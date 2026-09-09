@@ -1,0 +1,21 @@
+node_modules/
+data/
+storage/
+.env
+*.log
+android/.gradle/
+android/**/build/
+android/local.properties
+builds/*.apk
+dist/*.deb
+packaging/.stage/
+packaging/.cache/
+.private/
+
+# Локальная инфраструктура и эксплуатационные заметки
+ANDROID_RELEASE.md
+BACKUP_AND_RESTORE.md
+MIGRATION_OPENVK.md
+PROJECT_STATUS.md
+SECURITY_AUDIT.md
+deploy/ms.*.nginx

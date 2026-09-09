@@ -1,0 +1,61 @@
+name: Выпуск сервера
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Получить исходный код
+        uses: actions/checkout@v5
+
+      - name: Установить Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Установить FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+
+      - name: Установить зависимости
+        run: npm ci
+
+      - name: Запустить тесты
+        run: npm test
+
+      - name: Проверить секреты и личные данные
+        run: node scripts/check-repository-secrets.mjs
+
+      - name: Собрать DEB
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          ./packaging/build-deb.sh "$version" amd64
+          sha256sum dist/family-music-server_*.deb > dist/SHA256SUMS
+
+      - name: Создать GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.ref_name }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/family-music-server_*.deb dist/SHA256SUMS --clobber
+          else
+            gh release create "$tag" \
+              --verify-tag \
+              --generate-notes \
+              --title "Family Music Server $tag" \
+              dist/family-music-server_*.deb \
+              dist/SHA256SUMS
+          fi

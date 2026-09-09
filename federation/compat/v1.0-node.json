@@ -1,0 +1,17 @@
+{
+  "node_id": "fm:PreviousProfileNode0001",
+  "software_version": "0.1.0",
+  "protocols": {"1": {"minor": 0}},
+  "capabilities": {
+    "node.info.v1": {},
+    "health.v1": {},
+    "pairing.v1": {},
+    "catalog.delta.v1": {"max_page": 100}
+  },
+  "public_key": {
+    "key_id": "fm:PreviousProfileNode0001",
+    "algorithm": "ed25519",
+    "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  },
+  "future_field_from_old_patch": true
+}

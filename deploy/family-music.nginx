@@ -1,0 +1,39 @@
+map $http_x_forwarded_proto $family_music_proto {
+    default $scheme;
+    https https;
+}
+
+map $http_x_forwarded_host $family_music_host {
+    default $http_x_forwarded_host;
+    "" $http_host;
+}
+
+server {
+    listen 80 default_server;
+    server_name _;
+    client_max_body_size 1G;
+    set_real_ip_from REVERSE_PROXY_PRIVATE_IP;
+    real_ip_header X-Real-IP;
+
+    location /_protected_media/ {
+        internal;
+        alias /opt/family-music/storage/;
+        sendfile on;
+        aio threads;
+        add_header X-Music-Variant $upstream_http_x_music_variant always;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8095;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Host $family_music_host;
+        proxy_set_header X-Forwarded-Proto $family_music_proto;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_read_timeout 3600;
+        proxy_send_timeout 3600;
+    }
+}

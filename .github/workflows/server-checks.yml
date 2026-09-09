@@ -1,0 +1,122 @@
+name: Проверка сервера
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Получить исходный код
+        uses: actions/checkout@v5
+      - name: Установить Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - name: Установить FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+      - name: Установить зависимости
+        run: npm ci
+      - name: Проверить синтаксис
+        run: find src scripts test -type f -name '*.js' -print0 | xargs -0 -n1 node --check
+      - name: Проверить личные данные и секреты
+        run: |
+          node scripts/check-repository-secrets.mjs
+          node scripts/check-git-history-secrets.mjs
+      - name: Запустить тесты
+        run: npm test
+      - name: Проверить зависимости
+        run: npm audit --audit-level=high
+      - name: Собрать DEB-пакет
+        run: ./packaging/build-deb.sh "0.1.0-${GITHUB_RUN_NUMBER}" amd64
+      - name: Проверить DEB-пакет
+        run: dpkg-deb --info dist/family-music-server_*.deb
+      - name: Сохранить DEB-пакет проверки
+        uses: actions/upload-artifact@v6
+        with:
+          name: family-music-server-deb-${{ github.sha }}
+          path: dist/family-music-server_*.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  federation-two-node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: family_music_source
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d family_music_source"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGPASSWORD: postgres
+      FEDERATION_SOURCE_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/family_music_source
+      FEDERATION_TARGET_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/family_music_target
+    steps:
+      - name: Получить исходный код
+        uses: actions/checkout@v5
+      - name: Установить Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - name: Установить зависимости
+        run: npm ci
+      - name: Создать базу второй ноды
+        run: createdb -h 127.0.0.1 -U postgres family_music_target
+      - name: Проверить обмен между двумя нодами
+        run: npm run test:federation:two-node
+
+  media-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: family_music_media_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d family_music_media_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      MEDIA_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/family_music_media_test
+    steps:
+      - name: Получить исходный код
+        uses: actions/checkout@v5
+      - name: Установить Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - name: Установить FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+      - name: Установить зависимости
+        run: npm ci
+      - name: Проверить загрузку, worker и HTTP Range
+        run: npm run test:media:integration

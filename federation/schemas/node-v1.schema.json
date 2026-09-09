@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://family-music.example/schemas/federation/node-v1.schema.json",
+  "title": "Family Music federation node v1",
+  "type": "object",
+  "required": ["node_id", "software_version", "protocols", "capabilities", "public_key"],
+  "properties": {
+    "node_id": {"type": "string", "pattern": "^fm:[A-Za-z0-9_-]{16,128}$"},
+    "software_version": {"type": "string", "minLength": 1, "maxLength": 64},
+    "protocols": {
+      "type": "object",
+      "minProperties": 1,
+      "patternProperties": {
+        "^[1-9][0-9]*$": {
+          "type": "object",
+          "required": ["minor"],
+          "properties": {"minor": {"type": "integer", "minimum": 0}},
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "capabilities": {
+      "type": "object",
+      "propertyNames": {"pattern": "^[a-z][a-z0-9_.-]*\\.v[1-9][0-9]*$"},
+      "additionalProperties": {"type": "object"}
+    },
+    "public_key": {
+      "type": "object",
+      "required": ["key_id", "algorithm", "value"],
+      "properties": {
+        "key_id": {"type": "string", "minLength": 1, "maxLength": 160},
+        "algorithm": {"const": "ed25519"},
+        "value": {"type": "string", "minLength": 40, "maxLength": 128}
+      },
+      "additionalProperties": true
+    },
+    "endpoints": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "required": ["url", "scope", "priority"],
+        "properties": {
+          "url": {"type": "string", "format": "uri", "pattern": "^https://"},
+          "scope": {"enum": ["public", "private"]},
+          "priority": {"type": "integer", "minimum": 0, "maximum": 1000}
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

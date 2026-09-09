@@ -1,0 +1,29 @@
+name: Сообщить об ошибке
+description: Ошибка API, WEB или установки Family Music
+title: "[Ошибка]: "
+labels: [bug]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Что произошло?
+      description: Опишите ожидаемое и фактическое поведение.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Как повторить?
+      placeholder: Шаги, после которых появляется ошибка
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Версия или commit
+  - type: textarea
+    id: logs
+    attributes:
+      label: Журналы
+      description: Не публикуйте пароли, токены, домены и личные IP-адреса.
+      render: shell

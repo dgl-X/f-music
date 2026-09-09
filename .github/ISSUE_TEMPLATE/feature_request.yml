@@ -1,0 +1,32 @@
+name: Предложить функцию
+description: Улучшение API, WEB, установки или федерации Family Music
+title: "[Идея]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: scenario
+    attributes:
+      label: Какой сценарий хочется решить?
+      description: Опишите потребность пользователя, а не только предполагаемую реализацию.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Предлагаемое поведение
+      description: Как это должно выглядеть в WEB, API или при установке?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Альтернативы
+      description: Какие варианты или обходные решения уже рассматривались?
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Приватность
+      options:
+        - label: Я не приложил токены, пароли, реальные адреса серверов или персональные данные.
+          required: true
+

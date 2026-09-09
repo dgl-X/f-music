@@ -1,0 +1,14 @@
+[Unit]
+Description=Family Music daily backup
+After=postgresql.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/family-music-backup.conf
+ExecStart=/opt/family-music/scripts/backup.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target

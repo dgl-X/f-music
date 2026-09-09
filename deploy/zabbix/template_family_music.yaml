@@ -1,0 +1,169 @@
+zabbix_export:
+  version: '7.0'
+  template_groups:
+    - uuid: 83c29dfe035d4f55a2d94d8e8e93a3d0
+      name: Templates/Applications
+  templates:
+    - uuid: d1f68141df9e45e6af86270d24f24a35
+      template: 'Family Music by Zabbix agent'
+      name: 'Family Music by Zabbix agent'
+      description: |
+        Эксплуатационные метрики Family Music через локальный Zabbix agent.
+        Требует UserParameter familymusic.metrics и отдельный Bearer-токен.
+      groups:
+        - name: Templates/Applications
+      items:
+        - uuid: 6e915503467c46dcaf18937846621105
+          name: 'Family Music: метрики'
+          key: familymusic.metrics
+          delay: 1m
+          history: 1d
+          value_type: TEXT
+          trends: '0'
+          triggers:
+            - uuid: 49207a3a34ef4d6daa49ca81db54fb43
+              expression: 'nodata(/Family Music by Zabbix agent/familymusic.metrics,5m)=1'
+              name: 'Family Music: метрики недоступны 5 минут'
+              priority: HIGH
+        - uuid: 187721612c184539880f6fa6ab90abf1
+          name: 'Family Music: состояние'
+          type: DEPENDENT
+          key: familymusic.status
+          delay: '0'
+          history: 7d
+          value_type: CHAR
+          trends: '0'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.status
+          master_item:
+            key: familymusic.metrics
+          triggers:
+            - uuid: 6a02de7478274e708c020b87db0cdf92
+              expression: 'last(/Family Music by Zabbix agent/familymusic.status)<>"ok"'
+              name: 'Family Music: сервис работает в деградированном режиме'
+              priority: HIGH
+        - uuid: 9ac90d54270c4633baf003dbaf46f7f4
+          name: 'Family Music: возраст heartbeat worker'
+          type: DEPENDENT
+          key: familymusic.worker.age
+          delay: '0'
+          history: 7d
+          value_type: UNSIGNED
+          units: s
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - 'const v=JSON.parse(value).worker.age_seconds; return v===null ? 4294967295 : v;'
+          master_item:
+            key: familymusic.metrics
+          triggers:
+            - uuid: d456648243bf46d496c4c0d249582218
+              expression: 'min(/Family Music by Zabbix agent/familymusic.worker.age,3m)>45'
+              name: 'Family Music: worker не отвечает'
+              priority: HIGH
+        - uuid: bf2155587747431faff524823176844e
+          name: 'Family Music: память API'
+          type: DEPENDENT
+          key: familymusic.api.memory
+          delay: '0'
+          history: 7d
+          value_type: UNSIGNED
+          units: B
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.api.memory_rss_bytes
+          master_item:
+            key: familymusic.metrics
+        - uuid: 07ac32fc566b47c5a68babf5b0659792
+          name: 'Family Music: ошибки HTTP 5xx'
+          type: DEPENDENT
+          key: familymusic.api.errors_5xx
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.api.errors_5xx
+          master_item:
+            key: familymusic.metrics
+          triggers:
+            - uuid: 76416257d31445189063478c383c55c2
+              expression: 'change(/Family Music by Zabbix agent/familymusic.api.errors_5xx)>0'
+              name: 'Family Music: появились ошибки HTTP 5xx'
+              priority: WARNING
+        - uuid: 42edbb45cc5d437ea1333dd58067071a
+          name: 'Family Music: новые диагностические отчёты'
+          type: DEPENDENT
+          key: familymusic.reports.new
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.summary.new_reports
+          master_item:
+            key: familymusic.metrics
+          triggers:
+            - uuid: c6c09fd8b7cb4bb6b7ba54aeb3e68001
+              expression: 'last(/Family Music by Zabbix agent/familymusic.reports.new)>0'
+              name: 'Family Music: есть новые диагностические отчёты'
+              priority: INFO
+        - uuid: 5d0668bb9591418992e0e9bf728575a1
+          name: 'Family Music: ошибки загрузки за сутки'
+          type: DEPENDENT
+          key: familymusic.upload.errors_24h
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.summary.upload_errors_24h
+          master_item:
+            key: familymusic.metrics
+          triggers:
+            - uuid: 9e145da5396d4a61bb7c38cc3af84db4
+              expression: 'last(/Family Music by Zabbix agent/familymusic.upload.errors_24h)>0'
+              name: 'Family Music: есть ошибки загрузки за последние сутки'
+              priority: WARNING
+        - uuid: 14c5142893c1472193ae0964929744a5
+          name: 'Family Music: неудачные фоновые задачи'
+          type: DEPENDENT
+          key: familymusic.queues.failed
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - 'const q=JSON.parse(value).queues; return Object.keys(q).reduce(function(n,k){return n+(q[k].failed ? q[k].failed.count : 0);},0);'
+          master_item:
+            key: familymusic.metrics
+          triggers:
+            - uuid: f284e2b6a8604c209907492758714199
+              expression: 'last(/Family Music by Zabbix agent/familymusic.queues.failed)>0'
+              name: 'Family Music: есть неудачные фоновые задачи'
+              priority: WARNING
+        - uuid: d10af441b6004469b70cc388f04aec98
+          name: 'Family Music: недоступные федеративные ноды'
+          type: DEPENDENT
+          key: familymusic.federation.peers_offline
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.federation.peers_offline
+          master_item:
+            key: familymusic.metrics
+          triggers:
+            - uuid: ff2826a3c2ea4d45895d6e66d0550c6e
+              expression: 'last(/Family Music by Zabbix agent/familymusic.federation.peers_offline)>0'
+              name: 'Family Music: федеративная нода недоступна'
+              priority: WARNING

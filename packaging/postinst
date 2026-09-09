@@ -1,0 +1,62 @@
+#!/bin/sh
+set -eu
+
+if ! getent group family-music >/dev/null; then addgroup --system family-music; fi
+if ! getent passwd family-music >/dev/null; then adduser --system --ingroup family-music --home /opt/family-music --no-create-home --disabled-login family-music; fi
+
+install -d -o family-music -g family-music -m 0750 /opt/family-music/storage
+for directory in uploads originals covers artists derived federation/replicas; do
+  install -d -o family-music -g family-music -m 0750 "/opt/family-music/storage/$directory"
+done
+
+if [ ! -e /opt/family-music/.env ]; then
+  cp /usr/share/doc/family-music-server/examples/family-music.env /opt/family-music/.env
+  sed -i 's|^MUSIC_STORAGE_DIR=.*|MUSIC_STORAGE_DIR=/opt/family-music/storage|;s|^MUSIC_HOST=.*|MUSIC_HOST=127.0.0.1|;s|^DATABASE_URL=.*|DATABASE_URL=postgresql:///family_music?host=/var/run/postgresql|' /opt/family-music/.env
+fi
+chown root:family-music /opt/family-music
+chmod 0750 /opt/family-music
+chown root:family-music /opt/family-music/.env
+chmod 0640 /opt/family-music/.env
+
+if command -v runuser >/dev/null 2>&1 && id postgres >/dev/null 2>&1; then
+  if ! runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='family-music'" | grep -q 1; then
+    runuser -u postgres -- createuser --no-createdb --no-createrole --no-superuser family-music
+  fi
+  if ! runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_database WHERE datname='family_music'" | grep -q 1; then
+    runuser -u postgres -- createdb --owner=family-music family_music
+  fi
+fi
+
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl enable family-music.service family-music-worker.service >/dev/null 2>&1 || true
+if command -v deb-systemd-invoke >/dev/null 2>&1; then
+  deb-systemd-invoke restart family-music.service family-music-worker.service >/dev/null 2>&1 || true
+else
+  systemctl restart family-music.service family-music-worker.service >/dev/null 2>&1 || true
+fi
+for service in family-music.service family-music-worker.service; do
+  attempts=0
+  while [ "$(systemctl is-active "$service" 2>/dev/null || true)" = activating ] && [ "$attempts" -lt 30 ]; do
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+done
+
+attempts=0
+while ! /opt/family-music/runtime/bin/node -e "fetch('http://127.0.0.1:8095/api/v1/health').then(response => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))" >/dev/null 2>&1; do
+  attempts=$((attempts + 1))
+  if [ "$attempts" -ge 30 ]; then
+    echo "Family Music API не прошёл health-check после установки." >&2
+    systemctl status family-music.service family-music-worker.service --no-pager >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+
+for service in family-music.service family-music-worker.service; do
+  if [ "$(systemctl is-active "$service" 2>/dev/null || true)" != active ]; then
+    echo "$service не запущен после установки." >&2
+    exit 1
+  fi
+done
+exit 0

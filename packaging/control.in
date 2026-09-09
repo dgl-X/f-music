@@ -1,0 +1,11 @@
+Package: family-music-server
+Version: @VERSION@
+Section: sound
+Priority: optional
+Architecture: @ARCH@
+Installed-Size: @INSTALLED_SIZE@
+Maintainer: Family Music contributors
+Depends: libc6 (>= 2.28), libstdc++6, postgresql, ffmpeg, libchromaprint-tools, nginx, acl
+Description: Закрытый семейный музыкальный сервер
+ Family Music предоставляет WEB-интерфейс, HTTP API, фоновые обработчики,
+ потоковое воспроизведение, личные библиотеки и закрытую федерацию нод.

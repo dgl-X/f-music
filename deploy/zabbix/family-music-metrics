@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+token_file=${FAMILY_MUSIC_METRICS_TOKEN_FILE:-/etc/zabbix/family-music.token}
+api_url=${FAMILY_MUSIC_METRICS_URL:-http://127.0.0.1:8095/api/v1/metrics/zabbix}
+
+if [ ! -r "$token_file" ]; then
+  echo '{"status":"unavailable","error":"metrics_token_unreadable"}'
+  exit 1
+fi
+
+token=$(sed -n '1p' "$token_file")
+exec curl --fail --silent --show-error --max-time 5 \
+  --header "Authorization: Bearer $token" "$api_url"

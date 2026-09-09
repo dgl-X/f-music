@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://family-music.example/schemas/federation/error-v1.schema.json",
+  "title": "Family Music federation error v1",
+  "type": "object",
+  "required": ["error"],
+  "properties": {
+    "error": {
+      "type": "object",
+      "required": ["code", "message", "retryable"],
+      "properties": {
+        "code": {"type": "string", "pattern": "^[a-z][a-z0-9_]{2,63}$"},
+        "message": {"type": "string", "minLength": 1, "maxLength": 500},
+        "retryable": {"type": "boolean"},
+        "retry_after_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
+        "required_capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string"}
+        },
+        "request_id": {"type": "string", "maxLength": 128}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,25 @@
+{
+  "name": "family-music",
+  "version": "0.1.1",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "worker": "node src/server.js --worker",
+    "test": "node --test",
+    "test:media:integration": "node scripts/media-integration-ci.mjs",
+    "test:federation:two-node": "node scripts/federation-two-node-ci.mjs",
+    "test:federation:reconnect": "node scripts/federation-reconnect-smoke.mjs",
+    "import:openvk:dry": "node scripts/import-openvk.js --dry-run",
+    "import:openvk": "node scripts/import-openvk.js --skip-export",
+    "migrate:postgres": "node scripts/migrate-sqlite-to-postgres.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "pg": "^8.16.3"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

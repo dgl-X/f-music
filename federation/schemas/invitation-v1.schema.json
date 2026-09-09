@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://family-music.example/schemas/federation/invitation-v1.schema.json",
+  "title": "Family Music one-time pairing invitation v1",
+  "type": "object",
+  "required": ["version", "invitation_id", "issuer_node_id", "endpoint", "public_key", "secret", "expires_at"],
+  "properties": {
+    "version": {"const": 1},
+    "invitation_id": {"type": "string", "format": "uuid"},
+    "issuer_node_id": {"type": "string", "pattern": "^fm:[A-Za-z0-9_-]{16,128}$"},
+    "endpoint": {"type": "string", "format": "uri", "pattern": "^https://"},
+    "public_key": {"type": "string", "minLength": 40, "maxLength": 128},
+    "secret": {"type": "string", "minLength": 32, "maxLength": 256},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "label": {"type": "string", "maxLength": 120}
+  },
+  "additionalProperties": true
+}

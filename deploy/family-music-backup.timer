@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Family Music backup every night
+
+[Timer]
+OnCalendar=*-*-* 03:20:00
+RandomizedDelaySec=20m
+Persistent=true
+Unit=family-music-backup.service
+
+[Install]
+WantedBy=timers.target

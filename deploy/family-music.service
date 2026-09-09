@@ -1,0 +1,39 @@
+[Unit]
+Description=Family Music API and web application
+After=network.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=family-music
+Group=family-music
+WorkingDirectory=/opt/family-music
+EnvironmentFile=/opt/family-music/.env
+ExecStart=/usr/bin/node /opt/family-music/src/server.js
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+UMask=0027
+ReadWritePaths=/opt/family-music/storage
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+{
+  "protocol_version": 1,
+  "producer_minor": 0,
+  "min_reader_minor": 0,
+  "items": [],
+  "next_cursor": "fm-cursor-v1:MA",
+  "has_more": false,
+  "old_optional_diagnostic": "ignored"
+}

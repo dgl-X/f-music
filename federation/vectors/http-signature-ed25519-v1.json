@@ -1,0 +1,14 @@
+{
+  "notice": "Только тестовый ключ. Никогда не использовать для настоящей ноды.",
+  "method": "POST",
+  "target_uri": "https://node.example/federation/v1/pairing/accept",
+  "body": "{\"endpoint\":\"https://203.0.113.21:8443\",\"permissions\":[\"catalog.read\"]}",
+  "content_digest": "sha-256=:0Yck8D8yOqL9eb9NnyVl8m+HK9kTWCRsIkSjtLCmxDs=:",
+  "node_id": "fm:test-vector-1",
+  "nonce": "dGVzdC1ub25jZS0wMDE",
+  "signature_input": "sig1=(\"@method\" \"@target-uri\" \"content-digest\" \"x-family-music-node\" \"x-family-music-nonce\");created=1788714000;keyid=\"fm:test-vector-1\";alg=\"ed25519\"",
+  "signature_base": "\"@method\": POST\n\"@target-uri\": https://node.example/federation/v1/pairing/accept\n\"content-digest\": sha-256=:0Yck8D8yOqL9eb9NnyVl8m+HK9kTWCRsIkSjtLCmxDs=:\n\"x-family-music-node\": fm:test-vector-1\n\"x-family-music-nonce\": dGVzdC1ub25jZS0wMDE\n\"@signature-params\": (\"@method\" \"@target-uri\" \"content-digest\" \"x-family-music-node\" \"x-family-music-nonce\");created=1788714000;keyid=\"fm:test-vector-1\";alg=\"ed25519\"",
+  "signature": "sig1=:iwW2g8oLhY41XuCv7+e7+a6tWdLQpwMz9BrNMlPSGlLKmYCq68t2GO8fmPnHxcz7IgAeErnXZ2lO/DaWLbFpDg==:",
+  "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAtCf7UBZP79H8p8TlzpHJsHFaEtJBGxkeItvlR8JwsWQ=\n-----END PUBLIC KEY-----\n",
+  "private_key_pem": "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIE8MPlfGQ8F3/8viaMaZX/HUca/98AErh4+U1G6bCO28\n-----END PRIVATE KEY-----\n"
+}
