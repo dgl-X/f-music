@@ -20,7 +20,7 @@
 
 ### Android
 
-<img src="android/docs/images/android-library.png" alt="Android-клиент Family Music" width="320">
+<img src="docs/images/android-library.png" alt="Android-клиент F-Music" width="320">
 
 ## Текущее состояние
 
