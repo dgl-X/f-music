@@ -43,13 +43,54 @@ const sendJson = (res, status, value, extra = {}) => {
 };
 
 async function federationSettings() {
-  const rows = await db.prepare("SELECT key,value FROM app_settings WHERE key IN ('federation_enabled','federation_endpoints','federation_export_policy','federation_export_albums')").all();
+  const rows = await db.prepare("SELECT key,value FROM app_settings WHERE key IN ('federation_enabled','federation_endpoints','federation_export_policy','federation_export_albums','federation_export_collections')").all();
   const values = Object.fromEntries(rows.map(row => [row.key, row.value]));
-  let endpoints = [], selectedAlbums = [];
+  let endpoints = [], selectedAlbums = [], selectedCollections = [];
   try { endpoints = JSON.parse(values.federation_endpoints || '[]'); } catch {}
   try { selectedAlbums = JSON.parse(values.federation_export_albums || '[]'); } catch {}
-  const policy = ['all','albums'].includes(values.federation_export_policy) ? values.federation_export_policy : 'none';
-  return { enabled: values.federation_enabled === 'true', endpoints: Array.isArray(endpoints) ? endpoints : [], export_policy: policy, selected_albums: Array.isArray(selectedAlbums) ? selectedAlbums.filter(value => typeof value === 'string').slice(0, 1000) : [] };
+  try { selectedCollections = JSON.parse(values.federation_export_collections || '[]'); } catch {}
+  const policy = ['all','albums','collections'].includes(values.federation_export_policy) ? values.federation_export_policy : 'none';
+  return { enabled: values.federation_enabled === 'true', endpoints: Array.isArray(endpoints) ? endpoints : [], export_policy: policy,
+    selected_albums: Array.isArray(selectedAlbums) ? selectedAlbums.filter(value => typeof value === 'string').slice(0, 1000) : [],
+    selected_collections: Array.isArray(selectedCollections) ? selectedCollections.filter(value => typeof value === 'string').slice(0, 1000) : [] };
+}
+
+const parseSettingList = value => { try { const parsed=JSON.parse(value||'[]'); return Array.isArray(parsed)?parsed.map(String).slice(0,1000):[]; } catch { return []; } };
+
+async function federationExportSettings(peerNodeId = null) {
+  const global = await federationSettings();
+  let selected = global;
+  if (peerNodeId) {
+    const rule = await db.prepare('SELECT policy,selected_albums_json,selected_collections_json FROM federation_peer_export_rules WHERE peer_node_id=?').get(peerNodeId);
+    if (rule && rule.policy !== 'inherit') selected = { ...global, export_policy:rule.policy, selected_albums:parseSettingList(rule.selected_albums_json), selected_collections:parseSettingList(rule.selected_collections_json) };
+  }
+  let selectedTrackIds = [];
+  if (selected.export_policy === 'collections' && selected.selected_collections.length) {
+    selectedTrackIds = (await db.prepare(`SELECT DISTINCT track_id FROM federation_export_collection_tracks WHERE collection_id=ANY(?::text[])`).all(selected.selected_collections)).map(row=>row.track_id);
+  }
+  return { ...selected, selected_track_ids:selectedTrackIds };
+}
+
+async function appendFederationVisibilityEvents(tx, previousSettings, nextSettings, trackIds = null) {
+  const params = Array.isArray(trackIds) && trackIds.length ? trackIds : null;
+  const tracks = params
+    ? await tx.prepare(`SELECT id,title,artist,album,genre,year,duration_seconds,track_number,disc_number,cover_key,created_at FROM tracks WHERE id=ANY(?::text[]) ORDER BY created_at,id`).all(params)
+    : await tx.prepare(`SELECT id,title,artist,album,genre,year,duration_seconds,track_number,disc_number,cover_key,created_at FROM tracks ORDER BY created_at,id`).all();
+  const insertEvent = tx.prepare('INSERT INTO federation_catalog_events(event_type,object_id,payload_json) VALUES(?,?,?::jsonb)');
+  for (const track of tracks) {
+    const wasVisible = federationTrackVisible(track, previousSettings), isVisible = federationTrackVisible(track, nextSettings);
+    if (wasVisible === isVisible) continue;
+    const payload = isVisible ? { title:track.title,artist:track.artist,album:track.album,genre:track.genre,year:track.year,duration_seconds:track.duration_seconds,track_number:track.track_number,disc_number:track.disc_number,cover_available:Boolean(track.cover_key),created_at:track.created_at,policy_event:true } : { album:track.album,artist:track.artist,policy_event:true };
+    await insertEvent.run(isVisible ? 'track.upsert.v1' : 'track.delete.v1', track.id, JSON.stringify(payload));
+  }
+}
+
+async function appendFederationTrackRefreshEvents(tx, trackIds) {
+  const ids=[...new Set((trackIds||[]).map(String))];
+  if (!ids.length) return;
+  const tracks=await tx.prepare(`SELECT id,title,artist,album,genre,year,duration_seconds,track_number,disc_number,cover_key,created_at FROM tracks WHERE id=ANY(?::text[])`).all(ids);
+  const insertEvent=tx.prepare("INSERT INTO federation_catalog_events(event_type,object_id,payload_json) VALUES('track.upsert.v1',?,?::jsonb)");
+  for(const track of tracks) await insertEvent.run(track.id,JSON.stringify({title:track.title,artist:track.artist,album:track.album,genre:track.genre,year:track.year,duration_seconds:track.duration_seconds,track_number:track.track_number,disc_number:track.disc_number,cover_available:Boolean(track.cover_key),created_at:track.created_at,policy_event:true}));
 }
 
 function validateFederationEndpoints(value) {
@@ -132,7 +173,8 @@ async function federationCatalog(req, res, url) {
     const after = decodeCatalogCursor(url.searchParams.get('cursor')), limit = Math.max(1, Math.min(500, Number(url.searchParams.get('limit')) || 500));
     const rows = await db.prepare(`SELECT events.revision,events.event_type,events.object_id,events.payload_json,events.occurred_at,tracks.album AS current_album
       FROM federation_catalog_events events LEFT JOIN tracks ON tracks.id=events.object_id WHERE events.revision>? ORDER BY events.revision LIMIT ?`).all(after, limit + 1);
-    const rawPage = rows.slice(0, limit), page = rawPage.map(row => federationCatalogRow(row, settings)), hasMore = rows.length > limit, lastRevision = rawPage.length ? Number(rawPage.at(-1).revision) : after;
+    const exportSettings = await federationExportSettings(peer.node_id);
+    const rawPage = rows.slice(0, limit), page = rawPage.map(row => federationCatalogRow(row, exportSettings)), hasMore = rows.length > limit, lastRevision = rawPage.length ? Number(rawPage.at(-1).revision) : after;
     const body = Buffer.from(JSON.stringify({ protocol_version: 1, producer_minor: FEDERATION_PROTOCOL_MINOR, min_reader_minor: 0, items: page.map(row => catalogEvent(row, identity.node_id)), next_cursor: encodeCatalogCursor(lastRevision), has_more: hasMore }));
     res.writeHead(200, { ...jsonHeaders, ...signFederationResponse(body, identity.node_id, identity.private_key_pem) }); res.end(body);
     return true;
@@ -174,8 +216,8 @@ async function federationCover(req,res,url){
     const remoteNodeId=String(req.headers['x-family-music-node']||''),peer=await db.prepare("SELECT node_id,public_key FROM federation_peers WHERE node_id=? AND status IN ('compatible','limited') AND revoked_at IS NULL").get(remoteNodeId);
     if(!peer)return sendJson(res,403,{error:{code:'peer_not_trusted',message:'Нода не подключена или отозвана',retryable:false}}),true;
     await verifyFederationRequest({method:req.method,targetUri:externalRequestUri(req,url),headers:req.headers,publicKey:peer.public_key,expectedNodeId:peer.node_id,consumeNonce:consumeFederationNonce});
-    const track=await db.prepare('SELECT cover_key,album FROM tracks WHERE id=?').get(match[1]);
-    if(!federationTrackVisible(track,settings))return sendJson(res,403,{error:{code:'track_not_shared',message:'Трек не опубликован',retryable:false}}),true;
+    const track=await db.prepare('SELECT id,cover_key,album FROM tracks WHERE id=?').get(match[1]);
+    if(!federationTrackVisible(track,await federationExportSettings(peer.node_id)))return sendJson(res,403,{error:{code:'track_not_shared',message:'Трек не опубликован',retryable:false}}),true;
     if(!track?.cover_key)return sendJson(res,404,{error:{code:'cover_not_found',message:'Обложка отсутствует',retryable:false}}),true;
     const file=path.resolve(config.storageDir,track.cover_key);
     if(!file.startsWith(config.storageDir+path.sep)||!fs.existsSync(file))return sendJson(res,404,{error:{code:'cover_not_found',message:'Файл обложки отсутствует',retryable:false}}),true;
@@ -195,8 +237,8 @@ async function federationAudio(req,res,url){
     const remoteNodeId=String(req.headers['x-family-music-node']||'');peer=await db.prepare("SELECT node_id,public_key FROM federation_peers WHERE node_id=? AND status IN ('compatible','limited') AND revoked_at IS NULL").get(remoteNodeId);
     if(!peer)return sendJson(res,403,{error:{code:'peer_not_trusted',message:'Нода не подключена или отозвана',retryable:false}}),true;
     await verifyFederationRequest({method:req.method,targetUri:externalRequestUri(req,url),headers:req.headers,publicKey:peer.public_key,expectedNodeId:peer.node_id,consumeNonce:consumeFederationNonce});
-    const exportedTrack=await db.prepare('SELECT album FROM tracks WHERE id=?').get(match[1]);
-    if(!federationTrackVisible(exportedTrack,settings))return sendJson(res,403,{error:{code:'track_not_shared',message:'Трек не опубликован',retryable:false}}),true;
+    const exportedTrack=await db.prepare('SELECT id,album FROM tracks WHERE id=?').get(match[1]);
+    if(!federationTrackVisible(exportedTrack,await federationExportSettings(peer.node_id)))return sendJson(res,403,{error:{code:'track_not_shared',message:'Трек не опубликован',retryable:false}}),true;
     if(!acquireCounter(incomingFederationStreams,peer.node_id,4))return sendJson(res,429,{error:{code:'stream_limit',message:'Слишком много одновременных потоков',retryable:true}}),true;
     acquired = true;
     const quality=['original','aac_96','aac_192'].includes(url.searchParams.get('quality'))?url.searchParams.get('quality'):'original';
@@ -1127,14 +1169,21 @@ async function api(req, res, url, apiPrefix = '/api') {
     const settings = await federationSettings(), identity = loadFederationIdentity(config.storageDir);
     const availableAlbums = await db.prepare(`SELECT album AS name,count(*) AS track_count,max(year) AS year,min(artist) AS artist
       FROM tracks WHERE album<>'' GROUP BY album ORDER BY album COLLATE "C" LIMIT 1000`).all();
-    return sendJson(res, 200, { ...settings, available_albums: availableAlbums, initialized: Boolean(identity), node_id: identity?.node_id ?? null, fingerprint: identity?.fingerprint ?? null, created_at: identity?.created_at ?? null });
+    const collections = await db.prepare(`SELECT collection.id,collection.name,count(item.track_id) AS track_count
+      FROM federation_export_collections collection LEFT JOIN federation_export_collection_tracks item ON item.collection_id=collection.id
+      GROUP BY collection.id ORDER BY collection.name COLLATE "C"`).all();
+    return sendJson(res, 200, { ...settings, available_albums: availableAlbums, collections:collections.map(item=>({...item,track_count:Number(item.track_count)})), initialized: Boolean(identity), node_id: identity?.node_id ?? null, fingerprint: identity?.fingerprint ?? null, created_at: identity?.created_at ?? null });
   }
   if (url.pathname === '/api/admin/federation' && req.method === 'PUT') {
     if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
-    const body = await readJson(req), enabled = Boolean(body.enabled), initialize = Boolean(body.initialize), exportPolicy = ['all','albums'].includes(body.export_policy) ? body.export_policy : 'none';
+    const body = await readJson(req), enabled = Boolean(body.enabled), initialize = Boolean(body.initialize), exportPolicy = ['all','albums','collections'].includes(body.export_policy) ? body.export_policy : 'none';
     const selectedAlbums = [...new Set((Array.isArray(body.selected_albums) ? body.selected_albums : []).map(value => String(value).trim()).filter(Boolean))].slice(0, 1000);
-    const previousSettings = await federationSettings();
-    const nextSettings = { export_policy: exportPolicy, selected_albums: selectedAlbums };
+    const selectedCollections = [...new Set((Array.isArray(body.selected_collections) ? body.selected_collections : []).map(value => String(value).trim()).filter(Boolean))].slice(0, 1000);
+    const existingCollections = selectedCollections.length ? (await db.prepare('SELECT id FROM federation_export_collections WHERE id=ANY(?::text[])').all(selectedCollections)).map(item=>item.id) : [];
+    if (existingCollections.length !== selectedCollections.length) return sendJson(res,400,{error:'Выбрана несуществующая коллекция'});
+    const previousSettings = await federationExportSettings();
+    const selectedTrackIds = selectedCollections.length ? (await db.prepare('SELECT DISTINCT track_id FROM federation_export_collection_tracks WHERE collection_id=ANY(?::text[])').all(selectedCollections)).map(item=>item.track_id) : [];
+    const nextSettings = { export_policy: exportPolicy, selected_albums: selectedAlbums, selected_collections: selectedCollections, selected_track_ids:selectedTrackIds };
     const endpoints = validateFederationEndpoints(body.endpoints ?? []);
     let identity = loadFederationIdentity(config.storageDir);
     if ((initialize || enabled) && !identity) identity = ensureFederationIdentity(config.storageDir);
@@ -1148,16 +1197,55 @@ async function api(req, res, url, apiPrefix = '/api') {
         ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP`).run(exportPolicy);
       await tx.prepare(`INSERT INTO app_settings(key,value,updated_at) VALUES('federation_export_albums',?,CURRENT_TIMESTAMP)
         ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP`).run(JSON.stringify(selectedAlbums));
-      const tracks = await tx.prepare(`SELECT id,title,artist,album,genre,year,duration_seconds,track_number,disc_number,cover_key,created_at FROM tracks ORDER BY created_at,id`).all();
-      const insertEvent = tx.prepare('INSERT INTO federation_catalog_events(event_type,object_id,payload_json) VALUES(?,?,?::jsonb)');
-      for (const track of tracks) {
-        const wasVisible = federationTrackVisible(track, previousSettings), isVisible = federationTrackVisible(track, nextSettings);
-        if (wasVisible === isVisible) continue;
-        const payload = isVisible ? { title:track.title,artist:track.artist,album:track.album,genre:track.genre,year:track.year,duration_seconds:track.duration_seconds,track_number:track.track_number,disc_number:track.disc_number,cover_available:Boolean(track.cover_key),created_at:track.created_at,policy_event:true } : { album:track.album,artist:track.artist,policy_event:true };
-        await insertEvent.run(isVisible ? 'track.upsert.v1' : 'track.delete.v1', track.id, JSON.stringify(payload));
-      }
+      await tx.prepare(`INSERT INTO app_settings(key,value,updated_at) VALUES('federation_export_collections',?,CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP`).run(JSON.stringify(selectedCollections));
+      await appendFederationVisibilityEvents(tx, previousSettings, nextSettings);
     });
-    return sendJson(res, 200, { enabled, endpoints, export_policy: exportPolicy, selected_albums: selectedAlbums, initialized: Boolean(identity), node_id: identity?.node_id ?? null, fingerprint: identity?.fingerprint ?? null, created_at: identity?.created_at ?? null });
+    return sendJson(res, 200, { enabled, endpoints, export_policy: exportPolicy, selected_albums: selectedAlbums, selected_collections: selectedCollections, initialized: Boolean(identity), node_id: identity?.node_id ?? null, fingerprint: identity?.fingerprint ?? null, created_at: identity?.created_at ?? null });
+  }
+  if (url.pathname === '/api/admin/federation/collections' && req.method === 'GET') {
+    if (!user.is_admin) return sendJson(res,403,{error:'Доступно только администратору'});
+    const items=await db.prepare(`SELECT collection.id,collection.name,collection.created_at,collection.updated_at,count(item.track_id) AS track_count
+      FROM federation_export_collections collection LEFT JOIN federation_export_collection_tracks item ON item.collection_id=collection.id
+      GROUP BY collection.id ORDER BY collection.name COLLATE "C"`).all();
+    return sendJson(res,200,{items:items.map(item=>({...item,track_count:Number(item.track_count)}))});
+  }
+  if (url.pathname === '/api/admin/federation/collections' && req.method === 'POST') {
+    if (!user.is_admin) return sendJson(res,403,{error:'Доступно только администратору'});
+    const name=String((await readJson(req)).name||'').trim().slice(0,120);
+    if(!name)return sendJson(res,400,{error:'Укажите название коллекции'});
+    if(await db.prepare('SELECT 1 FROM federation_export_collections WHERE lower(name)=lower(?)').get(name))return sendJson(res,409,{error:'Коллекция с таким названием уже существует'});
+    const id=crypto.randomUUID();await db.prepare('INSERT INTO federation_export_collections(id,name,created_by) VALUES(?,?,?)').run(id,name,user.id);
+    return sendJson(res,201,{id,name,track_count:0});
+  }
+  const collectionMatch=/^\/api\/admin\/federation\/collections\/([0-9a-f-]{36})$/.exec(url.pathname);
+  if(collectionMatch&&req.method==='GET'){
+    if(!user.is_admin)return sendJson(res,403,{error:'Доступно только администратору'});
+    const collection=await db.prepare('SELECT id,name,created_at,updated_at FROM federation_export_collections WHERE id=?').get(collectionMatch[1]);
+    if(!collection)return sendJson(res,404,{error:'Коллекция не найдена'});
+    const tracks=await db.prepare(`SELECT tracks.id,tracks.title,tracks.artist,tracks.album,tracks.duration_seconds
+      FROM federation_export_collection_tracks item JOIN tracks ON tracks.id=item.track_id WHERE item.collection_id=?
+      ORDER BY tracks.artist COLLATE "C",tracks.album COLLATE "C",tracks.disc_number NULLS LAST,tracks.track_number NULLS LAST,tracks.title COLLATE "C"`).all(collection.id);
+    return sendJson(res,200,{...collection,tracks});
+  }
+  if(collectionMatch&&req.method==='PUT'){
+    if(!user.is_admin)return sendJson(res,403,{error:'Доступно только администратору'});
+    const body=await readJson(req,1024*1024),name=String(body.name||'').trim().slice(0,120),trackIds=[...new Set((Array.isArray(body.track_ids)?body.track_ids:[]).map(String))].slice(0,10000);
+    if(!name)return sendJson(res,400,{error:'Укажите название коллекции'});
+    const collection=await db.prepare('SELECT id FROM federation_export_collections WHERE id=?').get(collectionMatch[1]);if(!collection)return sendJson(res,404,{error:'Коллекция не найдена'});
+    if(await db.prepare('SELECT 1 FROM federation_export_collections WHERE lower(name)=lower(?) AND id<>?').get(name,collection.id))return sendJson(res,409,{error:'Коллекция с таким названием уже существует'});
+    const validIds=trackIds.length?(await db.prepare('SELECT id FROM tracks WHERE id=ANY(?::text[])').all(trackIds)).map(item=>item.id):[];
+    if(validIds.length!==trackIds.length)return sendJson(res,400,{error:'В коллекции указан несуществующий трек'});
+    const oldIds=(await db.prepare('SELECT track_id FROM federation_export_collection_tracks WHERE collection_id=?').all(collection.id)).map(item=>item.track_id),changed=[...new Set([...oldIds,...validIds])];
+    await db.transaction(async tx=>{await tx.prepare('UPDATE federation_export_collections SET name=?,updated_at=CURRENT_TIMESTAMP WHERE id=?').run(name,collection.id);await tx.prepare('DELETE FROM federation_export_collection_tracks WHERE collection_id=?').run(collection.id);for(const trackId of validIds)await tx.prepare('INSERT INTO federation_export_collection_tracks(collection_id,track_id) VALUES(?,?)').run(collection.id,trackId);await appendFederationTrackRefreshEvents(tx,changed);});
+    return sendJson(res,200,{id:collection.id,name,track_count:validIds.length});
+  }
+  if(collectionMatch&&req.method==='DELETE'){
+    if(!user.is_admin)return sendJson(res,403,{error:'Доступно только администратору'});
+    const collection=await db.prepare('SELECT id FROM federation_export_collections WHERE id=?').get(collectionMatch[1]);if(!collection)return sendJson(res,404,{error:'Коллекция не найдена'});
+    const oldIds=(await db.prepare('SELECT track_id FROM federation_export_collection_tracks WHERE collection_id=?').all(collection.id)).map(item=>item.track_id);
+    await db.transaction(async tx=>{await tx.prepare('DELETE FROM federation_export_collections WHERE id=?').run(collection.id);const setting=await tx.prepare("SELECT value FROM app_settings WHERE key='federation_export_collections'").get();if(setting)await tx.prepare("UPDATE app_settings SET value=?,updated_at=CURRENT_TIMESTAMP WHERE key='federation_export_collections'").run(JSON.stringify(parseSettingList(setting.value).filter(id=>id!==collection.id)));const rules=await tx.prepare('SELECT peer_node_id,selected_collections_json FROM federation_peer_export_rules').all();for(const rule of rules)await tx.prepare('UPDATE federation_peer_export_rules SET selected_collections_json=?,updated_at=CURRENT_TIMESTAMP WHERE peer_node_id=?').run(JSON.stringify(parseSettingList(rule.selected_collections_json).filter(id=>id!==collection.id)),rule.peer_node_id);await appendFederationTrackRefreshEvents(tx,oldIds);});
+    return sendJson(res,200,{ok:true});
   }
   if (url.pathname === '/api/admin/federation/check-endpoint' && req.method === 'POST') {
     if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
@@ -1194,11 +1282,23 @@ async function api(req, res, url, apiPrefix = '/api') {
   }
   if (url.pathname === '/api/admin/federation/peers' && req.method === 'GET') {
     if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
-    const items = await db.prepare(`SELECT federation_peers.node_id,label,endpoint,status,protocol_major,protocol_minor,capabilities_json,created_at,updated_at,last_seen_at,revoked_at,
-      catalog_cursor,last_synced_at,next_sync_at,sync_failures,sync_error,remote_latest_revision,last_notified_revision,notify_failures,notify_error,
-      (SELECT count(*) FROM federation_remote_tracks WHERE origin_node_id=federation_peers.node_id) AS remote_tracks
-      FROM federation_peers ORDER BY created_at DESC`).all();
-    return sendJson(res, 200, { items: items.map(item => ({ ...item, capabilities: JSON.parse(item.capabilities_json || '{}'), capabilities_json: undefined })) });
+    const items = await db.prepare(`SELECT federation_peers.node_id,federation_peers.label,federation_peers.endpoint,federation_peers.status,federation_peers.protocol_major,federation_peers.protocol_minor,federation_peers.capabilities_json,federation_peers.created_at,federation_peers.updated_at,federation_peers.last_seen_at,federation_peers.revoked_at,
+      federation_peers.catalog_cursor,federation_peers.last_synced_at,federation_peers.next_sync_at,federation_peers.sync_failures,federation_peers.sync_error,federation_peers.remote_latest_revision,federation_peers.last_notified_revision,federation_peers.notify_failures,federation_peers.notify_error,
+      (SELECT count(*) FROM federation_remote_tracks WHERE origin_node_id=federation_peers.node_id) AS remote_tracks,
+      rule.policy AS export_policy,rule.selected_albums_json,rule.selected_collections_json
+      FROM federation_peers LEFT JOIN federation_peer_export_rules rule ON rule.peer_node_id=federation_peers.node_id ORDER BY federation_peers.created_at DESC`).all();
+    return sendJson(res, 200, { items: items.map(item => ({ ...item, export_policy:item.export_policy||'inherit',selected_albums:parseSettingList(item.selected_albums_json),selected_collections:parseSettingList(item.selected_collections_json),selected_albums_json:undefined,selected_collections_json:undefined,capabilities: JSON.parse(item.capabilities_json || '{}'), capabilities_json: undefined })) });
+  }
+  const peerPolicyMatch=/^\/api\/admin\/federation\/peers\/(fm:[A-Za-z0-9_-]{16,128})\/export-policy$/.exec(url.pathname);
+  if(peerPolicyMatch&&req.method==='PUT'){
+    if(!user.is_admin)return sendJson(res,403,{error:'Доступно только администратору'});
+    const peer=await db.prepare('SELECT node_id FROM federation_peers WHERE node_id=? AND revoked_at IS NULL').get(peerPolicyMatch[1]);if(!peer)return sendJson(res,404,{error:'Активная нода не найдена'});
+    const body=await readJson(req),policy=['inherit','none','all','albums','collections'].includes(body.policy)?body.policy:'inherit',selectedAlbums=[...new Set((Array.isArray(body.selected_albums)?body.selected_albums:[]).map(value=>String(value).trim()).filter(Boolean))].slice(0,1000),selectedCollections=[...new Set((Array.isArray(body.selected_collections)?body.selected_collections:[]).map(String))].slice(0,1000);
+    const existing=selectedCollections.length?(await db.prepare('SELECT id FROM federation_export_collections WHERE id=ANY(?::text[])').all(selectedCollections)).map(item=>item.id):[];if(existing.length!==selectedCollections.length)return sendJson(res,400,{error:'Выбрана несуществующая коллекция'});
+    const previous=await federationExportSettings(peer.node_id),selectedTrackIds=selectedCollections.length?(await db.prepare('SELECT DISTINCT track_id FROM federation_export_collection_tracks WHERE collection_id=ANY(?::text[])').all(selectedCollections)).map(item=>item.track_id):[],global=await federationExportSettings(),next=policy==='inherit'?global:{...global,export_policy:policy,selected_albums:selectedAlbums,selected_collections:selectedCollections,selected_track_ids:selectedTrackIds};
+    await db.transaction(async tx=>{await tx.prepare(`INSERT INTO federation_peer_export_rules(peer_node_id,policy,selected_albums_json,selected_collections_json,updated_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP)
+      ON CONFLICT(peer_node_id) DO UPDATE SET policy=excluded.policy,selected_albums_json=excluded.selected_albums_json,selected_collections_json=excluded.selected_collections_json,updated_at=CURRENT_TIMESTAMP`).run(peer.node_id,policy,JSON.stringify(selectedAlbums),JSON.stringify(selectedCollections));await appendFederationVisibilityEvents(tx,previous,next);});
+    return sendJson(res,200,{ok:true,policy,selected_albums:selectedAlbums,selected_collections:selectedCollections});
   }
   if (url.pathname === '/api/admin/federation/accept' && req.method === 'POST') {
     if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });

@@ -85,6 +85,28 @@ ALTER TABLE federation_peers ADD COLUMN IF NOT EXISTS next_notify_at TIMESTAMPTZ
 ALTER TABLE federation_peers ADD COLUMN IF NOT EXISTS notify_failures INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE federation_peers ADD COLUMN IF NOT EXISTS notify_error TEXT;
 CREATE INDEX IF NOT EXISTS federation_peers_status ON federation_peers(status,updated_at DESC);
+CREATE TABLE IF NOT EXISTS federation_export_collections (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS federation_export_collections_name ON federation_export_collections((lower(name)));
+CREATE TABLE IF NOT EXISTS federation_export_collection_tracks (
+  collection_id TEXT NOT NULL REFERENCES federation_export_collections(id) ON DELETE CASCADE,
+  track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+  added_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY(collection_id,track_id)
+);
+CREATE INDEX IF NOT EXISTS federation_export_collection_tracks_track ON federation_export_collection_tracks(track_id,collection_id);
+CREATE TABLE IF NOT EXISTS federation_peer_export_rules (
+  peer_node_id TEXT PRIMARY KEY REFERENCES federation_peers(node_id) ON DELETE CASCADE,
+  policy TEXT NOT NULL DEFAULT 'inherit',
+  selected_albums_json TEXT NOT NULL DEFAULT '[]',
+  selected_collections_json TEXT NOT NULL DEFAULT '[]',
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS federation_catalog_events (revision BIGSERIAL PRIMARY KEY, event_type TEXT NOT NULL, object_id TEXT NOT NULL, payload_json JSONB NOT NULL DEFAULT '{}', occurred_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS federation_catalog_events_object ON federation_catalog_events(object_id,revision DESC);
 CREATE OR REPLACE FUNCTION record_federation_track_event() RETURNS trigger LANGUAGE plpgsql AS $$

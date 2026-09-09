@@ -4,11 +4,12 @@ const CURSOR_PREFIX = 'fm-cursor-v1:';
 
 export function federationTrackVisible(track, settings) {
   if (settings.export_policy === 'all') return true;
-  return settings.export_policy === 'albums' && settings.selected_albums.includes(String(track?.album || ''));
+  if (settings.export_policy === 'albums') return settings.selected_albums.includes(String(track?.album || ''));
+  return settings.export_policy === 'collections' && settings.selected_track_ids?.includes(String(track?.id || ''));
 }
 
 export function federationCatalogRow(row, settings) {
-  if (row.event_type === 'track.upsert.v1' && federationTrackVisible({ album: row.current_album }, settings)) {
+  if (row.event_type === 'track.upsert.v1' && federationTrackVisible({ id: row.object_id, album: row.current_album }, settings)) {
     const { policy_event: ignored, ...payload } = row.payload_json || {};
     return { ...row, payload_json: payload };
   }

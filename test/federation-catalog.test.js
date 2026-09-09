@@ -39,3 +39,13 @@ test('disabled export turns stale upserts into tombstones', () => {
   assert.equal(row.event_type, 'track.delete.v1');
   assert.deepEqual(row.payload_json, {});
 });
+
+test('collection export publishes only explicit track ids', () => {
+  const settings={export_policy:'collections',selected_albums:[],selected_track_ids:['track-public']};
+  assert.equal(federationTrackVisible({id:'track-public',album:'Private'},settings),true);
+  assert.equal(federationTrackVisible({id:'track-hidden',album:'Published'},settings),false);
+  const visible=federationCatalogRow({event_type:'track.upsert.v1',object_id:'track-public',current_album:'Private',payload_json:{title:'Shared'}},settings);
+  const hidden=federationCatalogRow({event_type:'track.upsert.v1',object_id:'track-hidden',current_album:'Published',payload_json:{title:'Hidden'}},settings);
+  assert.equal(visible.event_type,'track.upsert.v1');
+  assert.equal(hidden.event_type,'track.delete.v1');
+});
