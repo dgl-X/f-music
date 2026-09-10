@@ -1,0 +1,10 @@
+{
+  "release": "v0.1.1",
+  "protocol_major": 1,
+  "protocol_minor": 0,
+  "protocol_sha256": "9fb37a82c1f471b507eaeb3a1abf06db6e2fe1cd37a5735c1aa83e17a633bbee",
+  "schemas": {
+    "federation/schemas/node-v1.schema.json": "9b455e08b1904e40014359baadb5450582d76bb93b413a45a93727d5529d4e8f",
+    "federation/schemas/delta-v1.schema.json": "5221c74ba051df121f8314b023ff4f513145bd2c3a8f47dd17b5d315d6c8f93a"
+  }
+}

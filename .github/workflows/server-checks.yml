@@ -16,6 +16,8 @@ jobs:
     steps:
       - name: Получить исходный код
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - name: Установить Node.js
         uses: actions/setup-node@v5
         with:
@@ -35,6 +37,8 @@ jobs:
           node scripts/check-git-history-secrets.mjs
       - name: Запустить тесты
         run: npm test
+      - name: Проверить совместимость с сервером v0.1.1
+        run: npm run test:federation:baseline
       - name: Проверить зависимости
         run: npm audit --audit-level=high
       - name: Собрать DEB-пакет

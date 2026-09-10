@@ -10,6 +10,7 @@
     "test": "node --test",
     "test:media:integration": "node scripts/media-integration-ci.mjs",
     "test:federation:two-node": "node scripts/federation-two-node-ci.mjs",
+    "test:federation:baseline": "node scripts/check-federation-baseline.mjs",
     "test:federation:reconnect": "node scripts/federation-reconnect-smoke.mjs",
     "import:openvk:dry": "node scripts/import-openvk.js --dry-run",
     "import:openvk": "node scripts/import-openvk.js --skip-export",
