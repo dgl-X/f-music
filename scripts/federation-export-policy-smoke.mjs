@@ -12,6 +12,7 @@ function readEnv(file) {
 }
 
 const envFile=process.argv[2]||'/opt/family-music/.env',base='http://127.0.0.1:8095',config=loadConfig(readEnv(envFile)),db=await openDatabase(config.databaseUrl);
+const holdArgument=process.argv.find(value=>value.startsWith('--hold-seconds=')),holdSeconds=Math.max(0,Math.min(600,Number(holdArgument?.split('=')[1])||0));
 const username=`acl-smoke-${Date.now()}`,password=crypto.randomBytes(18).toString('base64url');let userId,collectionId,cookie,previousGlobal,peer,previousRule;
 
 async function request(path,options={}){
@@ -33,7 +34,8 @@ try{
   const effectiveCollection=await db.prepare('SELECT count(*) AS count FROM federation_export_collection_tracks WHERE collection_id=? AND track_id=?').get(collectionId,tracks[0].id);
   const recentEvents=await db.prepare("SELECT object_id,event_type FROM federation_catalog_events WHERE object_id=ANY(?::text[]) ORDER BY revision DESC LIMIT 10").all(tracks.map(item=>item.id));
   if(Number(effectiveCollection.count)!==1||!recentEvents.some(item=>item.object_id===tracks[0].id))throw new Error('Коллекция или события политики не сохранены');
-  console.log(JSON.stringify({ok:true,collection_tracks:1,excluded_tracks:1,peer_policy:'collections',events:recentEvents.length}));
+  console.log(JSON.stringify({ok:true,phase:'active',collection_tracks:1,excluded_tracks:1,peer_policy:'collections',events:recentEvents.length,shared_track_id:tracks[0].id,hold_seconds:holdSeconds}));
+  if(holdSeconds)await new Promise(resolve=>setTimeout(resolve,holdSeconds*1000));
 }finally{
   try{if(previousGlobal)await request('/api/v1/admin/federation',{method:'PUT',body:{enabled:previousGlobal.enabled,export_policy:previousGlobal.export_policy,selected_albums:previousGlobal.selected_albums,selected_collections:previousGlobal.selected_collections,endpoints:previousGlobal.endpoints}});}catch{}
   try{if(peer){if(previousRule)await db.prepare(`INSERT INTO federation_peer_export_rules(peer_node_id,policy,selected_albums_json,selected_collections_json,updated_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(peer_node_id) DO UPDATE SET policy=excluded.policy,selected_albums_json=excluded.selected_albums_json,selected_collections_json=excluded.selected_collections_json,updated_at=CURRENT_TIMESTAMP`).run(peer.node_id,previousRule.policy,previousRule.selected_albums_json,previousRule.selected_collections_json);else await db.prepare('DELETE FROM federation_peer_export_rules WHERE peer_node_id=?').run(peer.node_id);}}catch{}
