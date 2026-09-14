@@ -2112,7 +2112,7 @@ async function api(req, res, url, apiPrefix = '/api') {
     if (!track?.cover_key) { res.writeHead(404); return res.end(); }
     const file = path.resolve(config.storageDir, track.cover_key);
     if (!file.startsWith(config.storageDir + path.sep) || !fs.existsSync(file)) { res.writeHead(404); return res.end(); }
-    res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'private, no-cache' });
+    res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'private, max-age=3600, stale-while-revalidate=86400', 'Vary': 'Cookie' });
     return fs.createReadStream(file).pipe(res);
   }
   const artistImageGetMatch=/^\/api\/artists\/(\d+)\/image$/.exec(url.pathname);
@@ -2144,7 +2144,7 @@ async function api(req, res, url, apiPrefix = '/api') {
     if (!file.startsWith(config.storageDir + path.sep) || !fs.existsSync(file)) return sendJson(res, 404, { error: 'Файл не найден' });
     if (config.xAccelRedirect) {
       const internalPath = '/_protected_media/' + storageKey.split('/').map(encodeURIComponent).join('/');
-      res.writeHead(200, { 'Content-Type': mimeType, 'X-Music-Variant': actualVariant, 'X-Accel-Redirect': internalPath, 'Accept-Ranges': 'bytes' });
+      res.writeHead(200, { 'Content-Type': mimeType, 'X-Music-Variant': actualVariant, 'X-Accel-Redirect': internalPath, 'Accept-Ranges': 'bytes', 'Cache-Control': 'private, max-age=120', 'Vary': 'Cookie' });
       return res.end();
     }
     const size = fs.statSync(file).size;
@@ -2156,7 +2156,7 @@ async function api(req, res, url, apiPrefix = '/api') {
       if (!Number.isSafeInteger(start)||!Number.isSafeInteger(end)||start > end || start >= size) { res.writeHead(416, { 'Content-Range': `bytes */${size}` }); return res.end(); }
       status = 206;
     }
-    res.writeHead(status, { 'Content-Type': mimeType, 'X-Music-Variant': actualVariant, 'Accept-Ranges': 'bytes', 'Content-Length': end - start + 1, ...(status === 206 ? { 'Content-Range': `bytes ${start}-${end}/${size}` } : {}) });
+    res.writeHead(status, { 'Content-Type': mimeType, 'X-Music-Variant': actualVariant, 'Accept-Ranges': 'bytes', 'Content-Length': end - start + 1, 'Cache-Control': 'private, max-age=120', 'Vary': 'Cookie', ...(status === 206 ? { 'Content-Range': `bytes ${start}-${end}/${size}` } : {}) });
     return fs.createReadStream(file, { start, end }).pipe(res);
   }
   return sendJson(res, 404, { error: 'Маршрут не найден' });
