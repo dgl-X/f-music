@@ -1,13 +1,13 @@
 {
   "name": "family-music",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "license": "AGPL-3.0-only",
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
     "worker": "node src/server.js --worker",
-    "test": "node --test",
+    "test": "node --test --test-concurrency=1",
     "test:media:integration": "node scripts/media-integration-ci.mjs",
     "test:federation:two-node": "node scripts/federation-two-node-ci.mjs",
     "test:federation:baseline": "node scripts/check-federation-baseline.mjs",
