@@ -33,11 +33,24 @@ export class ShuffleNavigator {
   }
 
   peekNext(size, currentIndex, playable = () => true, wrap = true) {
+    return this.peekUpcoming(size, currentIndex, playable, 1, wrap)[0] ?? -1;
+  }
+
+  peekUpcoming(size, currentIndex, playable = () => true, count = 2, wrap = true) {
     this.ensure(size, currentIndex);
-    for (let position = this.position + 1; position < this.order.length; position++) { const index = this.order[position]; if (playable(index)) return index; }
-    if (!wrap || size < 2) return -1;
-    const savedOrder = [...this.order], savedPosition = this.position, savedSize = this.size;
-    this.reset(size, currentIndex); const index = this.order.slice(1).find(candidate => playable(candidate)) ?? -1;
-    this.order = savedOrder; this.position = savedPosition; this.size = savedSize; return index;
+    const result = [];
+    for (let position = this.position + 1; position < this.order.length; position++) {
+      const index = this.order[position];
+      if (playable(index)) result.push(index);
+      if (result.length >= count) return result;
+    }
+    if (wrap && size > 1) {
+      for (let position = 0; position < this.position; position++) {
+        const index = this.order[position];
+        if (playable(index) && !result.includes(index)) result.push(index);
+        if (result.length >= count) break;
+      }
+    }
+    return result;
   }
 }

@@ -14,3 +14,14 @@ test('shuffle skips failed tracks and does not invent previous history', () => {
   const next = navigator.next(4, 0, index => index !== 1);
   assert.notEqual(next, 1); assert.equal(navigator.previous(4, next), 0); assert.equal(navigator.previous(4, 0), -1);
 });
+
+test('shuffle preview shows two upcoming tracks without changing the order', () => {
+  const navigator = new ShuffleNavigator(() => 0.25);
+  navigator.reset(5, 2);
+  const before = [...navigator.order];
+  const upcoming = navigator.peekUpcoming(5, 2, index => index !== 3, 2, false);
+  assert.equal(upcoming.length, 2);
+  assert.deepEqual(navigator.order, before);
+  assert.equal(navigator.next(5, 2, index => index !== 3), upcoming[0]);
+  assert.equal(navigator.next(5, upcoming[0], index => index !== 3), upcoming[1]);
+});
