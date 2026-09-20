@@ -45,13 +45,6 @@ jobs:
         run: ./packaging/build-deb.sh "0.1.0-${GITHUB_RUN_NUMBER}" amd64
       - name: Проверить DEB-пакет
         run: dpkg-deb --info dist/family-music-server_*.deb
-      - name: Сохранить DEB-пакет проверки
-        uses: actions/upload-artifact@v6
-        with:
-          name: family-music-server-deb-${{ github.sha }}
-          path: dist/family-music-server_*.deb
-          if-no-files-found: error
-          retention-days: 7
 
   federation-two-node:
     runs-on: ubuntu-latest

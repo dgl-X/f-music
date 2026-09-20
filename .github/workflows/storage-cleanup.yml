@@ -1,0 +1,25 @@
+name: Однократная очистка Actions
+
+on:
+  push:
+    paths:
+      - .github/workflows/storage-cleanup.yml
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Удалить временные артефакты и кэши
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh api --paginate "repos/${GH_REPO}/actions/artifacts?per_page=100" --jq '.artifacts[].id' |
+            while read -r artifact_id; do
+              gh api --method DELETE "repos/${GH_REPO}/actions/artifacts/${artifact_id}"
+            done
+          gh cache delete --all --repo "${GH_REPO}" || true
