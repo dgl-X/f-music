@@ -35,12 +35,16 @@
 
 ## Каталог и файлы
 
-- `GET /tracks?q=&artist=&album=&liked=1&playlist_id=&sort=&limit=&offset=` — постраничный локальный каталог; ответ содержит `total`, `has_more`, `limit` и `offset`.
+- `GET /tracks?q=&artist=&album=&album_id=&liked=1&playlist_id=&sort=&limit=&offset=` — постраничный локальный каталог; ответ содержит `total`, `has_more`, `limit` и `offset`. `album_id` выбирает точную карточку альбома, включая треки с `feat.`. Старый фильтр `artist` + `album` продолжает работать.
 - `GET /favorites?q=&sort=&limit=&offset=` — единая пагинированная лента локальных лайков и ещё не завершённых федеративных импортов; `queue=1` допускает очередь до 10 000 элементов.
 - `GET /library?scope=all|local|remote&q=&sort=&limit=&offset=` — единый пагинированный каталог локальных и федеративных треков. В `all` уже импортированный трек показывается один раз как локальный; `queue=1` допускает очередь до 10 000 элементов.
 - `sort=random&seed=` — воспроизводимый случайный порядок по всей выбранной коллекции; Android использует его для глобального shuffle.
 - `POST /tracks/resolve` с `{ids:[...]}` — восстановить метаданные очереди в переданном порядке, до 10 000 локальных UUID и/или `remote:<opaque-ref>`.
-- `GET /catalog` — агрегированные исполнители и альбомы.
+- `GET /catalog` — исполнители и альбомы; у альбома есть стабильный `id`, `name`, `artist`, `bio`, `image_url`, `track_count`.
+- `GET /albums/{id}` — карточка альбома.
+- `PATCH /albums/{id}` — изменить описание `{bio}`; администратор или владелец всех треков альбома.
+- `PUT|DELETE /albums/{id}/image` — загрузить или удалить обложку карточки; те же права.
+- `GET /albums/{id}/image` — получить обложку карточки.
 - `PATCH /tracks/{id}` — изменить `title`, `artist`, `album`, `genre`, `year`.
 - `DELETE /tracks/{id}` — удалить трек и принадлежащие ему файлы.
 - `GET /tracks/{id}/stream?quality=auto|original|high|compact` — оригинал либо общая производная AAC 192/AAC 96 с поддержкой одного HTTP Range (`200`, `206`, `416`). Если выбранная AAC-копия ещё не готова, сервер ставит её в очередь и сразу отдаёт оригинал без задержки воспроизведения.
@@ -48,9 +52,9 @@
 - `PUT /tracks/{id}/cover` — тело с изображением до 12 МиБ.
 - `DELETE /tracks/{id}/cover` — удалить обложку.
 - `PUT|DELETE /tracks/{id}/like` — добавить или убрать сердечко.
-- `POST /tracks/batch` — пакетно оформить альбом: `{artist,album,genre,year,items:[{id,disc_number,track_number}]}`. Пустые исполнитель/жанр и год `null` сохраняют индивидуальные значения треков.
+- `POST /tracks/batch` — пакетно оформить альбом: `{album_id?,artist,album,genre,year,items:[{id,disc_number,track_number}]}`. Ответ содержит `album_id`. Поле `artist` задаёт исполнителя альбома и не переписывает исполнителей песен; пустой жанр и год `null` сохраняют индивидуальные значения треков.
 
-Элемент трека содержит `id`, `title`, `artist`, `album`, `filename`, `mime_type`, `size_bytes`, `duration_seconds`, `created_at`, `cover_url`, `genre`, `year`, `track_number`, `disc_number`, `liked`, `aac_192_ready`, `aac_96_ready`.
+Элемент трека содержит `id`, `title`, `artist`, `album`, `album_id`, `filename`, `mime_type`, `size_bytes`, `duration_seconds`, `created_at`, `cover_url`, `genre`, `year`, `track_number`, `disc_number`, `liked`, `aac_192_ready`, `aac_96_ready`.
 
 `GET /tracks/{id}/stream?quality=original&prepare=aac_192` отдаёт неизменяемый оригинал и одновременно ставит указанный AAC-вариант в фоновую очередь. Клиент переключается на `quality=aac_192` только после появления `aac_192_ready=true`, поэтому разные представления файла не смешиваются в одном HTTP-кэше.
 

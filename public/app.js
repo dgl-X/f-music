@@ -21,6 +21,7 @@ let activeView = 'liked';
 let activeArtist = '';
 let activeArtistId = 0;
 let activeAlbum = '';
+let activeAlbumId = 0;
 let searchQuery = '';
 let searchScope = localStorage.getItem('music-search-scope') || 'all';
 let federationNode='';
@@ -268,7 +269,7 @@ function resetUserPassword(id,name){passwordDialog({title:`Новый парол
 
 function switchView(view) {
   pageIndex=0;
-  if(view!=='collection'){activeArtist='';activeArtistId=0;activeAlbum='';if(view!=='playlist')activePlaylist=null;}
+  if(view!=='collection'){activeArtist='';activeArtistId=0;activeAlbum='';activeAlbumId=0;if(view!=='playlist')activePlaylist=null;}
   activeView=view;
   document.querySelectorAll('.tab').forEach(tab=>tab.classList.toggle('active',tab.dataset.view===view));
   document.querySelector('#sort').hidden=!['tracks','liked'].includes(view);
@@ -278,8 +279,8 @@ function switchView(view) {
   loadCurrentView();
 }
 
-function setTrackFilter(artist='',album='',artistId=0) {
-  activeArtist=artist;activeArtistId=Number(artistId)||0;activeAlbum=album;activeView='collection';document.querySelectorAll('.tab').forEach(tab=>tab.classList.remove('active'));document.querySelector('.catalog-tools').hidden=true;loadCollection();
+function setTrackFilter(artist='',album='',artistId=0,albumId=0) {
+  activeArtist=artist;activeArtistId=Number(artistId)||0;activeAlbum=album;activeAlbumId=Number(albumId)||0;activeView='collection';document.querySelectorAll('.tab').forEach(tab=>tab.classList.remove('active'));document.querySelector('.catalog-tools').hidden=true;loadCollection();
 }
 
 async function loadCurrentView() {
@@ -358,10 +359,10 @@ function manualRecognition(item,save){
 function renderActiveFilter() {
   const target=document.querySelector('#active-filter');
   const value=activePlaylist ? `Плейлист: ${activePlaylist.title}` : activeAlbum ? `Альбом: ${activeAlbum}` : activeArtist ? `Исполнитель: ${activeArtist}` : '';
-  target.innerHTML=value ? `<button id="clear-filter">${escapeHtml(value)} ×</button>${activePlaylist?'<button id="manage-playlist" class="secondary">Настроить</button>':''}${activeAlbum?'<button id="manage-album" class="secondary">Оформить альбом</button>':''}` : '';
+  target.innerHTML=value ? `<button id="clear-filter">${escapeHtml(value)} ×</button>${activePlaylist?'<button id="manage-playlist" class="secondary">Настроить</button>':''}${activeAlbum&&sessionUser?.is_admin?'<button id="manage-album" class="secondary">Оформить альбом</button>':''}` : '';
   if(value) document.querySelector('#clear-filter').onclick=()=>{activeArtist='';activeArtistId=0;activeAlbum='';activePlaylist=null;switchView('tracks');};
   if(activePlaylist)document.querySelector('#manage-playlist').onclick=async()=>{const title=prompt('Новое название плейлиста. Пустое значение удалит плейлист.',activePlaylist.title);if(title===null)return;if(!title.trim()){if(confirm(`Удалить плейлист «${activePlaylist.title}»?`)){await api(`/api/v1/playlists/${activePlaylist.id}`,{method:'DELETE'});activePlaylist=null;switchView('playlists');}}else{await api(`/api/v1/playlists/${activePlaylist.id}`,{method:'PATCH',body:JSON.stringify({title})});activePlaylist.title=title.trim();renderActiveFilter();}};
-  if(activeAlbum)document.querySelector('#manage-album').onclick=()=>{if(displayedTracks.length<2)return alert('Для оформления нужно минимум два трека');editUploadedAlbum({name:activeAlbum,tasks:displayedTracks.map(track=>({status:'ready',trackId:track.id,discNumber:track.disc_number,trackNumber:track.track_number,file:{name:track.filename||track.title,webkitRelativePath:track.filename||track.title},albumDone:false}))});};
+  if(activeAlbum&&sessionUser?.is_admin)document.querySelector('#manage-album').onclick=async()=>{if(!displayedTracks.length)return;const card=activeAlbumId?await api(`/api/v1/albums/${activeAlbumId}`):null;editExistingAlbum(displayedTracks,card);};
 }
 
 function setupPlayer() {
@@ -603,19 +604,19 @@ async function prepareRemotePlayback(track){
 
 async function loadCollection(){
   currentQueueRequest='';
-  const params=new URLSearchParams({sort:activeAlbum?'album':'title',queue:'1',limit:'10000',artist:activeArtist});if(activeAlbum)params.set('album',activeAlbum);
-  const [{items},artistCard]=await Promise.all([api(`/api/v1/tracks?${params}`),!activeAlbum&&activeArtistId?api(`/api/v1/artists/${activeArtistId}`):Promise.resolve(null)]),seconds=items.reduce((sum,item)=>sum+Number(item.duration_seconds||0),0),cover=artistCard?.image_url||items.find(item=>item.cover_url)?.cover_url||'';
+  const params=new URLSearchParams({sort:activeAlbum?'album':'title',queue:'1',limit:'10000'});if(activeAlbumId)params.set('album_id',activeAlbumId);else{if(activeArtist)params.set('artist',activeArtist);if(activeAlbum)params.set('album',activeAlbum);}
+  const [{items},artistCard,albumCard]=await Promise.all([api(`/api/v1/tracks?${params}`),!activeAlbum&&activeArtistId?api(`/api/v1/artists/${activeArtistId}`):Promise.resolve(null),activeAlbumId?api(`/api/v1/albums/${activeAlbumId}`):Promise.resolve(null)]),seconds=items.reduce((sum,item)=>sum+Number(item.duration_seconds||0),0),cover=albumCard?.image_url||artistCard?.image_url||items.find(item=>item.cover_url)?.cover_url||'';
   displayedTracks=items;const kind=activeAlbum?'Альбом':'Исполнитель',subtitle=activeAlbum?`${activeArtist}${items[0]?.year?` · ${items[0].year}`:''}`:`${items.length} ${items.length===1?'трек':'треков'}`,backView=activeAlbum?'albums':'artists';
   const cardMeta=artistCard?`${artistCard.album_count} альбомов · ${artistCard.featured_count} feat. · ${artistCard.play_count} просл.`:'';
-  const artistAlbums=artistCard?.albums?.length?`<div class="artist-albums">${artistCard.albums.map(album=>`<button class="secondary" data-album="${escapeHtml(album.name)}">${escapeHtml(album.name)} · ${album.track_count}</button>`).join('')}</div>`:'';
-  const header=`<section class="collection-hero"><button class="collection-back">‹</button><div class="collection-cover" ${cover?`style="background-image:url('${cover}')"`:''}>${cover?'':'♫'}</div><div class="collection-info"><small>${kind}</small><h2>${escapeHtml(activeAlbum||activeArtist)}</h2><span>${escapeHtml(subtitle)} · ${longDuration(seconds)}${cardMeta?` · ${escapeHtml(cardMeta)}`:''}</span>${artistCard?.bio?`<p class="artist-bio">${escapeHtml(artistCard.bio)}</p>`:''}${artistAlbums}<div><button class="primary collection-play">▶ Слушать</button><button class="secondary collection-shuffle">Перемешать</button>${activeAlbum?'<button class="secondary collection-edit">✎ Редактировать</button>':artistCard&&sessionUser?.is_admin?'<button class="secondary artist-edit">✎ Карточка</button>':''}</div></div></section>`;
+  const artistAlbums=artistCard?.albums?.length?`<div class="artist-albums">${artistCard.albums.map(album=>`<button class="secondary" data-id="${album.id||''}" data-album="${escapeHtml(album.name)}">${escapeHtml(album.name)} · ${album.track_count}</button>`).join('')}</div>`:'';
+  const header=`<section class="collection-hero"><button class="collection-back">‹</button><div class="collection-cover" ${cover?`style="background-image:url('${cover}')"`:''}>${cover?'':'♫'}</div><div class="collection-info"><small>${kind}</small><h2>${escapeHtml(activeAlbum||activeArtist)}</h2><span>${escapeHtml(subtitle)} · ${longDuration(seconds)}${cardMeta?` · ${escapeHtml(cardMeta)}`:''}</span>${albumCard?.bio?`<p class="artist-bio">${escapeHtml(albumCard.bio)}</p>`:''}${artistCard?.bio?`<p class="artist-bio">${escapeHtml(artistCard.bio)}</p>`:''}${artistAlbums}<div><button class="primary collection-play">▶ Слушать</button><button class="secondary collection-shuffle">Перемешать</button>${activeAlbum&&albumCard?.can_edit?'<button class="secondary collection-edit">✎ Редактировать</button>':artistCard&&sessionUser?.is_admin?'<button class="secondary artist-edit">✎ Карточка</button>':''}</div></div></section>`;
   renderTracks(items,'В этой коллекции нет треков.',header);const root=document.querySelector('#catalog-content');
-  root.querySelector('.collection-back').onclick=()=>{activeArtist='';activeArtistId=0;activeAlbum='';switchView(backView);};
+  root.querySelector('.collection-back').onclick=()=>{activeArtist='';activeArtistId=0;activeAlbum='';activeAlbumId=0;switchView(backView);};
   root.querySelector('.collection-play').onclick=()=>{if(!items.length)return;queue=[...items];playTrack(0);};
   root.querySelector('.collection-shuffle').onclick=()=>{if(!items.length)return;queue=[...items].sort(()=>Math.random()-.5);shuffleEnabled=true;document.querySelector('#shuffle').classList.add('active');playTrack(0);};
-  if(activeAlbum)root.querySelector('.collection-edit').onclick=()=>editExistingAlbum(items);
+  if(activeAlbum&&albumCard?.can_edit)root.querySelector('.collection-edit').onclick=()=>editExistingAlbum(items,albumCard);
   if(artistCard&&sessionUser?.is_admin)root.querySelector('.artist-edit').onclick=()=>editArtistCard(artistCard);
-  root.querySelectorAll('.artist-albums button').forEach(button=>button.onclick=()=>{activeAlbum=button.dataset.album;loadCollection();});
+  root.querySelectorAll('.artist-albums button').forEach(button=>button.onclick=()=>{activeAlbum=button.dataset.album;activeAlbumId=Number(button.dataset.id)||0;loadCollection();});
 }
 
 async function loadHistory(){currentQueueRequest='/api/v1/history?limit=200&offset=0';const data=await api(`/api/v1/history?limit=${pageSize}&offset=${pageIndex*pageSize}`);renderTracks(data.items,'История пока пуста.');renderPager(data,loadHistory);}
@@ -660,7 +661,7 @@ async function loadCatalog(view) {
   const root=document.querySelector('#catalog-content');
   if(!items.length){root.innerHTML='<div class="empty">Ничего не найдено.</div>';return;}
   root.innerHTML=`<div class="catalog-grid">${items.map(item=>`<button class="catalog-card" data-id="${item.id||''}" data-name="${escapeHtml(item.name)}" data-artist="${escapeHtml(item.artist??item.name)}"><div class="catalog-cover" ${(item.image_url||item.cover_track_id)?`style="background-image:url('${item.image_url||`/api/v1/tracks/${item.cover_track_id}/cover`}')"`:''}>${item.image_url||item.cover_track_id?'':'♫'}</div><div class="catalog-name">${escapeHtml(item.name)}</div><div class="catalog-meta">${view==='albums'?`${escapeHtml(item.artist)} · `:''}${item.track_count} ${item.track_count===1?'трек':'треков'}${item.year?` · ${item.year}`:''}</div></button>`).join('')}</div>`;
-  root.querySelectorAll('.catalog-card').forEach(card=>card.onclick=()=>setTrackFilter(card.dataset.artist,view==='albums'?card.dataset.name:'',view==='artists'?card.dataset.id:0));
+  root.querySelectorAll('.catalog-card').forEach(card=>card.onclick=()=>setTrackFilter(card.dataset.artist,view==='albums'?card.dataset.name:'',view==='artists'?card.dataset.id:0,view==='albums'?card.dataset.id:0));
   renderPager(data,()=>loadCatalog(view));
 }
 
@@ -806,17 +807,17 @@ function editUploadedAlbum(group){
   const tasks=group.tasks.filter(task=>task.status==='ready'&&task.trackId).sort((a,b)=>a.discNumber&&b.discNumber?(a.discNumber-b.discNumber)||(Number(a.trackNumber||9999)-Number(b.trackNumber||9999)):(a.file.webkitRelativePath||a.file.name).localeCompare(b.file.webkitRelativePath||b.file.name,'ru',{numeric:true}));
   const rows=tasks.map((task,index)=>{const relative=task.file.webkitRelativePath||task.file.name,disc=Number(task.discNumber||relative.match(/(?:cd|disc|disk)[ _-]*(\d+)/i)?.[1]||1),tag=Number(task.trackNumber||task.file.name.match(/^(\d{1,3})[\s._-]+/)?.[1]||0);return{task,disc,track:tag||index+1};});
   const dialog=document.createElement('dialog');dialog.className='album-dialog';
-  dialog.innerHTML=`<form class="edit-form"><div class="dialog-title">${group.existing?'Редактировать':'Оформить'} альбом</div><small class="album-hint">Общие поля применятся ко всем трекам. Порядок можно изменить стрелками или номерами.</small><label>Название альбома<input name="album" value="${escapeHtml(group.name.replace(/^Выбор \d+$/,''))}" required></label><label>Исполнитель альбома<input name="artist" value="${escapeHtml(group.artist||'')}" placeholder="Оставьте пустым, чтобы сохранить исполнителей"></label><div class="form-row"><label>Жанр<input name="genre" value="${escapeHtml(group.genre||'')}" placeholder="Не изменять"></label><label>Год<input name="year" type="number" min="1000" max="9999" value="${group.year||''}"></label></div><label class="secondary album-cover-select">Общая обложка<input name="cover" type="file" accept="image/*"></label><div class="album-order"></div><div class="error"></div><div class="dialog-actions"><button type="button" class="secondary album-cancel">Отмена</button><button class="primary album-save">Сохранить альбом</button></div></form>`;
+  dialog.innerHTML=`<form class="edit-form"><div class="dialog-title">${group.existing?'Редактировать':'Оформить'} альбом</div><small class="album-hint">Исполнитель альбома не меняет исполнителей отдельных песен. Порядок можно изменить стрелками или номерами.</small><label>Название альбома<input name="album" value="${escapeHtml(group.name.replace(/^Выбор \d+$/,''))}" required></label><label>Исполнитель альбома<input name="artist" value="${escapeHtml(group.artist||'')}" placeholder="Исполнитель альбома"></label><label>Описание альбома<textarea name="bio" maxlength="5000" rows="4" placeholder="Необязательно">${escapeHtml(group.bio||'')}</textarea></label><div class="form-row"><label>Жанр<input name="genre" value="${escapeHtml(group.genre||'')}" placeholder="Не изменять"></label><label>Год<input name="year" type="number" min="1000" max="9999" value="${group.year||''}"></label></div><label class="secondary album-cover-select">Обложка альбома<input name="cover" type="file" accept="image/*"></label>${group.albumId?'<label class="settings-check"><input name="remove_image" type="checkbox"><span>Удалить обложку альбома</span></label>':''}<div class="album-order"></div><div class="error"></div><div class="dialog-actions"><button type="button" class="secondary album-cancel">Отмена</button><button class="primary album-save">Сохранить альбом</button></div></form>`;
   document.body.append(dialog);dialog.showModal();
   const render=()=>{dialog.querySelector('.album-order').innerHTML=rows.map((row,index)=>`<div class="album-track-row" data-index="${index}"><span title="${escapeHtml(row.task.file.name)}">${escapeHtml(row.task.file.name)}</span><label>Диск<input class="album-disc" type="number" min="1" max="99" value="${row.disc}"></label><label>№<input class="album-number" type="number" min="1" max="999" value="${row.track}"></label><button type="button" class="secondary album-up" ${index===0?'disabled':''}>↑</button><button type="button" class="secondary album-down" ${index===rows.length-1?'disabled':''}>↓</button></div>`).join('');dialog.querySelectorAll('.album-track-row').forEach((element,index)=>{element.querySelector('.album-up').onclick=()=>{[rows[index-1],rows[index]]=[rows[index],rows[index-1]];render();};element.querySelector('.album-down').onclick=()=>{[rows[index+1],rows[index]]=[rows[index],rows[index+1]];render();};});};render();
   dialog.querySelector('.album-cancel').onclick=()=>dialog.close();dialog.addEventListener('close',()=>dialog.remove());
-  dialog.querySelector('form').onsubmit=async event=>{event.preventDefault();const form=event.currentTarget,error=form.querySelector('.error'),save=form.querySelector('.album-save');error.textContent='';dialog.querySelectorAll('.album-track-row').forEach((element,index)=>{rows[index].disc=Number(element.querySelector('.album-disc').value)||1;rows[index].track=Number(element.querySelector('.album-number').value)||index+1;});const values=Object.fromEntries(new FormData(form));const cover=form.elements.cover.files[0];delete values.cover;values.items=rows.map(row=>({id:row.task.trackId,disc_number:row.disc,track_number:row.track}));try{save.disabled=true;save.textContent='Сохраняем метаданные…';await api('/api/v1/tracks/batch',{method:'POST',body:JSON.stringify(values)});if(cover){save.textContent='Применяем общую обложку…';await api('/api/v1/tracks/batch-cover',{method:'PUT',headers:{'Content-Type':cover.type,'X-Track-Ids':rows.map(row=>row.task.trackId).join(',')},body:cover});}rows.forEach(row=>row.task.albumDone=true);dialog.close();if(group.onSaved)await group.onSaved(values);else renderUploadQueue();alert(`Альбом «${values.album}» сохранён: ${rows.length} треков`);}catch(problem){error.textContent=problem.message;save.disabled=false;save.textContent='Сохранить альбом';}};
+  dialog.querySelector('form').onsubmit=async event=>{event.preventDefault();const form=event.currentTarget,error=form.querySelector('.error'),save=form.querySelector('.album-save');error.textContent='';dialog.querySelectorAll('.album-track-row').forEach((element,index)=>{rows[index].disc=Number(element.querySelector('.album-disc').value)||1;rows[index].track=Number(element.querySelector('.album-number').value)||index+1;});const values=Object.fromEntries(new FormData(form));const cover=form.elements.cover.files[0],removeImage=Boolean(form.elements.remove_image?.checked);delete values.cover;delete values.remove_image;values.album_id=group.albumId||0;values.items=rows.map(row=>({id:row.task.trackId,disc_number:row.disc,track_number:row.track}));try{save.disabled=true;save.textContent='Сохраняем метаданные…';const result=await api('/api/v1/tracks/batch',{method:'POST',body:JSON.stringify(values)});const albumId=result.album_id;await api(`/api/v1/albums/${albumId}`,{method:'PATCH',body:JSON.stringify({bio:values.bio})});if(cover){save.textContent='Применяем обложку…';await api(`/api/v1/albums/${albumId}/image`,{method:'PUT',headers:{'Content-Type':cover.type},body:cover});}else if(removeImage)await api(`/api/v1/albums/${albumId}/image`,{method:'DELETE'});rows.forEach(row=>row.task.albumDone=true);dialog.close();if(group.onSaved)await group.onSaved({...values,album_id:albumId});else renderUploadQueue();alert(`Альбом «${values.album}» сохранён: ${rows.length} треков`);}catch(problem){error.textContent=problem.message;save.disabled=false;save.textContent='Сохранить альбом';}};
 }
 
-function editExistingAlbum(items){
+function editExistingAlbum(items,albumCard){
   if(!items.length)return;
   const same=value=>items.every(item=>(item[value]||'')===(items[0][value]||''))?(items[0][value]||''):'';
-  editUploadedAlbum({existing:true,name:activeAlbum,artist:same('artist'),genre:same('genre'),year:same('year'),tasks:items.map((track,index)=>({status:'ready',trackId:track.id,file:{name:`${track.track_number||index+1}. ${track.title}`,webkitRelativePath:''},discNumber:track.disc_number||1,trackNumber:track.track_number||index+1})),onSaved:async values=>{activeAlbum=values.album;activeArtist=values.artist||activeArtist;await loadCollection();}});
+  editUploadedAlbum({existing:true,albumId:albumCard?.id||0,name:activeAlbum,artist:albumCard?.artist||activeArtist,bio:albumCard?.bio||'',genre:same('genre'),year:albumCard?.year||same('year'),tasks:items.map((track,index)=>({status:'ready',trackId:track.id,file:{name:`${track.track_number||index+1}. ${track.title}`,webkitRelativePath:''},discNumber:track.disc_number||1,trackNumber:track.track_number||index+1})),onSaved:async values=>{activeAlbum=values.album;activeArtist=values.artist||activeArtist;activeAlbumId=values.album_id;await loadCollection();}});
 }
 
 function setupUploadDropZone(){

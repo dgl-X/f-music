@@ -42,6 +42,25 @@ END $$;
 DROP TRIGGER IF EXISTS tracks_sync_artist_credits ON tracks;
 CREATE TRIGGER tracks_sync_artist_credits AFTER INSERT OR UPDATE OF artist ON tracks FOR EACH ROW EXECUTE FUNCTION sync_track_artist_credits();
 UPDATE tracks SET artist=artist WHERE NOT EXISTS(SELECT 1 FROM track_artists WHERE track_artists.track_id=tracks.id);
+CREATE TABLE IF NOT EXISTS albums (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, artist TEXT NOT NULL, bio TEXT NOT NULL DEFAULT '', image_key TEXT, year INTEGER, created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE UNIQUE INDEX IF NOT EXISTS albums_name_artist_nocase ON albums(lower(name),lower(artist));
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS album_id BIGINT REFERENCES albums(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS tracks_album_id ON tracks(album_id);
+CREATE OR REPLACE FUNCTION sync_track_album() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE album_artist TEXT; linked_album BIGINT;
+BEGIN
+  IF trim(NEW.album)='' THEN NEW.album_id:=NULL; RETURN NEW; END IF;
+  IF NEW.album_id IS NOT NULL AND EXISTS(SELECT 1 FROM albums WHERE id=NEW.album_id AND lower(name)=lower(NEW.album)) THEN RETURN NEW; END IF;
+  album_artist:=trim(split_part(regexp_replace(NEW.artist,'\\s+(feat(?:uring)?\\.?|ft\\.?).*$','','i'),',',1));
+  IF album_artist='' THEN album_artist:='Неизвестный исполнитель'; END IF;
+  INSERT INTO albums(name,artist,year) VALUES(trim(NEW.album),album_artist,NEW.year)
+    ON CONFLICT((lower(name)),(lower(artist))) DO UPDATE SET name=albums.name RETURNING id INTO linked_album;
+  NEW.album_id:=linked_album;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS tracks_sync_album ON tracks;
+CREATE TRIGGER tracks_sync_album BEFORE INSERT OR UPDATE OF album,artist,album_id ON tracks FOR EACH ROW EXECUTE FUNCTION sync_track_album();
+UPDATE tracks SET album_id=NULL WHERE album<>'' AND album_id IS NULL;
 ALTER TABLE uploads ADD COLUMN IF NOT EXISTS track_id TEXT REFERENCES tracks(id) ON DELETE SET NULL;
 ALTER TABLE uploads ADD COLUMN IF NOT EXISTS candidate_track_id TEXT;
 CREATE TABLE IF NOT EXISTS processing_jobs (id BIGSERIAL PRIMARY KEY, upload_id TEXT NOT NULL UNIQUE REFERENCES uploads(id) ON DELETE CASCADE, status TEXT NOT NULL DEFAULT 'queued', attempts INTEGER NOT NULL DEFAULT 0, available_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ, last_error TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP);

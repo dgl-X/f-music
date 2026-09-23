@@ -23,12 +23,14 @@ const uploadDir = path.join(config.storageDir, 'uploads');
 const originalDir = path.join(config.storageDir, 'originals');
 const coverDir = path.join(config.storageDir, 'covers');
 const artistDir = path.join(config.storageDir, 'artists');
+const albumDir = path.join(config.storageDir, 'albums');
 const derivedDir = path.join(config.storageDir, 'derived');
 const federationReplicaDir = path.join(config.storageDir, 'federation', 'replicas');
 fs.mkdirSync(uploadDir, { recursive: true, mode: 0o750 });
 fs.mkdirSync(originalDir, { recursive: true, mode: 0o750 });
 fs.mkdirSync(coverDir, { recursive: true, mode: 0o750 });
 fs.mkdirSync(artistDir, { recursive: true, mode: 0o750 });
+fs.mkdirSync(albumDir, { recursive: true, mode: 0o750 });
 fs.mkdirSync(derivedDir, { recursive: true, mode: 0o750 });
 fs.mkdirSync(federationReplicaDir, { recursive: true, mode: 0o750 });
 
@@ -41,6 +43,12 @@ const sendJson = (res, status, value, extra = {}) => {
   res.writeHead(status, { ...jsonHeaders, ...extra });
   res.end(JSON.stringify(value));
 };
+
+async function canEditAlbum(user, albumId){
+  if(user.is_admin)return true;
+  const ownership=await db.prepare('SELECT count(*) total,count(*) FILTER(WHERE owner_id=?) mine FROM tracks WHERE album_id=?').get(user.id,albumId);
+  return Number(ownership.total)>0&&Number(ownership.mine)===Number(ownership.total);
+}
 
 async function federationSettings() {
   const rows = await db.prepare("SELECT key,value FROM app_settings WHERE key IN ('federation_enabled','federation_endpoints','federation_export_policy','federation_export_albums','federation_export_collections')").all();
@@ -1681,6 +1689,7 @@ async function api(req, res, url, apiPrefix = '/api') {
     const query = String(url.searchParams.get('q') ?? '').trim().slice(0, 120);
     const artist = String(url.searchParams.get('artist') ?? '').trim().slice(0, 240);
     const album = String(url.searchParams.get('album') ?? '').trim().slice(0, 240);
+    const albumId = Number(url.searchParams.get('album_id'));
     const liked = url.searchParams.get('liked') === '1';
     const playlistId = String(url.searchParams.get('playlist_id') ?? '');
     const sortKey = url.searchParams.get('sort') ?? 'newest';
@@ -1692,21 +1701,26 @@ async function api(req, res, url, apiPrefix = '/api') {
     const order = {
       newest: 'created_at DESC', oldest: 'created_at ASC',
       title: 'title COLLATE NOCASE ASC', artist: 'artist COLLATE NOCASE ASC, album COLLATE NOCASE ASC',
-      album: 'album COLLATE NOCASE ASC, track_number ASC, title COLLATE NOCASE ASC',
+      album: 'album COLLATE NOCASE ASC, disc_number ASC NULLS LAST, track_number ASC NULLS LAST, title COLLATE NOCASE ASC',
       year: 'year DESC, album COLLATE NOCASE ASC',
       random: 'md5(id || @seed)',
     }[sortKey] ?? 'created_at DESC';
     const where = [];
     const params = { current_user: user.id, limit, offset, seed: seed || 'family-music' };
     if (query) { where.push('(title ILIKE @query OR artist ILIKE @query OR album ILIKE @query OR genre ILIKE @query)'); params.query = `%${query}%`; }
-    if (artist) { where.push(`EXISTS(SELECT 1 FROM track_artists JOIN artists ON artists.id=track_artists.artist_id
-      WHERE track_artists.track_id=tracks.id AND artists.name=@artist COLLATE NOCASE)`); params.artist = artist; }
-    if (album) { where.push('album = @album COLLATE NOCASE'); params.album = album; }
+    const legacyAlbum=album&&artist&&!albumId?await db.prepare('SELECT id FROM albums WHERE lower(name)=lower(?) AND lower(artist)=lower(?)').get(album,artist):null;
+    if(legacyAlbum){where.push('album_id = @album_id');params.album_id=Number(legacyAlbum.id);}
+    else if(Number.isSafeInteger(albumId)&&albumId>0){where.push('album_id = @album_id');params.album_id=albumId;}
+    else{
+      if(artist){where.push(`EXISTS(SELECT 1 FROM track_artists JOIN artists ON artists.id=track_artists.artist_id
+        WHERE track_artists.track_id=tracks.id AND artists.name=@artist COLLATE NOCASE)`);params.artist=artist;}
+      if(album){where.push('album = @album COLLATE NOCASE');params.album=album;}
+    }
     if (liked) where.push('EXISTS(SELECT 1 FROM track_likes likes_filter WHERE likes_filter.track_id=tracks.id AND likes_filter.user_id=@current_user)');
     if (playlistId) { where.push('id IN (SELECT track_id FROM playlist_tracks WHERE playlist_id=@playlist_id)'); params.playlist_id = playlistId; }
     const filter = where.length ? `WHERE ${where.join(' AND ')}` : '';
     const total = Number((await db.prepare(`SELECT count(*) count FROM tracks ${filter}`).get(params)).count);
-    const sql = `SELECT id, title, artist, album, filename, mime_type, size_bytes, duration_seconds, created_at,
+    const sql = `SELECT id, title, artist, album, album_id, filename, mime_type, size_bytes, duration_seconds, created_at,
       cover_key, genre, year, track_number, disc_number,
       (SELECT recommended_gain_db FROM loudness_jobs WHERE loudness_jobs.track_id=tracks.id AND status='ready') AS replay_gain_db,
       EXISTS(SELECT 1 FROM track_files ready192 WHERE ready192.track_id=tracks.id AND ready192.variant='aac_192' AND ready192.status='ready') AS aac_192_ready,
@@ -1767,17 +1781,14 @@ async function api(req, res, url, apiPrefix = '/api') {
       GROUP BY artists.id,artists.name,artists.bio,artists.image_key ORDER BY artists.name COLLATE NOCASE${view==='artists'?pageSql:''}`).all(pageParams);
     for(const artist of artists){artist.image_url=artist.image_key?`${apiPrefix}/artists/${artist.id}/image`:null;delete artist.image_key;}
     if(view==='artists')return sendJson(res,200,{items:artists,total:artistTotal,offset,limit,has_more:offset+artists.length<artistTotal});
-    const albumFilter=query?'WHERE album ILIKE @query OR album_artist ILIKE @query':'';
-    const albumCountSql=`WITH album_tracks AS (SELECT tracks.album,COALESCE((SELECT artists.name FROM track_artists JOIN artists ON artists.id=track_artists.artist_id WHERE track_artists.track_id=tracks.id AND track_artists.role='primary' ORDER BY track_artists.position LIMIT 1),tracks.artist) album_artist FROM tracks WHERE album<>'') SELECT count(*) count FROM (SELECT 1 FROM album_tracks ${albumFilter} GROUP BY album_artist,album) grouped`;
-    const albumTotal=view==='albums'?Number((await db.prepare(albumCountSql).get(pageParams)).count):0;
-    const albums = await db.prepare(`WITH album_tracks AS (
-      SELECT tracks.*,
-        COALESCE((SELECT artists.name FROM track_artists JOIN artists ON artists.id=track_artists.artist_id
-          WHERE track_artists.track_id=tracks.id AND track_artists.role='primary' ORDER BY track_artists.position LIMIT 1),tracks.artist) AS album_artist
-      FROM tracks WHERE album<>'')
-      SELECT album AS name,album_artist AS artist,count(*) AS track_count,max(year) AS year,
-        min(id) FILTER (WHERE cover_key IS NOT NULL) AS cover_track_id
-      FROM album_tracks ${albumFilter} GROUP BY album_artist COLLATE NOCASE,album COLLATE NOCASE ORDER BY album COLLATE NOCASE${view==='albums'?pageSql:''}`).all(pageParams);
+    const albumFilter=query?'AND (albums.name ILIKE @query OR albums.artist ILIKE @query)':'';
+    const albumTotal=view==='albums'?Number((await db.prepare(`SELECT count(*) count FROM albums WHERE EXISTS(SELECT 1 FROM tracks WHERE tracks.album_id=albums.id) ${albumFilter}`).get(pageParams)).count):0;
+    const albums = await db.prepare(`SELECT albums.id,albums.name,albums.artist,albums.bio,COALESCE(albums.year,max(tracks.year)) AS year,
+      count(tracks.id) AS track_count,
+      min(tracks.id) FILTER (WHERE tracks.cover_key IS NOT NULL) AS cover_track_id,
+      CASE WHEN albums.image_key IS NOT NULL THEN '${apiPrefix}/albums/'||albums.id||'/image' ELSE NULL END AS image_url
+      FROM albums JOIN tracks ON tracks.album_id=albums.id WHERE TRUE ${albumFilter}
+      GROUP BY albums.id ORDER BY albums.name COLLATE NOCASE${view==='albums'?pageSql:''}`).all(pageParams);
     if(view==='albums')return sendJson(res,200,{items:albums,total:albumTotal,offset,limit,has_more:offset+albums.length<albumTotal});
     return sendJson(res, 200, { artists, albums });
   }
@@ -1876,7 +1887,7 @@ async function api(req, res, url, apiPrefix = '/api') {
       LEFT JOIN (SELECT track_id,sum(play_count) plays FROM play_history GROUP BY track_id) history ON history.track_id=tracks.id
       WHERE artists.id=? GROUP BY artists.id`).get(Number(artistMatch[1]));
     if(!artist)return sendJson(res,404,{error:'Исполнитель не найден'});
-    const albums=await db.prepare(`SELECT tracks.album AS name,count(*) AS track_count,max(tracks.year) AS "year",min(tracks.id) FILTER(WHERE tracks.cover_key IS NOT NULL) AS cover_track_id FROM tracks JOIN track_artists ON track_artists.track_id=tracks.id WHERE track_artists.artist_id=? AND tracks.album<>'' GROUP BY tracks.album ORDER BY tracks.album COLLATE NOCASE`).all(artist.id);
+    const albums=await db.prepare(`SELECT albums.id,albums.name,count(*) AS track_count,albums.year,min(tracks.id) FILTER(WHERE tracks.cover_key IS NOT NULL) AS cover_track_id FROM albums JOIN tracks ON tracks.album_id=albums.id JOIN track_artists ON track_artists.track_id=tracks.id WHERE track_artists.artist_id=? GROUP BY albums.id ORDER BY albums.name COLLATE NOCASE`).all(artist.id);
     return sendJson(res,200,{...artist,image_url:artist.image_key?`${apiPrefix}/artists/${artist.id}/image`:null,image_key:undefined,albums});
   }
   if(artistMatch&&req.method==='PATCH'){
@@ -1892,6 +1903,39 @@ async function api(req, res, url, apiPrefix = '/api') {
     if(!String(req.headers['content-type']||'').toLowerCase().startsWith('image/'))return sendJson(res,415,{error:'Нужен файл изображения'});
     const source=path.join(uploadDir,`${crypto.randomUUID()}.artist-source`),target=path.join(artistDir,`${artist.id}.jpg`);
     try{fs.writeFileSync(source,await readBytes(req,12*1024*1024),{mode:0o640});const ok=await runProcess('ffmpeg',['-loglevel','error','-y','-i',source,'-frames:v','1','-vf',"scale='min(1200,iw)':'min(1200,ih)':force_original_aspect_ratio=decrease",'-q:v','2',target]);if(!ok||!fs.existsSync(target))return sendJson(res,400,{error:'Не удалось прочитать изображение'});const key=path.join('artists',`${artist.id}.jpg`);await db.prepare('UPDATE artists SET image_key=? WHERE id=?').run(key,artist.id);return sendJson(res,200,{ok:true,image_url:`${apiPrefix}/artists/${artist.id}/image?v=${Date.now()}`});}finally{fs.rmSync(source,{force:true});}
+  }
+  const albumMatch=/^\/api\/albums\/(\d+)$/.exec(url.pathname);
+  if(albumMatch&&(req.method==='GET'||req.method==='PATCH')){
+    const album=await db.prepare('SELECT id,name,artist,bio,image_key,year FROM albums WHERE id=?').get(Number(albumMatch[1]));
+    if(!album)return sendJson(res,404,{error:'Альбом не найден'});
+    if(req.method==='PATCH'){
+      if(!await canEditAlbum(user,album.id))return sendJson(res,403,{error:'Недостаточно прав для изменения альбома'});
+      const body=await readJson(req),bio=String(body.bio??'').trim();
+      if(bio.length>5000)return sendJson(res,400,{error:'Описание слишком длинное'});
+      await db.prepare('UPDATE albums SET bio=? WHERE id=?').run(bio,album.id);album.bio=bio;
+    }
+    return sendJson(res,200,{...album,image_url:album.image_key?`${apiPrefix}/albums/${album.id}/image`:null,image_key:undefined,can_edit:await canEditAlbum(user,album.id)});
+  }
+  const albumImageMatch=/^\/api\/albums\/(\d+)\/image$/.exec(url.pathname);
+  if(albumImageMatch&&(req.method==='PUT'||req.method==='DELETE')){
+    const album=await db.prepare('SELECT id,image_key FROM albums WHERE id=?').get(Number(albumImageMatch[1]));
+    if(!album)return sendJson(res,404,{error:'Альбом не найден'});
+    if(!await canEditAlbum(user,album.id))return sendJson(res,403,{error:'Недостаточно прав для изменения альбома'});
+    if(req.method==='DELETE'){
+      await db.prepare('UPDATE albums SET image_key=NULL WHERE id=?').run(album.id);
+      if(album.image_key){const file=path.resolve(config.storageDir,album.image_key);if(file.startsWith(config.storageDir+path.sep))fs.rmSync(file,{force:true});}
+      return sendJson(res,200,{ok:true,image_url:null});
+    }
+    if(!String(req.headers['content-type']||'').toLowerCase().startsWith('image/'))return sendJson(res,415,{error:'Нужен файл изображения'});
+    const source=path.join(uploadDir,`${crypto.randomUUID()}.album-source`),temporary=path.join(uploadDir,`${crypto.randomUUID()}.album.jpg`),target=path.join(albumDir,`${album.id}.jpg`);
+    try{
+      fs.writeFileSync(source,await readBytes(req,12*1024*1024),{mode:0o640});
+      const ok=await runProcess('ffmpeg',['-loglevel','error','-y','-i',source,'-frames:v','1','-vf',"scale='min(1200,iw)':'min(1200,ih)':force_original_aspect_ratio=decrease",'-q:v','2',temporary]);
+      if(!ok||!fs.existsSync(temporary))return sendJson(res,400,{error:'Не удалось прочитать изображение'});
+      fs.renameSync(temporary,target);
+      await db.prepare('UPDATE albums SET image_key=? WHERE id=?').run(path.join('albums',`${album.id}.jpg`),album.id);
+      return sendJson(res,200,{ok:true,image_url:`${apiPrefix}/albums/${album.id}/image?v=${Date.now()}`});
+    }finally{fs.rmSync(source,{force:true});fs.rmSync(temporary,{force:true});}
   }
   if(url.pathname==='/api/duplicates'&&req.method==='GET'){
     const rows=await db.prepare(`WITH normalized AS (
@@ -1929,16 +1973,41 @@ async function api(req, res, url, apiPrefix = '/api') {
   if (url.pathname === '/api/tracks/batch' && req.method === 'POST') {
     const body=await readJson(req,1024*1024),items=Array.isArray(body.items)?body.items.slice(0,500):[];
     const ids=[...new Set(items.map(item=>String(item.id||'')).filter(id=>/^[0-9a-f-]{36}$/.test(id)))];
-    if(ids.length<2)return sendJson(res,400,{error:'Для альбома нужно минимум два трека'});
-    const tracks=await db.prepare('SELECT id,owner_id FROM tracks WHERE id = ANY(@ids)').all({ids});
+    if(ids.length<1)return sendJson(res,400,{error:'Выберите хотя бы один трек'});
+    const tracks=await db.prepare('SELECT id,owner_id,artist,album_id FROM tracks WHERE id = ANY(@ids)').all({ids});
     if(tracks.length!==ids.length)return sendJson(res,404,{error:'Один из треков не найден'});
     if(!user.is_admin&&tracks.some(track=>track.owner_id!==user.id))return sendJson(res,403,{error:'Недостаточно прав для изменения одного из треков'});
     const clean=(value,max=240)=>String(value??'').trim().slice(0,max),artist=clean(body.artist),album=clean(body.album),genre=clean(body.genre,120);
     const year=body.year===''||body.year==null?null:Number(body.year);
     if(!album)return sendJson(res,400,{error:'Введите название альбома'});
     if(year!==null&&(!Number.isInteger(year)||year<1000||year>9999))return sendJson(res,400,{error:'Некорректный год'});
-    await db.transaction(async tx=>{for(let index=0;index<items.length;index++){const item=items[index],id=String(item.id||'');if(!ids.includes(id))continue;const trackNumber=Number.isInteger(Number(item.track_number))&&Number(item.track_number)>0?Number(item.track_number):index+1;const discNumber=Number.isInteger(Number(item.disc_number))&&Number(item.disc_number)>0?Number(item.disc_number):1;await tx.prepare(`UPDATE tracks SET artist=CASE WHEN @artist='' THEN artist ELSE @artist END,album=@album,genre=CASE WHEN @genre='' THEN genre ELSE @genre END,year=COALESCE(@year,year),track_number=@track_number,disc_number=@disc_number WHERE id=@id`).run({artist,album,genre,year,track_number:trackNumber,disc_number:discNumber,id});}});
-    return sendJson(res,200,{ok:true,updated:ids.length});
+    const requestedAlbumId=Number(body.album_id)||0;
+    if(requestedAlbumId&&(!Number.isSafeInteger(requestedAlbumId)||!tracks.some(track=>Number(track.album_id)===requestedAlbumId)))return sendJson(res,400,{error:'Альбом не соответствует выбранным трекам'});
+    const existingAlbum=requestedAlbumId?await db.prepare('SELECT id,artist FROM albums WHERE id=?').get(requestedAlbumId):null;
+    if(requestedAlbumId&&!existingAlbum)return sendJson(res,404,{error:'Альбом не найден'});
+    const firstArtist=tracks.find(track=>track.id===ids[0])?.artist||'Неизвестный исполнитель';
+    const albumArtist=artist||existingAlbum?.artist||firstArtist.replace(/\s+(feat(?:uring)?\.?|ft\.?).*$/i,'').split(',')[0].trim()||'Неизвестный исполнитель';
+    const conflicting=await db.prepare('SELECT id FROM albums WHERE lower(name)=lower(?) AND lower(artist)=lower(?)').get(album,albumArtist);
+    if(conflicting&&requestedAlbumId&&Number(conflicting.id)!==requestedAlbumId)return sendJson(res,409,{error:'Альбом с таким названием и исполнителем уже существует'});
+    if(!user.is_admin&&(requestedAlbumId||conflicting)&&!await canEditAlbum(user,requestedAlbumId||conflicting.id))return sendJson(res,403,{error:'Недостаточно прав для изменения общего альбома'});
+    let savedAlbumId;
+    await db.transaction(async tx=>{
+      if(requestedAlbumId){
+        await tx.prepare('UPDATE albums SET name=?,artist=?,year=COALESCE(?,year) WHERE id=?').run(album,albumArtist,year,requestedAlbumId);
+        await tx.prepare('UPDATE tracks SET album=? WHERE album_id=? AND album<>?').run(album,requestedAlbumId,album);
+        savedAlbumId=requestedAlbumId;
+      }else{
+        const saved=await tx.prepare(`INSERT INTO albums(name,artist,year) VALUES(?,?,?) ON CONFLICT((lower(name)),(lower(artist))) DO UPDATE SET year=COALESCE(EXCLUDED.year,albums.year) RETURNING id`).get(album,albumArtist,year);
+        savedAlbumId=Number(saved.id);
+      }
+      for(let index=0;index<items.length;index++){
+        const item=items[index],id=String(item.id||'');if(!ids.includes(id))continue;
+        const trackNumber=Number.isInteger(Number(item.track_number))&&Number(item.track_number)>0?Number(item.track_number):index+1;
+        const discNumber=Number.isInteger(Number(item.disc_number))&&Number(item.disc_number)>0?Number(item.disc_number):1;
+        await tx.prepare(`UPDATE tracks SET album=@album,album_id=@album_id,genre=CASE WHEN @genre='' THEN genre ELSE @genre END,year=COALESCE(@year,year),track_number=@track_number,disc_number=@disc_number WHERE id=@id`).run({album,album_id:savedAlbumId,genre,year,track_number:trackNumber,disc_number:discNumber,id});
+      }
+    });
+    return sendJson(res,200,{ok:true,updated:ids.length,album_id:savedAlbumId});
   }
   if (url.pathname === '/api/tracks/batch-cover' && req.method === 'PUT') {
     if (!String(req.headers['content-type'] ?? '').toLowerCase().startsWith('image/')) return sendJson(res,415,{error:'Нужен файл изображения'});
@@ -2120,6 +2189,12 @@ async function api(req, res, url, apiPrefix = '/api') {
     const artist=await db.prepare('SELECT image_key FROM artists WHERE id=?').get(Number(artistImageGetMatch[1]));if(!artist?.image_key){res.writeHead(404);return res.end();}
     const file=path.resolve(config.storageDir,artist.image_key);if(!file.startsWith(config.storageDir+path.sep)||!fs.existsSync(file)){res.writeHead(404);return res.end();}
     res.writeHead(200,{'Content-Type':'image/jpeg','Cache-Control':'private, max-age=3600'});return fs.createReadStream(file).pipe(res);
+  }
+  const albumImageGetMatch=/^\/api\/albums\/(\d+)\/image$/.exec(url.pathname);
+  if(albumImageGetMatch&&req.method==='GET'){
+    const album=await db.prepare('SELECT image_key FROM albums WHERE id=?').get(Number(albumImageGetMatch[1]));if(!album?.image_key){res.writeHead(404);return res.end();}
+    const file=path.resolve(config.storageDir,album.image_key);if(!file.startsWith(config.storageDir+path.sep)||!fs.existsSync(file)){res.writeHead(404);return res.end();}
+    res.writeHead(200,{'Content-Type':'image/jpeg','Cache-Control':'private, max-age=3600','Vary':'Cookie'});return fs.createReadStream(file).pipe(res);
   }
   const streamMatch = /^\/api\/tracks\/([0-9a-f-]+)\/stream$/.exec(url.pathname);
   if (streamMatch && req.method === 'GET') {
