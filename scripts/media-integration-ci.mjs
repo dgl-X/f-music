@@ -176,6 +176,16 @@ try {
   }, 'Worker did not recover and finish the upload', 30000);
   assert.ok(ready.track_id);
 
+  const invalidAudio=Buffer.from('this is not an mp3 stream');
+  result=await json('/api/v1/uploads',{method:'POST',headers:{'Content-Type':'application/json',Cookie:cookie,Origin:origin},body:JSON.stringify({filename:'broken.mp3',mime_type:'audio/mpeg',size:invalidAudio.length})});
+  assert.equal(result.response.status,201);const invalidUploadId=result.body.id;
+  result=await json(`/api/v1/uploads/${invalidUploadId}`,{method:'PUT',headers:{Cookie:cookie,Origin:origin,'Content-Type':'application/octet-stream','Content-Range':`bytes 0-${invalidAudio.length-1}/${invalidAudio.length}`},body:invalidAudio});
+  assert.ok([200,202].includes(result.response.status));
+  const rejected=await waitFor(async()=>{const status=await json(`/api/v1/uploads/${invalidUploadId}`,{headers:{Cookie:cookie}});return status.body.status==='failed'?status.body:null;},'Broken audio was not rejected');
+  assert.equal(rejected.error,'Файл не распознан как аудио');
+  assert.equal(await db.prepare("SELECT count(*) count FROM tracks WHERE filename='broken.mp3'").get().then(row=>Number(row.count)),0);
+  assert.equal(fs.existsSync(path.join(storageDir,'uploads',`${invalidUploadId}.part`)),false);
+
   let stream = await fetch(`${origin}/api/v1/tracks/${ready.track_id}/stream`, { headers: { Cookie: cookie, Range: 'bytes=0-15' } });
   assert.equal(stream.status, 206);
   assert.match(stream.headers.get('content-range'), /^bytes 0-15\/\d+$/);

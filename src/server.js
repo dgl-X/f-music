@@ -18,6 +18,7 @@ import { audioCodec, playbackVariant, requiresCompatibilityVariant } from './aud
 import { serveStoredMedia } from './media-stream.js';
 import { RegistrationLimiter, validateRegistration } from './registration.js';
 import { clearSessionCookie, createAuthenticationService, hasValidSessionOrigin, requestIp, requestOriginMatches } from './authentication.js';
+import { validateAudioDecode } from './audio-validation.js';
 
 const config = loadConfig();
 const db = await openDatabase(config.databaseUrl);
@@ -607,6 +608,12 @@ async function finalizeUpload(upload) {
   if (!metadata || !String(metadata.format_name ?? '').match(/mp3|flac|ogg|opus|aac|m4a|mp4|wav/)) {
     await db.prepare("UPDATE uploads SET status='failed', error='Файл не распознан как аудио', updated_at=CURRENT_TIMESTAMP WHERE id=?").run(upload.id);
     fs.rmSync(source, { force: true });
+    return;
+  }
+  const validation=await validateAudioDecode(source,metadata.duration);
+  if(!validation.valid){
+    await db.prepare("UPDATE uploads SET status='failed', error='Аудиофайл повреждён или обрезан', updated_at=CURRENT_TIMESTAMP WHERE id=?").run(upload.id);
+    fs.rmSync(source,{force:true});
     return;
   }
   const duplicate = await db.prepare('SELECT id FROM tracks WHERE sha256=?').get(sourceSha256);
