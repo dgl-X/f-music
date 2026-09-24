@@ -14,6 +14,8 @@ const origin = `http://127.0.0.1:${port}`;
 const storageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'family-music-media-test-'));
 const children = [];
 const accountSecret = ['integration', 'fixture', String(process.pid)].join('-');
+const changedAccountSecret = ['integration', 'changed', String(process.pid)].join('-');
+const familySecret = ['family', 'changed', String(process.pid)].join('-');
 
 function wavFixture() {
   const sampleRate = 8000, seconds = 1, samples = sampleRate * seconds;
@@ -135,6 +137,7 @@ try {
     body: JSON.stringify({ username: 'family', display_name: 'Family', password: accountSecret }),
   });
   assert.equal(result.response.status, 201);
+  const familyId=result.body.id;
   result = await json('/api/v1/admin/registration-settings', {
     method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: cookie, Origin: origin }, body: JSON.stringify({ enabled:false }),
   });
@@ -181,6 +184,23 @@ try {
   stream = await fetch(`${origin}/api/v1/tracks/${ready.track_id}/stream`, { headers: { Cookie: cookie, Range: 'bytes=999999-' } });
   assert.equal(stream.status, 416);
   assert.match(stream.headers.get('content-range'), /^bytes \*\/\d+$/);
+
+  result=await json('/api/v1/login',{method:'POST',headers:{'Content-Type':'application/json',Origin:origin},body:JSON.stringify({username:'family',password:accountSecret})});
+  assert.equal(result.response.status,200);const familyCookie=result.response.headers.get('set-cookie').split(';',1)[0];
+  result=await json(`/api/v1/users/${familyId}/password`,{method:'PUT',headers:{'Content-Type':'application/json',Cookie:cookie,Origin:origin},body:JSON.stringify({new_password:familySecret})});
+  assert.equal(result.response.status,200);
+  result=await json('/api/v1/me',{headers:{Cookie:familyCookie}});assert.equal(result.response.status,401);
+  result=await json('/api/v1/login',{method:'POST',headers:{'Content-Type':'application/json',Origin:origin},body:JSON.stringify({username:'family',password:accountSecret})});assert.equal(result.response.status,401);
+  result=await json('/api/v1/login',{method:'POST',headers:{'Content-Type':'application/json',Origin:origin},body:JSON.stringify({username:'family',password:familySecret})});assert.equal(result.response.status,200);
+
+  result=await json('/api/v1/login',{method:'POST',headers:{'Content-Type':'application/json',Origin:origin},body:JSON.stringify({username:'integration',password:accountSecret,device_name:'Password change victim'})});
+  assert.equal(result.response.status,200);const passwordVictimCookie=result.response.headers.get('set-cookie').split(';',1)[0];
+  result=await json('/api/v1/me/password',{method:'PUT',headers:{'Content-Type':'application/json',Cookie:cookie,Origin:origin},body:JSON.stringify({current_password:'wrong-password',new_password:changedAccountSecret})});assert.equal(result.response.status,400);
+  result=await json('/api/v1/me/password',{method:'PUT',headers:{'Content-Type':'application/json',Cookie:cookie,Origin:origin},body:JSON.stringify({current_password:accountSecret,new_password:changedAccountSecret})});assert.equal(result.response.status,200);
+  result=await json('/api/v1/me',{headers:{Cookie:passwordVictimCookie}});assert.equal(result.response.status,401);
+  result=await json('/api/v1/login',{method:'POST',headers:{'Content-Type':'application/json',Origin:origin},body:JSON.stringify({username:'integration',password:accountSecret})});assert.equal(result.response.status,401);
+  result=await json('/api/v1/login',{method:'POST',headers:{'Content-Type':'application/json',Origin:origin},body:JSON.stringify({username:'integration',password:changedAccountSecret})});assert.equal(result.response.status,200);
+
   result = await json('/api/v1/logout', { method:'POST', headers:{ Cookie:cookie } });
   assert.equal(result.response.status,403);
   result = await json('/api/v1/logout', { method:'POST', headers:{ Cookie:cookie, Origin:origin } });

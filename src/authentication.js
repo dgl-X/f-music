@@ -1,4 +1,19 @@
-import { parseCookies, randomToken, tokenHash, verifyPassword } from './security.js';
+import { hashPassword, parseCookies, randomToken, tokenHash, verifyPassword } from './security.js';
+
+export function validateInitialSetup(input = {}) {
+  const username=String(input.username??'').trim(),displayName=String(input.display_name??'').trim();
+  const libraryName=String(input.library_name??'Family Music').trim(),password=String(input.password??'');
+  if(!/^[a-zA-Z0-9_.-]{3,32}$/.test(username))return {error:'Некорректное имя пользователя'};
+  if(displayName.length>80)return {error:'Отображаемое имя слишком длинное'};
+  if(libraryName.length<2||libraryName.length>60)return {error:'Название библиотеки: от 2 до 60 символов'};
+  if(password.length<10||password.length>256)return {error:'Пароль должен содержать от 10 до 256 символов'};
+  return {username,displayName:displayName||username,libraryName,password,recognitionEnabled:Boolean(input.recognition_enabled)};
+}
+
+export function validateNewPassword(value) {
+  const password=String(value??'');
+  return password.length>=10&&password.length<=256?{password}:{error:'Новый пароль должен содержать от 10 до 256 символов'};
+}
 
 export function requestIp(req) {
   return String(req.headers['x-real-ip'] || req.socket.remoteAddress || '').slice(0, 80);
@@ -47,6 +62,20 @@ export class LoginAttemptLimiter {
 export function createAuthenticationService({ db, sessionDays, secureCookies }) {
   const attempts = new LoginAttemptLimiter();
   return {
+    async setup(input) {
+      const values=validateInitialSetup(input);if(values.error)return {status:'invalid',error:values.error};
+      const created=await db.transaction(async tx=>{
+        await tx.prepare('LOCK TABLE users IN EXCLUSIVE MODE').run();
+        if(Number((await tx.prepare('SELECT count(*) count FROM users').get()).count)!==0)return false;
+        await tx.prepare('INSERT INTO users (username, display_name, password_hash, is_admin) VALUES (?, ?, ?, 1)').run(values.username,values.displayName,hashPassword(values.password));
+        await tx.prepare(`INSERT INTO app_settings(key,value,updated_at) VALUES('library_name',?,CURRENT_TIMESTAMP)
+          ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP`).run(values.libraryName);
+        await tx.prepare(`INSERT INTO app_settings(key,value,updated_at) VALUES('recognition_enabled',?,CURRENT_TIMESTAMP)
+          ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP`).run(values.recognitionEnabled?'true':'false');
+        return true;
+      });
+      return created?{status:'ok',libraryName:values.libraryName}:{status:'configured'};
+    },
     async login({ username, password, deviceName, clientName, userAgent, ip }) {
       if (attempts.blocked(ip)) return { status: 'blocked' };
       const user = await db.prepare('SELECT * FROM users WHERE lower(username) = lower(?)').get(String(username ?? ''));
@@ -97,6 +126,26 @@ export function createAuthenticationService({ db, sessionDays, secureCookies }) 
       if (!target) return null;
       await db.prepare('DELETE FROM sessions WHERE id=? AND user_id=?').run(targetId, user.id);
       return { current: String(targetId) === String(user.session_id) };
+    },
+    async changeOwnPassword({ userId, cookieHeader, currentPassword, newPassword }) {
+      const values=validateNewPassword(newPassword);if(values.error)return {status:'invalid',error:values.error};
+      const account=await db.prepare('SELECT password_hash FROM users WHERE id=?').get(userId);
+      if(!account||!verifyPassword(String(currentPassword??''),account.password_hash))return {status:'wrong_current'};
+      const token=parseCookies(cookieHeader).music_session;
+      await db.transaction(async tx=>{
+        await tx.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hashPassword(values.password),userId);
+        await tx.prepare('DELETE FROM sessions WHERE user_id=? AND token_hash<>?').run(userId,tokenHash(token||''));
+      });
+      return {status:'ok'};
+    },
+    async resetUserPassword({ targetId, newPassword }) {
+      const values=validateNewPassword(newPassword);if(values.error)return {status:'invalid',error:values.error};
+      if(!await db.prepare('SELECT 1 FROM users WHERE id=?').get(targetId))return {status:'not_found'};
+      await db.transaction(async tx=>{
+        await tx.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hashPassword(values.password),targetId);
+        await tx.prepare('DELETE FROM sessions WHERE user_id=?').run(targetId);
+      });
+      return {status:'ok'};
     },
   };
 }

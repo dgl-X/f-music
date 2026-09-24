@@ -12,7 +12,7 @@ import { FEDERATION_PROTOCOL_MINOR, negotiateFederation } from './federation-pro
 import { getFederationJson, openFederationStream, postFederationJson, probeFederationEndpoint } from './federation-endpoints.js';
 import { signFederationRequest, signFederationResponse, signPairingConfirmation, verifyFederationRequest, verifyFederationResponse, verifyPairingConfirmation } from './federation-signatures.js';
 import { resolveApiRoute } from './routing.js';
-import { acquireCounter, hashPassword, parseContentRange, parseCookies, randomToken, releaseCounter, tokenHash, verifyPassword } from './security.js';
+import { acquireCounter, hashPassword, parseContentRange, randomToken, releaseCounter, tokenHash } from './security.js';
 import { normalizeHybridFlac } from './audio-normalization.js';
 import { audioCodec, playbackVariant, requiresCompatibilityVariant } from './audio-compatibility.js';
 import { serveStoredMedia } from './media-stream.js';
@@ -1017,29 +1017,10 @@ async function api(req, res, url, apiPrefix = '/api') {
     });
   }
   if (url.pathname === '/api/setup' && req.method === 'POST') {
-    const body = await readJson(req);
-    const username = String(body.username ?? '').trim();
-    const displayName = String(body.display_name ?? '').trim();
-    const libraryName = String(body.library_name ?? 'Family Music').trim();
-    const password = String(body.password ?? '');
-    if (!/^[a-zA-Z0-9_.-]{3,32}$/.test(username)) return sendJson(res, 400, { error: 'Некорректное имя пользователя' });
-    if (displayName.length > 80) return sendJson(res, 400, { error: 'Отображаемое имя слишком длинное' });
-    if (libraryName.length < 2 || libraryName.length > 60) return sendJson(res, 400, { error: 'Название библиотеки: от 2 до 60 символов' });
-    if (password.length < 10) return sendJson(res, 400, { error: 'Пароль должен содержать не менее 10 символов' });
-    const passwordHash = hashPassword(password);
-    const created = await db.transaction(async tx => {
-      await tx.prepare('LOCK TABLE users IN EXCLUSIVE MODE').run();
-      if (Number((await tx.prepare('SELECT count(*) count FROM users').get()).count) !== 0) return false;
-      await tx.prepare('INSERT INTO users (username, display_name, password_hash, is_admin) VALUES (?, ?, ?, 1)')
-        .run(username, displayName || username, passwordHash);
-      await tx.prepare(`INSERT INTO app_settings(key,value,updated_at) VALUES('library_name',?,CURRENT_TIMESTAMP)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP`).run(libraryName);
-      await tx.prepare(`INSERT INTO app_settings(key,value,updated_at) VALUES('recognition_enabled',?,CURRENT_TIMESTAMP)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP`).run(body.recognition_enabled ? 'true' : 'false');
-      return true;
-    });
-    if (!created) return sendJson(res, 409, { error: 'Первичная настройка уже выполнена' });
-    return sendJson(res, 201, { ok: true, library_name: libraryName });
+    const result=await authentication.setup(await readJson(req));
+    if(result.status==='invalid')return sendJson(res,400,{error:result.error});
+    if(result.status==='configured')return sendJson(res,409,{error:'Первичная настройка уже выполнена'});
+    return sendJson(res,201,{ok:true,library_name:result.libraryName});
   }
   if (url.pathname === '/api/register' && req.method === 'POST') {
     if (!requestOriginMatches(req)) return sendJson(res,403,{error:'Недоверенный источник запроса'});
@@ -1481,16 +1462,9 @@ async function api(req, res, url, apiPrefix = '/api') {
   }
   if (url.pathname === '/api/me/password' && req.method === 'PUT') {
     const body = await readJson(req);
-    const account = await db.prepare('SELECT password_hash FROM users WHERE id=?').get(user.id);
-    const currentPassword = String(body.current_password ?? '');
-    const newPassword = String(body.new_password ?? '');
-    if (!verifyPassword(currentPassword, account.password_hash)) return sendJson(res, 400, { error: 'Текущий пароль указан неверно' });
-    if (newPassword.length < 10) return sendJson(res, 400, { error: 'Новый пароль должен содержать не менее 10 символов' });
-    const token = parseCookies(req.headers.cookie).music_session;
-    await db.transaction(async tx => {
-      await tx.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hashPassword(newPassword), user.id);
-      await tx.prepare('DELETE FROM sessions WHERE user_id=? AND token_hash<>?').run(user.id, tokenHash(token));
-    });
+    const result=await authentication.changeOwnPassword({userId:user.id,cookieHeader:req.headers.cookie,currentPassword:body.current_password,newPassword:body.new_password});
+    if(result.status==='wrong_current')return sendJson(res,400,{error:'Текущий пароль указан неверно'});
+    if(result.status==='invalid')return sendJson(res,400,{error:result.error});
     return sendJson(res, 200, { ok: true });
   }
   if (url.pathname === '/api/federation/search' && req.method === 'GET') {
@@ -1665,13 +1639,9 @@ async function api(req, res, url, apiPrefix = '/api') {
     if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
     const targetId = Number(userPasswordMatch[1]);
     if (targetId === user.id) return sendJson(res, 400, { error: 'Свой пароль меняется через профиль' });
-    if (!await db.prepare('SELECT 1 FROM users WHERE id=?').get(targetId)) return sendJson(res, 404, { error: 'Пользователь не найден' });
-    const newPassword = String((await readJson(req)).new_password ?? '');
-    if (newPassword.length < 10) return sendJson(res, 400, { error: 'Новый пароль должен содержать не менее 10 символов' });
-    await db.transaction(async tx => {
-      await tx.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hashPassword(newPassword), targetId);
-      await tx.prepare('DELETE FROM sessions WHERE user_id=?').run(targetId);
-    });
+    const result=await authentication.resetUserPassword({targetId,newPassword:(await readJson(req)).new_password});
+    if(result.status==='not_found')return sendJson(res,404,{error:'Пользователь не найден'});
+    if(result.status==='invalid')return sendJson(res,400,{error:result.error});
     return sendJson(res, 200, { ok: true });
   }
   if (url.pathname === '/api/tracks' && req.method === 'GET') {
