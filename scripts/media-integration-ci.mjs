@@ -62,6 +62,7 @@ let db;
 try {
   start('api');
   await waitFor(async () => (await fetch(`${origin}/api/v1/health`)).ok, 'API did not start');
+  db = await openDatabase(databaseUrl);
 
   let result = await json('/api/v1/setup/status');
   assert.equal(result.body.needs_setup, true);
@@ -77,6 +78,12 @@ try {
   result = await json('/api/v1/setup/status');
   assert.equal(result.body.needs_setup, false);
   assert.equal(result.body.library_name, 'Integration Music');
+  assert.equal(result.body.registration_enabled, false);
+  result = await json('/api/v1/register', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin },
+    body: JSON.stringify({ username: 'family', display_name: 'Family', password: accountSecret }),
+  });
+  assert.equal(result.response.status, 404);
   result = await json('/api/v1/setup', {
     method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin },
     body: JSON.stringify({ username: 'secondadmin', display_name: 'Second', password: accountSecret, library_name: 'Changed Music' }),
@@ -91,6 +98,48 @@ try {
   });
   assert.equal(result.response.status, 200);
   const cookie = result.response.headers.get('set-cookie').split(';', 1)[0];
+
+  result = await json('/api/v1/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin },
+    body: JSON.stringify({ username: 'integration', password: accountSecret, device_name: 'Second integration device' }),
+  });
+  assert.equal(result.response.status, 200);
+  const secondCookie = result.response.headers.get('set-cookie').split(';', 1)[0];
+  result = await json('/api/v1/sessions', { headers: { Cookie: cookie } });
+  assert.equal(result.response.status, 200);
+  assert.equal(result.body.items.length, 2);
+  const secondSession = result.body.items.find(item => !item.current);
+  result = await json(`/api/v1/sessions/${secondSession.id}`, { method: 'DELETE', headers: { Cookie: cookie } });
+  assert.equal(result.response.status, 403);
+  result = await json(`/api/v1/sessions/${secondSession.id}`, { method: 'DELETE', headers: { Cookie: cookie, Origin: origin } });
+  assert.equal(result.response.status, 200);
+  result = await json('/api/v1/me', { headers: { Cookie: secondCookie } });
+  assert.equal(result.response.status, 401);
+
+  result = await json('/api/v1/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin },
+    body: JSON.stringify({ username: 'integration', password: accountSecret, device_name: 'Expiring integration device' }),
+  });
+  assert.equal(result.response.status, 200);
+  const expiringCookie = result.response.headers.get('set-cookie').split(';', 1)[0];
+  await db.prepare("UPDATE sessions SET expires_at=CURRENT_TIMESTAMP-INTERVAL '1 second' WHERE device_name=?").run('Expiring integration device');
+  result = await json('/api/v1/me', { headers: { Cookie: expiringCookie } });
+  assert.equal(result.response.status, 401);
+
+  result = await json('/api/v1/admin/registration-settings', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: cookie, Origin: origin }, body: JSON.stringify({ enabled:true }),
+  });
+  assert.equal(result.response.status, 200);
+  result = await json('/api/v1/register', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin },
+    body: JSON.stringify({ username: 'family', display_name: 'Family', password: accountSecret }),
+  });
+  assert.equal(result.response.status, 201);
+  result = await json('/api/v1/admin/registration-settings', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: cookie, Origin: origin }, body: JSON.stringify({ enabled:false }),
+  });
+  assert.equal(result.response.status, 200);
+
   const audio = wavFixture();
 
   result = await json('/api/v1/uploads', {
@@ -116,7 +165,6 @@ try {
     assert.equal(result.body.offset, endOffset + 1);
   }
 
-  db = await openDatabase(databaseUrl);
   await db.prepare("UPDATE processing_jobs SET status='processing',started_at=CURRENT_TIMESTAMP WHERE upload_id=?").run(uploadId);
   start('worker');
   const ready = await waitFor(async () => {
@@ -133,6 +181,12 @@ try {
   stream = await fetch(`${origin}/api/v1/tracks/${ready.track_id}/stream`, { headers: { Cookie: cookie, Range: 'bytes=999999-' } });
   assert.equal(stream.status, 416);
   assert.match(stream.headers.get('content-range'), /^bytes \*\/\d+$/);
+  result = await json('/api/v1/logout', { method:'POST', headers:{ Cookie:cookie } });
+  assert.equal(result.response.status,403);
+  result = await json('/api/v1/logout', { method:'POST', headers:{ Cookie:cookie, Origin:origin } });
+  assert.equal(result.response.status,200);
+  result = await json('/api/v1/me', { headers:{ Cookie:cookie } });
+  assert.equal(result.response.status,401);
   console.log('Media integration test passed');
 } finally {
   for (const child of children) child.kill('SIGTERM');
