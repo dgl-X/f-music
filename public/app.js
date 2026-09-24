@@ -50,10 +50,13 @@ let uploadWorkers=0;
 let uploadTaskSequence=0;
 let audioContext=null,audioGain=null,audioSource=null;
 let instanceName='Family Music';
+let settingsSection='';
+let unknownRoutePath='';
+let openingSettingsSection='';
 
 function applyLocationRoute() {
   const route=parseWebRoute(location.pathname,location.search);
-  activeView=route.notFound?'liked':route.view;
+  activeView=route.view;
   activeArtist='';activeArtistId=route.artistId;activeAlbum='';activeAlbumId=route.albumId;
   activePlaylist=route.playlistId?{id:route.playlistId,title:''}:null;
   searchQuery=route.query;
@@ -63,11 +66,13 @@ function applyLocationRoute() {
   if(route.pageSize)pageSize=route.pageSize;
   federationNode=route.node;
   federationKind=route.kind;
+  settingsSection=route.settingsSection;
+  unknownRoutePath=route.unknownPath;
   return route;
 }
 
 function currentWebRoute() {
-  return webRouteForState({view:activeView,artistId:activeArtistId,albumId:activeAlbumId,playlistId:activePlaylist?.id||'',query:searchQuery,scope:searchScope,sort:sortMode,page:pageIndex,pageSize,node:federationNode,kind:federationKind});
+  return webRouteForState({view:activeView,artistId:activeArtistId,albumId:activeAlbumId,playlistId:activePlaylist?.id||'',query:searchQuery,scope:searchScope,sort:sortMode,page:pageIndex,pageSize,node:federationNode,kind:federationKind,settingsSection,unknownPath:unknownRoutePath});
 }
 
 function syncBrowserRoute(mode='push') {
@@ -81,13 +86,15 @@ function updateViewControls() {
   const sort=document.querySelector('#sort'),scope=document.querySelector('#search-scope'),tools=document.querySelector('.catalog-tools'),search=document.querySelector('#search');
   if(sort){sort.hidden=!['tracks','liked'].includes(activeView);sort.value=sortMode;}
   if(scope){scope.hidden=activeView!=='tracks';scope.value=searchScope;}
-  if(tools)tools.hidden=['recognition','upload','recommendations','search','collection','playlist'].includes(activeView);
+  if(tools)tools.hidden=['recognition','upload','recommendations','search','collection','playlist','settings','not-found'].includes(activeView);
   if(search&&search.value!==searchQuery)search.value=searchQuery;
 }
 
 window.addEventListener('popstate',()=>{
   if(!sessionUser)return;
   applyLocationRoute();
+  document.querySelectorAll('dialog[open]').forEach(dialog=>dialog.close());
+  openingSettingsSection='';
   updateViewControls();
   loadCurrentView().catch(error=>{const root=document.querySelector('#catalog-content');if(root)root.innerHTML=`<div class="empty">${escapeHtml(error.message)}</div>`;});
 });
@@ -174,20 +181,33 @@ async function renderLibrary(user) {
   document.querySelector('#now-details').onclick=()=>{const track=queue[currentIndex];if(track?.remote)return showRemoteTrack(track.remote_ref);if(track)editTrack(track);};
   setupPlayer();
   updateViewControls();
-  if(!initialRoute.canonical||initialRoute.notFound)syncBrowserRoute('replace');
+  if(!initialRoute.canonical)syncBrowserRoute('replace');
   await loadCurrentView();
 }
 
 function showWebSettings(){
-  const dialog=document.createElement('dialog');dialog.className='stats-dialog settings-dialog';
-  const admin=sessionUser?.is_admin?`<div class="settings-group"><h3>Администрирование</h3><button data-action="stats"><span>Статистика</span><small>Состояние сервера, очереди и громкость</small></button><button data-action="users"><span>Аккаунты</span><small>Пользователи и сброс паролей</small></button><button data-action="federation"><span>Федерация</span><small>Identity, адреса и доступность ноды</small></button><button data-action="recognition-settings"><span>Автораспознавание</span><small>AcoustID, включение и Client API key</small></button><button data-action="reports"><span>Отчёты об ошибках</span><small>Диагностика из Android-приложения</small></button><button data-action="recognition"><span>Требуют внимания</span><small>Распознавание и исправление метаданных</small></button></div>`:'';
-  dialog.innerHTML=`<div class="stats-shell"><div class="stats-head"><div><div class="dialog-title">Настройки</div><small>${escapeHtml(sessionUser?.display_name||'')}</small></div><button class="stats-close" aria-label="Закрыть">×</button></div><div class="settings-group"><h3>Аккаунт</h3><button data-action="password"><span>Изменить пароль</span><small>Обновить пароль текущего пользователя</small></button></div><div class="settings-group"><h3>Библиотека</h3><label>«Все треки» по умолчанию<select name="library_scope"><option value="all">Общая библиотека</option><option value="local">Только этот сервер</option><option value="remote">Только федерация</option></select></label><button data-action="duplicates"><span>Возможные дубликаты</span><small>Совпадения по названию и исполнителю</small></button></div>${admin}</div>`;
-  document.body.append(dialog);dialog.showModal();dialog.querySelector('.stats-close').onclick=()=>dialog.close();dialog.addEventListener('close',()=>dialog.remove());
-  const open=action=>{dialog.close();action();};
-  dialog.querySelector('[data-action="password"]').onclick=()=>open(changeOwnPassword);
-  dialog.querySelector('[data-action="duplicates"]').onclick=()=>open(showDuplicates);
-  const scopeSelect=dialog.querySelector('[name="library_scope"]');scopeSelect.value=searchScope;scopeSelect.onchange=()=>{searchScope=scopeSelect.value;localStorage.setItem('music-search-scope',searchScope);const toolbarScope=document.querySelector('#search-scope');if(toolbarScope)toolbarScope.value=searchScope;pageIndex=0;if(activeView==='tracks')loadCurrentView();};
-  if(sessionUser?.is_admin){dialog.querySelector('[data-action="stats"]').onclick=()=>open(showAdminStats);dialog.querySelector('[data-action="users"]').onclick=()=>open(manageUsers);dialog.querySelector('[data-action="federation"]').onclick=()=>open(showFederationSettings);dialog.querySelector('[data-action="recognition-settings"]').onclick=()=>open(showRecognitionSettings);dialog.querySelector('[data-action="reports"]').onclick=()=>open(showDiagnosticReports);dialog.querySelector('[data-action="recognition"]').onclick=()=>{dialog.close();switchView('recognition');};}
+  switchView('settings');
+}
+
+function loadSettingsView(){
+  const root=document.querySelector('#catalog-content');
+  const admin=sessionUser?.is_admin?`<div class="settings-group"><h3>Администрирование</h3><button data-section="statistics"><span>Статистика</span><small>Состояние сервера, очереди и громкость</small></button><button data-section="users"><span>Аккаунты</span><small>Пользователи и сброс паролей</small></button><button data-section="federation"><span>Федерация</span><small>Identity, адреса и доступность ноды</small></button><button data-section="recognition"><span>Автораспознавание</span><small>AcoustID, включение и Client API key</small></button><button data-section="reports"><span>Отчёты об ошибках</span><small>Диагностика из Android-приложения</small></button><button data-action="recognition-queue"><span>Требуют внимания</span><small>Распознавание и исправление метаданных</small></button></div>`:'';
+  root.innerHTML=`<section class="stats-shell settings-dialog routed-settings"><div class="stats-head"><div><div class="dialog-title">Настройки</div><small>${escapeHtml(sessionUser?.display_name||'')}</small></div><button class="stats-close" aria-label="Закрыть">×</button></div><div class="settings-group"><h3>Аккаунт</h3><button data-section="password"><span>Изменить пароль</span><small>Обновить пароль текущего пользователя</small></button></div><div class="settings-group"><h3>Библиотека</h3><label>«Все треки» по умолчанию<select name="library_scope"><option value="all">Общая библиотека</option><option value="local">Только этот сервер</option><option value="remote">Только федерация</option></select></label><button data-section="duplicates"><span>Возможные дубликаты</span><small>Совпадения по названию и исполнителю</small></button></div>${admin}</section>`;
+  root.querySelector('.stats-close').onclick=()=>switchView('liked');
+  const scopeSelect=root.querySelector('[name="library_scope"]');scopeSelect.value=searchScope;scopeSelect.onchange=()=>{searchScope=scopeSelect.value;localStorage.setItem('music-search-scope',searchScope);};
+  root.querySelectorAll('[data-section]').forEach(button=>button.onclick=()=>openSettingsSection(button.dataset.section));
+  root.querySelector('[data-action="recognition-queue"]')?.addEventListener('click',()=>switchView('recognition'));
+  if(settingsSection&&openingSettingsSection!==settingsSection)openSettingsSection(settingsSection,false);
+}
+
+function openSettingsSection(section,push=true){
+  const adminOnly=new Set(['statistics','users','federation','recognition','reports']);
+  if(adminOnly.has(section)&&!sessionUser?.is_admin){settingsSection='';syncBrowserRoute('replace');return;}
+  const actions={statistics:showAdminStats,users:manageUsers,federation:showFederationSettings,recognition:showRecognitionSettings,reports:showDiagnosticReports,duplicates:showDuplicates,password:changeOwnPassword};
+  const action=actions[section];if(!action)return;
+  settingsSection=section;openingSettingsSection=section;if(push)syncBrowserRoute();
+  Promise.resolve(action()).catch(error=>alert(error.message));
+  setTimeout(()=>{const dialogs=[...document.querySelectorAll('dialog[open]')],dialog=dialogs.at(-1);if(!dialog){openingSettingsSection='';return;}dialog.addEventListener('close',()=>{if(activeView==='settings'&&settingsSection===section){settingsSection='';openingSettingsSection='';syncBrowserRoute('replace');loadSettingsView();}},{once:true});},0);
 }
 
 async function editFederationCollection(collection=null){
@@ -257,7 +277,7 @@ async function showRecognitionSettings(){
   document.body.append(dialog);dialog.showModal();const close=()=>dialog.close();dialog.querySelector('.stats-close').onclick=close;dialog.querySelector('.cancel-recognition-settings').onclick=close;dialog.addEventListener('close',()=>dialog.remove());
   const form=dialog.querySelector('form'),error=form.querySelector('.error'),keyInput=form.elements.client_key;
   try{const state=await api('/api/v1/admin/recognition-settings');form.elements.enabled.checked=state.enabled;keyInput.placeholder=state.key_configured?'Ключ сохранён · введите только для замены':'Введите Client API key';form.querySelector('.settings-hint').textContent=state.key_configured?'Ключ настроен. Пустое поле оставит его без изменений.':'Ключ пока не настроен.';}catch(problem){error.textContent=problem.message;form.querySelector('button.primary').disabled=true;}
-  form.onsubmit=async event=>{event.preventDefault();error.textContent='';const body={enabled:form.elements.enabled.checked};if(keyInput.value.trim())body.client_key=keyInput.value.trim();else if(form.elements.remove_key.checked)body.client_key='';try{await api('/api/v1/admin/recognition-settings',{method:'PUT',body:JSON.stringify(body)});dialog.close();showWebSettings();}catch(problem){error.textContent=problem.message;}};
+  form.onsubmit=async event=>{event.preventDefault();error.textContent='';const body={enabled:form.elements.enabled.checked};if(keyInput.value.trim())body.client_key=keyInput.value.trim();else if(form.elements.remove_key.checked)body.client_key='';try{await api('/api/v1/admin/recognition-settings',{method:'PUT',body:JSON.stringify(body)});dialog.close();}catch(problem){error.textContent=problem.message;}};
 }
 
 async function manageUsers(){
@@ -315,6 +335,8 @@ function resetUserPassword(id,name){passwordDialog({title:`Новый парол
 
 function switchView(view,historyMode='push') {
   pageIndex=0;
+  if(view!=='settings'){settingsSection='';openingSettingsSection='';}
+  if(view!=='not-found')unknownRoutePath='';
   if(view!=='collection'){activeArtist='';activeArtistId=0;activeAlbum='';activeAlbumId=0;if(view!=='playlist')activePlaylist=null;}
   activeView=view;
   updateViewControls();
@@ -328,6 +350,8 @@ function setTrackFilter(artist='',album='',artistId=0,albumId=0) {
 
 async function loadCurrentView() {
   renderActiveFilter();
+  if(activeView==='settings')return loadSettingsView();
+  if(activeView==='not-found'){const root=document.querySelector('#catalog-content');root.innerHTML=`<section class="route-not-found"><strong>404</strong><h2>Такой страницы нет</h2><p>${escapeHtml(unknownRoutePath||location.pathname)}</p><button class="primary">Перейти в библиотеку</button></section>`;root.querySelector('button').onclick=()=>switchView('liked');return;}
   if(['tracks','liked','playlist'].includes(activeView)) return loadTracks();
   if(activeView==='history') return loadHistory();
   if(activeView==='playlists') return loadPlaylists();
