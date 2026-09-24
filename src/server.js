@@ -19,6 +19,7 @@ import { serveStoredMedia } from './media-stream.js';
 import { RegistrationLimiter, validateRegistration } from './registration.js';
 import { clearSessionCookie, createAuthenticationService, hasValidSessionOrigin, requestIp, requestOriginMatches } from './authentication.js';
 import { validateAudioDecode } from './audio-validation.js';
+import { createCatalogService } from './catalog-service.js';
 
 const config = loadConfig();
 const db = await openDatabase(config.databaseUrl);
@@ -42,6 +43,7 @@ fs.mkdirSync(federationReplicaDir, { recursive: true, mode: 0o750 });
 const jsonHeaders = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' };
 const registrationLimiter = new RegistrationLimiter();
 const authentication = createAuthenticationService({ db, sessionDays: config.sessionDays, secureCookies: config.secureCookies });
+const catalog = createCatalogService({ db, apiPrefix: '/api' });
 const workerMode = process.argv.includes('--worker');
 const processStartedAt = new Date();
 const httpMetrics = { requests: 0, errors5xx: 0 };
@@ -1652,49 +1654,7 @@ async function api(req, res, url, apiPrefix = '/api') {
     return sendJson(res, 200, { ok: true });
   }
   if (url.pathname === '/api/tracks' && req.method === 'GET') {
-    const query = String(url.searchParams.get('q') ?? '').trim().slice(0, 120);
-    const artist = String(url.searchParams.get('artist') ?? '').trim().slice(0, 240);
-    const album = String(url.searchParams.get('album') ?? '').trim().slice(0, 240);
-    const albumId = Number(url.searchParams.get('album_id'));
-    const liked = url.searchParams.get('liked') === '1';
-    const playlistId = String(url.searchParams.get('playlist_id') ?? '');
-    const sortKey = url.searchParams.get('sort') ?? 'newest';
-    const queueRequest = url.searchParams.get('queue') === '1';
-    const maxLimit = queueRequest ? 10000 : 200;
-    const limit = Math.min(maxLimit, Math.max(1, Number(url.searchParams.get('limit')) || 100));
-    const offset = Math.max(0, Number(url.searchParams.get('offset')) || 0);
-    const seed = String(url.searchParams.get('seed') || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
-    const order = {
-      newest: 'created_at DESC', oldest: 'created_at ASC',
-      title: 'title COLLATE NOCASE ASC', artist: 'artist COLLATE NOCASE ASC, album COLLATE NOCASE ASC',
-      album: 'album COLLATE NOCASE ASC, disc_number ASC NULLS LAST, track_number ASC NULLS LAST, title COLLATE NOCASE ASC',
-      year: 'year DESC, album COLLATE NOCASE ASC',
-      random: 'md5(id || @seed)',
-    }[sortKey] ?? 'created_at DESC';
-    const where = [];
-    const params = { current_user: user.id, limit, offset, seed: seed || 'family-music' };
-    if (query) { where.push('(title ILIKE @query OR artist ILIKE @query OR album ILIKE @query OR genre ILIKE @query)'); params.query = `%${query}%`; }
-    const legacyAlbum=album&&artist&&!albumId?await db.prepare('SELECT id FROM albums WHERE lower(name)=lower(?) AND lower(artist)=lower(?)').get(album,artist):null;
-    if(legacyAlbum){where.push('album_id = @album_id');params.album_id=Number(legacyAlbum.id);}
-    else if(Number.isSafeInteger(albumId)&&albumId>0){where.push('album_id = @album_id');params.album_id=albumId;}
-    else{
-      if(artist){where.push(`EXISTS(SELECT 1 FROM track_artists JOIN artists ON artists.id=track_artists.artist_id
-        WHERE track_artists.track_id=tracks.id AND artists.name=@artist COLLATE NOCASE)`);params.artist=artist;}
-      if(album){where.push('album = @album COLLATE NOCASE');params.album=album;}
-    }
-    if (liked) where.push('EXISTS(SELECT 1 FROM track_likes likes_filter WHERE likes_filter.track_id=tracks.id AND likes_filter.user_id=@current_user)');
-    if (playlistId) { where.push('id IN (SELECT track_id FROM playlist_tracks WHERE playlist_id=@playlist_id)'); params.playlist_id = playlistId; }
-    const filter = where.length ? `WHERE ${where.join(' AND ')}` : '';
-    const total = Number((await db.prepare(`SELECT count(*) count FROM tracks ${filter}`).get(params)).count);
-    const sql = `SELECT id, title, artist, album, album_id, filename, mime_type, size_bytes, duration_seconds, created_at,
-      cover_key, genre, year, track_number, disc_number,
-      (SELECT recommended_gain_db FROM loudness_jobs WHERE loudness_jobs.track_id=tracks.id AND status='ready') AS replay_gain_db,
-      EXISTS(SELECT 1 FROM track_files ready192 WHERE ready192.track_id=tracks.id AND ready192.variant='aac_192' AND ready192.status='ready') AS aac_192_ready,
-      EXISTS(SELECT 1 FROM track_files ready96 WHERE ready96.track_id=tracks.id AND ready96.variant='aac_96' AND ready96.status='ready') AS aac_96_ready,
-      EXISTS(SELECT 1 FROM track_likes likes_state WHERE likes_state.track_id=tracks.id AND likes_state.user_id=@current_user) AS liked
-      FROM tracks ${filter} ORDER BY ${order},id LIMIT @limit OFFSET @offset`;
-    const tracks = (await db.prepare(sql).all(params)).map(track => ({ ...track, cover_url: track.cover_key ? `${apiPrefix}/tracks/${track.id}/cover` : null, cover_key: undefined }));
-    return sendJson(res, 200, { items: tracks, total, offset, limit, has_more: offset + tracks.length < total });
+    return sendJson(res, 200, await catalog.listTracks({ searchParams: url.searchParams, userId: user.id }));
   }
   if (url.pathname === '/api/recommendations' && req.method === 'GET') {
     const tracks = (await db.prepare(`SELECT tracks.id,tracks.title,tracks.artist,tracks.album,tracks.filename,tracks.mime_type,
