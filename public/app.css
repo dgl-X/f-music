@@ -267,8 +267,8 @@ dialog::backdrop { background:#0009; backdrop-filter:blur(4px); }
 @media(max-width:620px){.collection-hero{grid-template-columns:38px 92px 1fr;gap:11px;padding:13px}.collection-back{width:38px;height:38px}.collection-cover{width:92px}.collection-info h2{font-size:1.65rem}.collection-info>span{font-size:.78rem}.collection-info>div{grid-column:1/-1}.collection-info button{padding:9px 11px}}
 @media(max-width:700px){.stat-grid{grid-template-columns:1fr 1fr}.stats-two{grid-template-columns:1fr}.storage-parts{grid-template-columns:1fr 1fr}.stats-dialog{max-height:calc(100vh - 12px)}.stats-shell{padding:16px}.user{gap:6px}.user .secondary{padding:9px 10px}}
 
-.settings-dialog.routed-settings{width:min(900px,100%);max-width:900px;margin:18px auto 120px;padding:28px 32px}
-@media(max-width:750px){.settings-dialog.routed-settings{width:100%;margin:4px auto 120px;padding:18px 14px;border-radius:18px}}
+.settings-dialog.routed-settings{box-sizing:border-box;width:100%;max-width:none;margin:0 0 120px;padding:28px 32px}
+@media(max-width:750px){.settings-dialog.routed-settings{width:100%;margin:0 0 120px;padding:18px 14px;border-radius:18px}}
 @media(max-width:760px){.recognition-item{grid-template-columns:20px 1fr}.recognition-item>:not(.recognition-select){grid-column:2}.recognition-summary{grid-template-columns:1fr 1fr}.recognition-head{align-items:stretch;flex-direction:column}.recognition-head .recognition-head-actions{justify-content:stretch}.recognition-head-actions button{flex:1}.recognition-actions{justify-content:flex-end;flex-wrap:wrap}.recognition-bulk button{flex:1 1 45%}}
 .routed-settings{max-width:760px;margin:18px auto 120px;padding:22px;border-radius:22px;background:var(--panel, #191c23)}
 .route-not-found{min-height:52vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:10px;color:#a7abb6}
