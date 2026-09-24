@@ -10,10 +10,10 @@ systemd-сервиса и примеры конфигурации. Систем�
 
 ```bash
 npm ci --omit=dev
-./packaging/build-deb.sh 0.1.7 amd64
+./packaging/build-deb.sh 0.1.8 amd64
 ```
 
-Результат появляется в `dist/family-music-server_0.1.7_amd64.deb`.
+Результат появляется в `dist/family-music-server_0.1.8_amd64.deb`.
 Сборщик загружает официальный Node.js 24.20.0 один раз в игнорируемый Git
 локальный кэш и перед упаковкой сверяет закреплённый SHA-256.
 
@@ -23,8 +23,8 @@ npm ci --omit=dev
 сборку DEB и публикацию пакета вместе с `SHA256SUMS`.
 
 ```bash
-git tag -a v0.1.7 -m "Family Music Server v0.1.7"
-git push origin v0.1.7
+git tag -a v0.1.8 -m "Family Music Server v0.1.8"
+git push origin v0.1.8
 ```
 
 Версия DEB берётся из тега. Перед отправкой тега следует убедиться, что commit в
@@ -34,7 +34,7 @@ git push origin v0.1.7
 ## Установка и обновление
 
 ```bash
-apt install ./family-music-server_0.1.7_amd64.deb
+apt install ./family-music-server_0.1.8_amd64.deb
 systemctl status family-music family-music-worker
 node -e "fetch('http://127.0.0.1:8095/api/v1/health').then(async r => { console.log(await r.text()); process.exit(r.ok ? 0 : 1) })"
 ```

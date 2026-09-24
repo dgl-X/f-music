@@ -28,6 +28,7 @@ test('root remains compatible and unknown paths are distinguishable', () => {
 
 test('settings sections and internal 404 survive a refresh', () => {
   assert.equal(parseWebRoute('/settings/federation').settingsSection, 'federation');
+  assert.equal(parseWebRoute('/settings/registration').settingsSection, 'registration');
   assert.equal(webRouteForState({view:'settings',settingsSection:'reports'}), '/settings/reports');
   const missing=parseWebRoute('/missing/page');
   assert.equal(missing.view,'not-found');

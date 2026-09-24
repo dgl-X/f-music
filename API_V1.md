@@ -11,13 +11,15 @@
 
 ## Авторизация
 
-`POST /login` принимает `{username,password}` и устанавливает `music_session` как `HttpOnly; Secure; SameSite=Strict` cookie. Web и Android должны сохранять cookie и отправлять её во всех последующих запросах. Публичной регистрации нет.
+`POST /login` принимает `{username,password}` и устанавливает `music_session` как `HttpOnly; Secure; SameSite=Strict` cookie. Web и Android должны сохранять cookie и отправлять её во всех последующих запросах. Самостоятельная регистрация опциональна и по умолчанию выключена.
 
 - `GET /setup/status` — состояние мастера: `needs_setup`, версия сервера,
-  название библиотеки и безопасные проверки БД, storage и worker.
+  название библиотеки, `registration_enabled` и безопасные проверки БД, storage и worker.
 - `POST /setup` — атомарно создать первого администратора и сохранить
   `library_name`/`recognition_enabled`, только при пустой БД.
 - `POST /login` — войти.
+- `POST /register` — создать обычный аккаунт, только когда регистрация включена;
+  ограничено пятью попытками на IP в час.
 - `POST /logout` — завершить текущий сеанс.
 - `GET /me` — текущий пользователь.
 - `GET /sessions` — безопасный список собственных активных входов с устройством, клиентом, IP и последней активностью; токены и их хэши не возвращаются.
@@ -26,6 +28,8 @@
 - `PUT /me/password` — `{current_password,new_password}`.
 - `GET /users` — список аккаунтов, только администратор.
 - `POST /users` — `{username,display_name,password}`, только администратор.
+- `GET|PUT /admin/registration-settings` — прочитать или изменить состояние
+  самостоятельной регистрации, только администратор.
 - `PUT /users/{id}/password` — `{new_password}`, только администратор.
 - `GET /admin/stats` — агрегаты библиотеки, пользователей, диска, очередей и проверка наличия медиафайлов; только администратор.
 - `GET /admin/metrics` — heartbeat API/worker, память, HTTP 5xx, состояния и возраст очередей, новые отчёты и ошибки за сутки; только администратор.

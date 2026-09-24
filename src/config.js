@@ -20,5 +20,6 @@ export function loadConfig(env = process.env) {
     recognitionEnabled: env.MUSIC_RECOGNITION_ENABLED === 'true',
     acoustIdClientKey: String(env.ACOUSTID_CLIENT_KEY ?? ''),
     metricsToken: String(env.MUSIC_METRICS_TOKEN ?? ''),
+    registrationEnabled: env.MUSIC_REGISTRATION_ENABLED === 'true',
   };
 }
