@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { clearSessionCookie, hasValidSessionOrigin, LoginAttemptLimiter, requestOriginMatches, sessionCookie } from '../src/authentication.js';
+import { clearSessionCookie, hasValidSessionOrigin, LoginAttemptLimiter, requestOriginMatches, sessionCookie, validateInitialSetup, validateNewPassword } from '../src/authentication.js';
 
 const request = ({ method='POST', origin, host='music.example', protocol='https', cookie='' }={}) => ({
   method, headers:{ origin, host, cookie, 'x-forwarded-proto':protocol }, socket:{ remoteAddress:'127.0.0.1' },
@@ -25,4 +25,13 @@ test('login limiter resets after success or expiry', () => {
 test('session cookies keep security attributes', () => {
   assert.match(sessionCookie('a b',30,true),/^music_session=a%20b; Path=\/; HttpOnly; SameSite=Strict; Max-Age=2592000; Secure$/);
   assert.equal(clearSessionCookie(),'music_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0');
+});
+
+test('initial setup and password changes share strict validation',()=>{
+  assert.deepEqual(validateInitialSetup({username:' admin ',display_name:'Дом',library_name:'Музыка',password:'long-password'}),{username:'admin',displayName:'Дом',libraryName:'Музыка',password:'long-password',recognitionEnabled:false});
+  assert.match(validateInitialSetup({username:'я',password:'long-password'}).error,/пользователя/);
+  assert.match(validateInitialSetup({username:'admin',library_name:'x',password:'long-password'}).error,/библиотеки/);
+  assert.deepEqual(validateNewPassword('new-password'),{password:'new-password'});
+  assert.match(validateNewPassword('short').error,/пароль/i);
+  assert.match(validateNewPassword('x'.repeat(257)).error,/пароль/i);
 });
