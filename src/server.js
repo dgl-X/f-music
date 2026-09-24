@@ -17,6 +17,7 @@ import { normalizeHybridFlac } from './audio-normalization.js';
 import { audioCodec, playbackVariant, requiresCompatibilityVariant } from './audio-compatibility.js';
 import { serveStoredMedia } from './media-stream.js';
 import { RegistrationLimiter, validateRegistration } from './registration.js';
+import { clearSessionCookie, createAuthenticationService, hasValidSessionOrigin, requestIp, requestOriginMatches } from './authentication.js';
 
 const config = loadConfig();
 const db = await openDatabase(config.databaseUrl);
@@ -38,8 +39,8 @@ fs.mkdirSync(derivedDir, { recursive: true, mode: 0o750 });
 fs.mkdirSync(federationReplicaDir, { recursive: true, mode: 0o750 });
 
 const jsonHeaders = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' };
-const loginAttempts = new Map();
 const registrationLimiter = new RegistrationLimiter();
+const authentication = createAuthenticationService({ db, sessionDays: config.sessionDays, secureCookies: config.secureCookies });
 const workerMode = process.argv.includes('--worker');
 const processStartedAt = new Date();
 const httpMetrics = { requests: 0, errors5xx: 0 };
@@ -317,29 +318,6 @@ async function notifyFederationPeers() {
   } finally { federationNotifyBusy=false; }
 }
 
-function requestIp(req) { return String(req.headers['x-real-ip'] || req.socket.remoteAddress || '').slice(0, 80); }
-function loginBlocked(ip) {
-  const now = Date.now(), entry = loginAttempts.get(ip);
-  if (!entry || now - entry.startedAt > 15 * 60 * 1000) { loginAttempts.delete(ip); return false; }
-  return entry.failures >= 8;
-}
-function recordLoginFailure(ip) {
-  const now = Date.now(), entry = loginAttempts.get(ip);
-  if (!entry || now - entry.startedAt > 15 * 60 * 1000) loginAttempts.set(ip, { failures: 1, startedAt: now });
-  else entry.failures++;
-}
-function hasValidOrigin(req) {
-  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method) || !parseCookies(req.headers.cookie).music_session) return true;
-  return requestOriginMatches(req, false);
-}
-function requestOriginMatches(req, allowMissing = true) {
-  const origin = req.headers.origin;
-  if (!origin) return allowMissing;
-  const protocol = String(req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim();
-  const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
-  return origin === `${protocol}://${host}`;
-}
-
 async function readJson(req, limit = 64 * 1024) {
   let size = 0;
   const chunks = [];
@@ -367,21 +345,7 @@ async function readBytes(req, limit) {
 }
 
 async function currentUser(req) {
-  const token = parseCookies(req.headers.cookie).music_session;
-  if (!token) return null;
-  const user = await db.prepare(`SELECT users.id, users.username, users.display_name, users.is_admin, sessions.id AS session_id
-    FROM sessions JOIN users ON users.id = sessions.user_id
-    WHERE sessions.token_hash = ? AND sessions.expires_at > datetime('now')`).get(tokenHash(token)) ?? null;
-  if (user) {
-    const deviceName = String(req.headers['x-device-name'] ?? '').trim().slice(0, 120);
-    const clientName = String(req.headers['x-client-name'] ?? '').trim().slice(0, 120);
-    await db.prepare(`UPDATE sessions SET last_seen_at=CURRENT_TIMESTAMP, ip_address=?,
-      device_name=CASE WHEN ?='' THEN device_name ELSE ? END,
-      client_name=CASE WHEN ?='' THEN client_name ELSE ? END
-      WHERE id=? AND (last_seen_at < CURRENT_TIMESTAMP - INTERVAL '1 minute' OR device_name='' OR device_name='Неизвестное устройство')`)
-      .run(requestIp(req), deviceName, deviceName, clientName, clientName, user.session_id);
-  }
-  return user;
+  return authentication.currentUser({ cookieHeader:req.headers.cookie, deviceName:req.headers['x-device-name'], clientName:req.headers['x-client-name'], ip:requestIp(req) });
 }
 
 async function requireUser(req, res) {
@@ -1091,49 +1055,31 @@ async function api(req, res, url, apiPrefix = '/api') {
     }catch(error){if(error.code==='23505')return sendJson(res,409,{error:'Такой логин уже занят'});throw error;}
   }
   if (url.pathname === '/api/login' && req.method === 'POST') {
-    const ip = requestIp(req);
-    if (loginBlocked(ip)) return sendJson(res, 429, { error: 'Слишком много попыток. Повторите позже' }, { 'Retry-After': '900' });
     const body = await readJson(req);
-    const user = await db.prepare('SELECT * FROM users WHERE lower(username) = lower(?)').get(String(body.username ?? ''));
-    if (!user || !verifyPassword(String(body.password ?? ''), user.password_hash)) {
-      recordLoginFailure(ip);
-      return sendJson(res, 401, { error: 'Неверное имя пользователя или пароль' });
-    }
-    loginAttempts.delete(ip);
-    const token = randomToken();
-    const expires = new Date(Date.now() + config.sessionDays * 86400000);
-    const deviceName = String(body.device_name ?? '').trim().slice(0, 120) || 'Web-браузер';
-    const clientName = String(body.client_name ?? '').trim().slice(0, 120) || String(req.headers['user-agent'] ?? 'Браузер').slice(0, 120);
-    await db.prepare(`INSERT INTO sessions (user_id, token_hash, expires_at, device_name, client_name, ip_address)
-      VALUES (?, ?, ?, ?, ?, ?)`).run(user.id, tokenHash(token), expires.toISOString(), deviceName, clientName, ip);
-    const cookie = `music_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${config.sessionDays * 86400}${config.secureCookies ? '; Secure' : ''}`;
-    return sendJson(res, 200, { id: user.id, username: user.username, display_name: user.display_name }, { 'Set-Cookie': cookie });
+    const result = await authentication.login({ username:body.username, password:body.password, deviceName:body.device_name, clientName:body.client_name, userAgent:req.headers['user-agent'], ip:requestIp(req) });
+    if (result.status === 'blocked') return sendJson(res, 429, { error: 'Слишком много попыток. Повторите позже' }, { 'Retry-After': '900' });
+    if (result.status === 'invalid') return sendJson(res, 401, { error: 'Неверное имя пользователя или пароль' });
+    return sendJson(res, 200, result.user, { 'Set-Cookie': result.cookie });
   }
   if (url.pathname === '/api/logout' && req.method === 'POST') {
-    const token = parseCookies(req.headers.cookie).music_session;
-    if (token) await db.prepare('DELETE FROM sessions WHERE token_hash=?').run(tokenHash(token));
-    return sendJson(res, 200, { ok: true }, { 'Set-Cookie': 'music_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0' });
+    await authentication.logout(req.headers.cookie);
+    return sendJson(res, 200, { ok: true }, { 'Set-Cookie': clearSessionCookie() });
   }
   const user = await requireUser(req, res);
   if (!user) return;
   if (url.pathname === '/api/me') return sendJson(res, 200, user);
   if (url.pathname === '/api/sessions' && req.method === 'GET') {
-    const items = await db.prepare(`SELECT id, device_name, client_name, ip_address, created_at, last_seen_at, expires_at
-      FROM sessions WHERE user_id=? AND expires_at>CURRENT_TIMESTAMP ORDER BY last_seen_at DESC, id DESC`).all(user.id);
-    return sendJson(res, 200, { items: items.map(item => ({ ...item, id: String(item.id), current: String(item.id) === String(user.session_id) })) });
+    return sendJson(res, 200, { items: await authentication.listSessions(user) });
   }
   if (url.pathname === '/api/sessions/others' && req.method === 'DELETE') {
-    const result = await db.prepare('DELETE FROM sessions WHERE user_id=? AND id<>?').run(user.id, user.session_id);
-    return sendJson(res, 200, { ok: true, revoked: result.changes });
+    return sendJson(res, 200, { ok: true, revoked: await authentication.revokeOtherSessions(user) });
   }
   const sessionDelete = /^\/api\/sessions\/(\d+)$/.exec(url.pathname);
   if (sessionDelete && req.method === 'DELETE') {
     const targetId = sessionDelete[1];
-    const target = await db.prepare('SELECT id FROM sessions WHERE id=? AND user_id=?').get(targetId, user.id);
-    if (!target) return sendJson(res, 404, { error: 'Сессия не найдена' });
-    await db.prepare('DELETE FROM sessions WHERE id=? AND user_id=?').run(targetId, user.id);
-    const current = String(targetId) === String(user.session_id);
-    return sendJson(res, 200, { ok: true, current }, current ? { 'Set-Cookie': 'music_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0' } : {});
+    const result = await authentication.revokeSession(user,targetId);
+    if (!result) return sendJson(res, 404, { error: 'Сессия не найдена' });
+    return sendJson(res, 200, { ok: true, current:result.current }, result.current ? { 'Set-Cookie': clearSessionCookie() } : {});
   }
   if (url.pathname === '/api/users' && req.method === 'GET') {
     if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
@@ -2286,7 +2232,7 @@ const server = http.createServer(async (req, res) => {
     if (await federationCatalog(req, res, url)) return;
     if (await publicFederation(req, res, url)) return;
     const route = resolveApiRoute(url);
-    if (route && !hasValidOrigin(req)) return sendJson(res, 403, { error: 'Недоверенный источник запроса' });
+    if (route && !hasValidSessionOrigin(req)) return sendJson(res, 403, { error: 'Недоверенный источник запроса' });
     if (route) {
       res.setHeader('X-API-Version', String(route.version));
       if (route.legacy) {

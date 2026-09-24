@@ -20,6 +20,7 @@
 - `src/server.js` — HTTP API, статика и постановка фоновых заданий.
 - `src/db.js` — PostgreSQL и автоматическое создание схемы.
 - `src/security.js` — пароли, токены, cookies и Content-Range.
+- `src/authentication.js` — вход, cookie, Origin-политика и жизненный цикл сессий.
 - `src/registration.js` — проверка данных и ограничение самостоятельной регистрации.
 - `src/media-stream.js` — безопасное разрешение пути и HTTP Range/X-Accel-Redirect.
 - `src/worker.js` — обработка загрузок, распознавание, AAC, loudness и федеративный импорт.
