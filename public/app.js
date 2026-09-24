@@ -201,10 +201,10 @@ function showWebSettings(){
 
 function loadSettingsView(){
   const root=document.querySelector('#catalog-content');
+  const scopeNames={all:'Общая библиотека',local:'Только этот сервер',remote:'Только федерация'};
   const admin=sessionUser?.is_admin?`<div class="settings-group"><h3>Администрирование</h3><button data-section="statistics"><span>Статистика</span><small>Состояние сервера, очереди и громкость</small></button><button data-section="users"><span>Аккаунты</span><small>Пользователи и сброс паролей</small></button><button data-section="registration"><span>Регистрация</span><small>Разрешить пользователям создавать аккаунты самостоятельно</small></button><button data-section="federation"><span>Федерация</span><small>Identity, адреса и доступность ноды</small></button><button data-section="recognition"><span>Автораспознавание</span><small>AcoustID, включение и Client API key</small></button><button data-section="reports"><span>Отчёты об ошибках</span><small>Диагностика из Android-приложения</small></button><button data-action="recognition-queue"><span>Требуют внимания</span><small>Распознавание и исправление метаданных</small></button></div>`:'';
-  root.innerHTML=`<section class="stats-shell settings-dialog routed-settings"><div class="stats-head"><div><div class="dialog-title">Настройки</div><small>${escapeHtml(sessionUser?.display_name||'')}</small></div><button class="stats-close" aria-label="Закрыть">×</button></div><div class="settings-group"><h3>Аккаунт</h3><button data-section="password"><span>Изменить пароль</span><small>Обновить пароль текущего пользователя</small></button></div><div class="settings-group"><h3>Библиотека</h3><label>«Все треки» по умолчанию<select name="library_scope"><option value="all">Общая библиотека</option><option value="local">Только этот сервер</option><option value="remote">Только федерация</option></select></label><button data-section="duplicates"><span>Возможные дубликаты</span><small>Совпадения по названию и исполнителю</small></button></div>${admin}</section>`;
+  root.innerHTML=`<section class="stats-shell settings-dialog routed-settings"><div class="stats-head"><div><div class="dialog-title">Настройки</div><small>${escapeHtml(sessionUser?.display_name||'')}</small></div><button class="stats-close" aria-label="Закрыть">×</button></div><div class="settings-group"><h3>Аккаунт</h3><button data-section="password"><span>Изменить пароль</span><small>Обновить пароль текущего пользователя</small></button></div><div class="settings-group"><h3>Библиотека</h3><button data-section="library"><span>«Все треки» по умолчанию</span><small>${escapeHtml(scopeNames[searchScope]||scopeNames.all)}</small></button><button data-section="duplicates"><span>Возможные дубликаты</span><small>Совпадения по названию и исполнителю</small></button></div>${admin}</section>`;
   root.querySelector('.stats-close').onclick=()=>switchView('liked');
-  const scopeSelect=root.querySelector('[name="library_scope"]');scopeSelect.value=searchScope;scopeSelect.onchange=()=>{searchScope=scopeSelect.value;localStorage.setItem('music-search-scope',searchScope);};
   root.querySelectorAll('[data-section]').forEach(button=>button.onclick=()=>openSettingsSection(button.dataset.section));
   root.querySelector('[data-action="recognition-queue"]')?.addEventListener('click',()=>switchView('recognition'));
   if(settingsSection&&openingSettingsSection!==settingsSection)openSettingsSection(settingsSection,false);
@@ -213,11 +213,19 @@ function loadSettingsView(){
 function openSettingsSection(section,push=true){
   const adminOnly=new Set(['statistics','users','registration','federation','recognition','reports']);
   if(adminOnly.has(section)&&!sessionUser?.is_admin){settingsSection='';syncBrowserRoute('replace');return;}
-  const actions={statistics:showAdminStats,users:manageUsers,registration:showRegistrationSettings,federation:showFederationSettings,recognition:showRecognitionSettings,reports:showDiagnosticReports,duplicates:showDuplicates,password:changeOwnPassword};
+  const actions={library:showLibraryDisplaySettings,statistics:showAdminStats,users:manageUsers,registration:showRegistrationSettings,federation:showFederationSettings,recognition:showRecognitionSettings,reports:showDiagnosticReports,duplicates:showDuplicates,password:changeOwnPassword};
   const action=actions[section];if(!action)return;
   settingsSection=section;openingSettingsSection=section;if(push)syncBrowserRoute();
   Promise.resolve(action()).catch(error=>alert(error.message));
   setTimeout(()=>{const dialogs=[...document.querySelectorAll('dialog[open]')],dialog=dialogs.at(-1);if(!dialog){openingSettingsSection='';return;}dialog.addEventListener('close',()=>{if(activeView==='settings'&&settingsSection===section){settingsSection='';openingSettingsSection='';syncBrowserRoute('replace');loadSettingsView();}},{once:true});},0);
+}
+
+function showLibraryDisplaySettings(){
+  const dialog=document.createElement('dialog');dialog.className='stats-dialog settings-dialog';
+  const option=(value,title,description)=>`<label class="settings-check"><input type="radio" name="scope" value="${value}" ${searchScope===value?'checked':''}><span><strong>${title}</strong><small>${description}</small></span></label>`;
+  dialog.innerHTML=`<form class="stats-shell recognition-settings-form"><div class="stats-head"><div><div class="dialog-title">Все треки</div><small>Источник библиотеки по умолчанию</small></div><button type="button" class="stats-close" aria-label="Закрыть">×</button></div>${option('all','Общая библиотека','Показывать локальные треки и доступные треки других серверов.')}${option('local','Только этот сервер','Показывать музыку, которая хранится на этой ноде.')}${option('remote','Только федерация','Показывать доступную музыку подключённых серверов.')}<small class="settings-hint">Фильтр можно временно менять и на странице «Все треки».</small><div class="dialog-actions"><button type="button" class="secondary cancel">Отмена</button><button class="primary">Сохранить</button></div></form>`;
+  document.body.append(dialog);dialog.showModal();const form=dialog.querySelector('form');const close=value=>dialog.close(value);form.querySelector('.stats-close').onclick=()=>close('');form.querySelector('.cancel').onclick=()=>close('');form.onsubmit=event=>{event.preventDefault();searchScope=String(new FormData(form).get('scope')||'all');localStorage.setItem('music-search-scope',searchScope);close('saved');};
+  return new Promise(resolve=>dialog.addEventListener('close',()=>{const changed=dialog.returnValue==='saved';dialog.remove();resolve(changed);},{once:true}));
 }
 
 async function showRegistrationSettings(){
