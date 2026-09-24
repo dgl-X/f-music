@@ -1,5 +1,6 @@
 import { ShuffleNavigator } from './shuffle-navigator.js';
 import { AudioMemoryCache } from './audio-cache.js';
+import { parseWebRoute, webRouteForState } from './web-router.js';
 
 const app = document.querySelector('#app');
 const api = async (url, options = {}) => {
@@ -25,6 +26,7 @@ let activeAlbumId = 0;
 let searchQuery = '';
 let searchScope = localStorage.getItem('music-search-scope') || 'all';
 let federationNode='';
+let federationKind='tracks';
 let federationPage=0;
 let sortMode = 'newest';
 let pageIndex = 0;
@@ -48,6 +50,47 @@ let uploadWorkers=0;
 let uploadTaskSequence=0;
 let audioContext=null,audioGain=null,audioSource=null;
 let instanceName='Family Music';
+
+function applyLocationRoute() {
+  const route=parseWebRoute(location.pathname,location.search);
+  activeView=route.notFound?'liked':route.view;
+  activeArtist='';activeArtistId=route.artistId;activeAlbum='';activeAlbumId=route.albumId;
+  activePlaylist=route.playlistId?{id:route.playlistId,title:''}:null;
+  searchQuery=route.query;
+  if(route.scope)searchScope=route.scope;
+  if(route.sort)sortMode=route.sort;
+  pageIndex=route.page;
+  if(route.pageSize)pageSize=route.pageSize;
+  federationNode=route.node;
+  federationKind=route.kind;
+  return route;
+}
+
+function currentWebRoute() {
+  return webRouteForState({view:activeView,artistId:activeArtistId,albumId:activeAlbumId,playlistId:activePlaylist?.id||'',query:searchQuery,scope:searchScope,sort:sortMode,page:pageIndex,pageSize,node:federationNode,kind:federationKind});
+}
+
+function syncBrowserRoute(mode='push') {
+  const target=currentWebRoute();
+  if(`${location.pathname}${location.search}`===target)return;
+  history[mode==='replace'?'replaceState':'pushState']({},'',target);
+}
+
+function updateViewControls() {
+  document.querySelectorAll('.tab').forEach(tab=>tab.classList.toggle('active',tab.dataset.view===activeView));
+  const sort=document.querySelector('#sort'),scope=document.querySelector('#search-scope'),tools=document.querySelector('.catalog-tools'),search=document.querySelector('#search');
+  if(sort){sort.hidden=!['tracks','liked'].includes(activeView);sort.value=sortMode;}
+  if(scope){scope.hidden=activeView!=='tracks';scope.value=searchScope;}
+  if(tools)tools.hidden=['recognition','upload','recommendations','search','collection','playlist'].includes(activeView);
+  if(search&&search.value!==searchQuery)search.value=searchQuery;
+}
+
+window.addEventListener('popstate',()=>{
+  if(!sessionUser)return;
+  applyLocationRoute();
+  updateViewControls();
+  loadCurrentView().catch(error=>{const root=document.querySelector('#catalog-content');if(root)root.innerHTML=`<div class="empty">${escapeHtml(error.message)}</div>`;});
+});
 
 function applyWebGain(){
   const player=document.querySelector('#player'),track=queue[currentIndex],userVolume=Number(localStorage.getItem('music-volume')??.8);
@@ -103,9 +146,10 @@ function renderAuth(isSetup) {
 
 async function renderLibrary(user) {
   sessionUser=user;
+  const initialRoute=applyLocationRoute();
   app.innerHTML = `<section class="shell"><header><div class="brand">◉ ${escapeHtml(instanceName)}</div><div class="user"><span>${escapeHtml(user.display_name)}</span><button class="secondary" id="web-settings">Настройки</button><button class="secondary" id="logout">Выйти</button></div></header>
     <div class="hero"><div><h1>Музыка</h1></div></div>
-    <nav class="catalog-tabs"><button class="tab active" data-view="liked">Мне нравится</button><button class="tab" data-view="recommendations">Для вас</button><button class="tab" data-view="search">Поиск</button><button class="tab" data-view="tracks">Все треки</button><button class="tab" data-view="history">Недавно слушали</button><button class="tab" data-view="artists">Исполнители</button><button class="tab" data-view="albums">Альбомы</button><button class="tab" data-view="playlists">Плейлисты</button><button class="tab" data-view="upload">Загрузка</button></nav>
+    <nav class="catalog-tabs"><button class="tab" data-view="liked">Мне нравится</button><button class="tab" data-view="recommendations">Для вас</button><button class="tab" data-view="search">Поиск</button><button class="tab" data-view="tracks">Все треки</button><button class="tab" data-view="history">Недавно слушали</button><button class="tab" data-view="artists">Исполнители</button><button class="tab" data-view="albums">Альбомы</button><button class="tab" data-view="playlists">Плейлисты</button><button class="tab" data-view="upload">Загрузка</button></nav>
     <div class="catalog-tools"><div class="search-box">⌕<input id="search" type="search" placeholder="Поиск в медиатеке" autocomplete="off"></div><div class="catalog-options"><select id="search-scope" aria-label="Какие треки показывать"><option value="all">Общая библиотека</option><option value="local">Только этот сервер</option><option value="remote">Только федерация</option></select><select id="sort" aria-label="Сортировка"><option value="newest">Сначала новые</option><option value="oldest">Снача старые</option><option value="title">По названию</option><option value="artist">По исполнителю</option><option value="album">По альбому</option><option value="year">По году</option></select><select id="page-size" aria-label="Треков на странице"><option value="50">50 на странице</option><option value="100">100 на странице</option><option value="200">200 на странице</option></select></div></div>
     <div class="active-filter" id="active-filter"></div><div id="catalog-content"></div></section>
     <section class="player-bar" id="player-bar" aria-label="Музыкальный плеер">
@@ -115,20 +159,22 @@ async function renderLibrary(user) {
       <div class="volume"><button class="mode-control" id="normalization" title="Выравнивание громкости">RG</button><span>♩</span><input id="volume" type="range" min="0" max="1" step="0.01" value="0.8" aria-label="Громкость"><button class="queue-toggle" id="queue-toggle" title="Очередь">☷</button></div>
     </section><aside class="queue-panel" id="queue-panel"><div class="queue-header"><div><strong>Очередь</strong><span id="queue-count"></span></div><button id="queue-close" aria-label="Закрыть">×</button></div><div class="queue-list" id="queue-list"></div></aside>`;
   document.querySelector('#web-settings').onclick=showWebSettings;
-  document.querySelector('#logout').onclick = async () => { await api('/api/v1/logout',{method:'POST'});cancelAudioPrefetch();document.querySelector('#player')?.pause();audioCache.clear();activeBlobUrl='';renderAuth(false); };
+  document.querySelector('#logout').onclick = async () => { await api('/api/v1/logout',{method:'POST'});cancelAudioPrefetch();document.querySelector('#player')?.pause();audioCache.clear();activeBlobUrl='';history.replaceState({},'', '/');renderAuth(false); };
   document.querySelectorAll('.tab').forEach(tab=>tab.onclick=()=>switchView(tab.dataset.view));
   document.querySelector('#page-size').value=String(pageSize);
   document.querySelector('#search-scope').value=searchScope;
   document.querySelector('#search-scope').hidden=activeView!=='tracks';
-  document.querySelector('#search').oninput=event=>{ searchQuery=event.target.value.trim();pageIndex=0;clearTimeout(searchTimer); searchTimer=setTimeout(loadCurrentView,180); };
-  document.querySelector('#sort').onchange=event=>{ sortMode=event.target.value;pageIndex=0;loadCurrentView(); };
-  document.querySelector('#search-scope').onchange=event=>{searchScope=event.target.value;localStorage.setItem('music-search-scope',searchScope);pageIndex=0;loadCurrentView();};
-  document.querySelector('#page-size').onchange=event=>{pageSize=Number(event.target.value)||50;pageIndex=0;localStorage.setItem('music-page-size',String(pageSize));loadCurrentView();};
+  document.querySelector('#search').oninput=event=>{ searchQuery=event.target.value.trim();pageIndex=0;clearTimeout(searchTimer); searchTimer=setTimeout(()=>{syncBrowserRoute('replace');loadCurrentView();},180); };
+  document.querySelector('#sort').onchange=event=>{ sortMode=event.target.value;pageIndex=0;syncBrowserRoute('replace');loadCurrentView(); };
+  document.querySelector('#search-scope').onchange=event=>{searchScope=event.target.value;localStorage.setItem('music-search-scope',searchScope);pageIndex=0;syncBrowserRoute('replace');loadCurrentView();};
+  document.querySelector('#page-size').onchange=event=>{pageSize=Number(event.target.value)||50;pageIndex=0;localStorage.setItem('music-page-size',String(pageSize));syncBrowserRoute('replace');loadCurrentView();};
   document.querySelector('#queue-toggle').onclick=()=>{document.querySelector('#queue-panel').classList.toggle('open');renderQueue();};
   document.querySelector('#queue-close').onclick=()=>document.querySelector('#queue-panel').classList.remove('open');
   document.querySelector('#player-like').onclick=toggleCurrentLike;
   document.querySelector('#now-details').onclick=()=>{const track=queue[currentIndex];if(track?.remote)return showRemoteTrack(track.remote_ref);if(track)editTrack(track);};
   setupPlayer();
+  updateViewControls();
+  if(!initialRoute.canonical||initialRoute.notFound)syncBrowserRoute('replace');
   await loadCurrentView();
 }
 
@@ -267,20 +313,17 @@ function passwordDialog({title,requiresCurrent,onSubmit}){
 function changeOwnPassword(){passwordDialog({title:'Смена пароля',requiresCurrent:true,onSubmit:values=>api('/api/v1/me/password',{method:'PUT',body:JSON.stringify(values)})});}
 function resetUserPassword(id,name){passwordDialog({title:`Новый пароль: ${name}`,requiresCurrent:false,onSubmit:values=>api(`/api/v1/users/${id}/password`,{method:'PUT',body:JSON.stringify(values)})});}
 
-function switchView(view) {
+function switchView(view,historyMode='push') {
   pageIndex=0;
   if(view!=='collection'){activeArtist='';activeArtistId=0;activeAlbum='';activeAlbumId=0;if(view!=='playlist')activePlaylist=null;}
   activeView=view;
-  document.querySelectorAll('.tab').forEach(tab=>tab.classList.toggle('active',tab.dataset.view===view));
-  document.querySelector('#sort').hidden=!['tracks','liked'].includes(view);
-  document.querySelector('#search-scope').hidden=view!=='tracks';
-  document.querySelector('#sort').value=sortMode;
-  document.querySelector('.catalog-tools').hidden=['recognition','upload','recommendations','search'].includes(view);
+  updateViewControls();
+  syncBrowserRoute(historyMode);
   loadCurrentView();
 }
 
 function setTrackFilter(artist='',album='',artistId=0,albumId=0) {
-  activeArtist=artist;activeArtistId=Number(artistId)||0;activeAlbum=album;activeAlbumId=Number(albumId)||0;activeView='collection';document.querySelectorAll('.tab').forEach(tab=>tab.classList.remove('active'));document.querySelector('.catalog-tools').hidden=true;loadCollection();
+  activeArtist=artist;activeArtistId=Number(artistId)||0;activeAlbum=album;activeAlbumId=Number(albumId)||0;activeView='collection';document.querySelectorAll('.tab').forEach(tab=>tab.classList.remove('active'));document.querySelector('.catalog-tools').hidden=true;syncBrowserRoute();loadCollection();
 }
 
 async function loadCurrentView() {
@@ -300,9 +343,9 @@ async function loadFederationBrowser(){
   currentQueueRequest='';const root=document.querySelector('#catalog-content');root.innerHTML='<div class="empty">Загружаем поиск…</div>';
   const nodes=await api('/api/v1/federation/nodes');
   root.innerHTML=`<section class="federation-browser"><div class="federation-search-tools"><div class="search-box">⌕<input class="federation-query" type="search" placeholder="Песня, альбом или исполнитель"></div><select class="federation-kind"><option value="tracks">Песни</option><option value="albums">Альбомы</option><option value="artists">Исполнители</option></select></div><div class="federation-node-list"><button class="secondary ${federationNode?'':'active'}" data-node="">Все серверы</button>${nodes.items.map(node=>`<button class="secondary ${federationNode===node.node_id?'active':''}" data-node="${escapeHtml(node.node_id)}">${escapeHtml(node.label||node.endpoint)} · ${node.track_count}</button>`).join('')}</div><div class="federation-play-actions" ${federationNode?'':'hidden'}><button class="primary federation-play-all">▶ Слушать всё</button><button class="secondary federation-shuffle-all">Перемешать</button></div><div class="federation-browser-results"></div></section>`;
-  const query=root.querySelector('.federation-query'),kind=root.querySelector('.federation-kind'),results=root.querySelector('.federation-browser-results');let timer;
+  const query=root.querySelector('.federation-query'),kind=root.querySelector('.federation-kind'),results=root.querySelector('.federation-browser-results');let timer;query.value=searchQuery;kind.value=federationKind;
   const load=async()=>{const q=query.value.trim();if(!federationNode&&q.length<2){results.innerHTML='<div class="empty">Выберите сервер, чтобы открыть всю его музыку, или введите запрос.</div>';return;}const data=await api(`/api/v1/federation/search?q=${encodeURIComponent(q)}&node_id=${encodeURIComponent(federationNode)}&limit=100&offset=${federationPage*100}`);if(kind.value==='tracks'){renderFederationTracks(results,data.items);const pager=document.createElement('div');pager.className='catalog-pager';pager.innerHTML=`<button class="secondary prev" ${federationPage?'':'disabled'}>‹ Назад</button><span>${data.offset+1}–${data.offset+data.items.length} из ${data.total}</span><button class="secondary next" ${data.has_more?'':'disabled'}>Далее ›</button>`;results.append(pager);pager.querySelector('.prev').onclick=()=>{federationPage--;load();};pager.querySelector('.next').onclick=()=>{federationPage++;load();};return;}const items=kind.value==='albums'?data.albums:data.artists;results.innerHTML=items.length?`<div class="catalog-grid">${items.map(item=>`<button class="catalog-card federation-collection" data-name="${escapeHtml(item.name)}"><div class="catalog-cover">♫</div><div class="catalog-name">${escapeHtml(item.name)}</div><div class="catalog-meta">${kind.value==='albums'?escapeHtml(item.artist)+' · ':''}${item.track_count} треков</div></button>`).join('')}</div>`:'<div class="empty">Ничего не найдено.</div>';results.querySelectorAll('.federation-collection').forEach(button=>button.onclick=()=>{query.value=button.dataset.name;kind.value='tracks';federationPage=0;load();});};
-  root.querySelectorAll('.federation-node-list button').forEach(button=>button.onclick=()=>{federationNode=button.dataset.node;federationPage=0;loadFederationBrowser();});query.oninput=()=>{federationPage=0;clearTimeout(timer);timer=setTimeout(load,180);};kind.onchange=()=>{federationPage=0;load();};load();
+  root.querySelectorAll('.federation-node-list button').forEach(button=>button.onclick=()=>{federationNode=button.dataset.node;federationPage=0;syncBrowserRoute();loadFederationBrowser();});query.oninput=()=>{searchQuery=query.value.trim();federationPage=0;clearTimeout(timer);timer=setTimeout(()=>{syncBrowserRoute('replace');load();},180);};kind.onchange=()=>{federationKind=kind.value;federationPage=0;syncBrowserRoute('replace');load();};load();
   const playAll=async shuffle=>{const button=shuffle?root.querySelector('.federation-shuffle-all'):root.querySelector('.federation-play-all'),label=button.textContent;button.disabled=true;button.textContent='Собираем очередь…';try{const data=await api(`/api/v1/federation/search?q=${encodeURIComponent(query.value.trim())}&node_id=${encodeURIComponent(federationNode)}&queue=1&limit=10000`);playbackFailures.clear();queue=shuffle?[...data.items].sort(()=>Math.random()-.5):data.items;if(queue.length){shuffleEnabled=shuffle;document.querySelector('#shuffle').classList.toggle('active',shuffle);playTrack(0);}}finally{button.disabled=false;button.textContent=label;}};root.querySelector('.federation-play-all')?.addEventListener('click',()=>playAll(false));root.querySelector('.federation-shuffle-all')?.addEventListener('click',()=>playAll(true));
 }
 
@@ -559,6 +602,9 @@ function playNext(track){
 }
 
 async function loadTracks() {
+  if(activePlaylist&&!activePlaylist.title){
+    try{const playlists=await api('/api/v1/playlists?limit=200&offset=0'),match=playlists.items.find(item=>item.id===activePlaylist.id);activePlaylist.title=match?.title||'Плейлист';renderActiveFilter();}catch{activePlaylist.title='Плейлист';}
+  }
   const params=new URLSearchParams({sort:sortMode,limit:String(pageSize),offset:String(pageIndex*pageSize)});
   if(searchQuery)params.set('q',searchQuery); if(activeArtist)params.set('artist',activeArtist); if(activeAlbum)params.set('album',activeAlbum);
   if(activeView==='liked')params.set('liked','1'); if(activePlaylist)params.set('playlist_id',activePlaylist.id);
@@ -604,9 +650,12 @@ async function prepareRemotePlayback(track){
 
 async function loadCollection(){
   currentQueueRequest='';
-  const params=new URLSearchParams({sort:activeAlbum?'album':'title',queue:'1',limit:'10000'});if(activeAlbumId)params.set('album_id',activeAlbumId);else{if(activeArtist)params.set('artist',activeArtist);if(activeAlbum)params.set('album',activeAlbum);}
+  const isAlbum=Boolean(activeAlbumId||activeAlbum);
+  const params=new URLSearchParams({sort:isAlbum?'album':'title',queue:'1',limit:'10000'});if(activeAlbumId)params.set('album_id',activeAlbumId);else{if(activeArtist)params.set('artist',activeArtist);if(activeAlbum)params.set('album',activeAlbum);}
   const [{items},artistCard,albumCard]=await Promise.all([api(`/api/v1/tracks?${params}`),!activeAlbum&&activeArtistId?api(`/api/v1/artists/${activeArtistId}`):Promise.resolve(null),activeAlbumId?api(`/api/v1/albums/${activeAlbumId}`):Promise.resolve(null)]),seconds=items.reduce((sum,item)=>sum+Number(item.duration_seconds||0),0),cover=albumCard?.image_url||artistCard?.image_url||items.find(item=>item.cover_url)?.cover_url||'';
-  displayedTracks=items;const kind=activeAlbum?'Альбом':'Исполнитель',subtitle=activeAlbum?`${activeArtist}${items[0]?.year?` · ${items[0].year}`:''}`:`${items.length} ${items.length===1?'трек':'треков'}`,backView=activeAlbum?'albums':'artists';
+  if(albumCard){activeAlbum=albumCard.name||activeAlbum;activeArtist=albumCard.artist||activeArtist;}
+  if(artistCard)activeArtist=artistCard.name||activeArtist;
+  displayedTracks=items;const kind=isAlbum?'Альбом':'Исполнитель',subtitle=isAlbum?`${activeArtist}${items[0]?.year?` · ${items[0].year}`:''}`:`${items.length} ${items.length===1?'трек':'треков'}`,backView=isAlbum?'albums':'artists';
   const cardMeta=artistCard?`${artistCard.album_count} альбомов · ${artistCard.featured_count} feat. · ${artistCard.play_count} просл.`:'';
   const artistAlbums=artistCard?.albums?.length?`<div class="artist-albums">${artistCard.albums.map(album=>`<button class="secondary" data-id="${album.id||''}" data-album="${escapeHtml(album.name)}">${escapeHtml(album.name)} · ${album.track_count}</button>`).join('')}</div>`:'';
   const header=`<section class="collection-hero"><button class="collection-back">‹</button><div class="collection-cover" ${cover?`style="background-image:url('${cover}')"`:''}>${cover?'':'♫'}</div><div class="collection-info"><small>${kind}</small><h2>${escapeHtml(activeAlbum||activeArtist)}</h2><span>${escapeHtml(subtitle)} · ${longDuration(seconds)}${cardMeta?` · ${escapeHtml(cardMeta)}`:''}</span>${albumCard?.bio?`<p class="artist-bio">${escapeHtml(albumCard.bio)}</p>`:''}${artistCard?.bio?`<p class="artist-bio">${escapeHtml(artistCard.bio)}</p>`:''}${artistAlbums}<div><button class="primary collection-play">▶ Слушать</button><button class="secondary collection-shuffle">Перемешать</button>${activeAlbum&&albumCard?.can_edit?'<button class="secondary collection-edit">✎ Редактировать</button>':artistCard&&sessionUser?.is_admin?'<button class="secondary artist-edit">✎ Карточка</button>':''}</div></div></section>`;
@@ -616,7 +665,7 @@ async function loadCollection(){
   root.querySelector('.collection-shuffle').onclick=()=>{if(!items.length)return;queue=[...items].sort(()=>Math.random()-.5);shuffleEnabled=true;document.querySelector('#shuffle').classList.add('active');playTrack(0);};
   if(activeAlbum&&albumCard?.can_edit)root.querySelector('.collection-edit').onclick=()=>editExistingAlbum(items,albumCard);
   if(artistCard&&sessionUser?.is_admin)root.querySelector('.artist-edit').onclick=()=>editArtistCard(artistCard);
-  root.querySelectorAll('.artist-albums button').forEach(button=>button.onclick=()=>{activeAlbum=button.dataset.album;activeAlbumId=Number(button.dataset.id)||0;loadCollection();});
+  root.querySelectorAll('.artist-albums button').forEach(button=>button.onclick=()=>{activeAlbum=button.dataset.album;activeAlbumId=Number(button.dataset.id)||0;activeArtistId=0;syncBrowserRoute();loadCollection();});
 }
 
 async function loadHistory(){currentQueueRequest='/api/v1/history?limit=200&offset=0';const data=await api(`/api/v1/history?limit=${pageSize}&offset=${pageIndex*pageSize}`);renderTracks(data.items,'История пока пуста.');renderPager(data,loadHistory);}
@@ -624,7 +673,7 @@ async function loadHistory(){currentQueueRequest='/api/v1/history?limit=200&offs
 function renderPager(data,reload){
   const total=Number(data.total||0),start=total?Number(data.offset||0)+1:0,end=Number(data.offset||0)+(data.items?.length||0),pages=Math.max(1,Math.ceil(total/Number(data.limit||pageSize)));
   const pager=document.createElement('div');pager.className='catalog-pager';pager.innerHTML=`<button class="secondary pager-prev" ${pageIndex<=0?'disabled':''}>‹ Назад</button><span>${start}–${end} из ${total.toLocaleString('ru-RU')} · страница ${pageIndex+1} из ${pages}</span><button class="secondary pager-next" ${data.has_more?'':'disabled'}>Далее ›</button>`;document.querySelector('#catalog-content').append(pager);
-  pager.querySelector('.pager-prev').onclick=()=>{if(pageIndex>0){pageIndex--;reload();scrollTo({top:0,behavior:'smooth'});}};pager.querySelector('.pager-next').onclick=()=>{if(data.has_more){pageIndex++;reload();scrollTo({top:0,behavior:'smooth'});}};
+  pager.querySelector('.pager-prev').onclick=()=>{if(pageIndex>0){pageIndex--;syncBrowserRoute();reload();scrollTo({top:0,behavior:'smooth'});}};pager.querySelector('.pager-next').onclick=()=>{if(data.has_more){pageIndex++;syncBrowserRoute();reload();scrollTo({top:0,behavior:'smooth'});}};
 }
 
 function renderTracks(items,emptyMessage,header=''){
@@ -651,7 +700,7 @@ async function loadPlaylists(){
   const data=await api(`/api/v1/playlists?limit=${pageSize}&offset=${pageIndex*pageSize}`),items=data.items;const root=document.querySelector('#catalog-content');
   root.innerHTML=`<div class="catalog-grid"><button class="catalog-card create-playlist"><div class="catalog-cover">＋</div><div class="catalog-name">Новый плейлист</div><div class="catalog-meta">Создать коллекцию</div></button>${items.map(item=>`<button class="catalog-card playlist-card" data-id="${item.id}" data-title="${escapeHtml(item.title)}"><div class="catalog-cover" ${item.cover_track_id?`style="background-image:url('/api/v1/tracks/${item.cover_track_id}/cover')"`:''}>${item.cover_track_id?'':'♫'}</div><div class="catalog-name">${escapeHtml(item.title)}</div><div class="catalog-meta">${item.track_count} треков</div></button>`).join('')}</div>`;
   root.querySelector('.create-playlist').onclick=async()=>{const title=prompt('Название плейлиста');if(!title)return;await api('/api/v1/playlists',{method:'POST',body:JSON.stringify({title})});loadPlaylists();};
-  root.querySelectorAll('.playlist-card').forEach(card=>card.onclick=()=>{activePlaylist={id:card.dataset.id,title:card.dataset.title};activeView='playlist';document.querySelectorAll('.tab').forEach(tab=>tab.classList.remove('active'));loadCurrentView();});
+  root.querySelectorAll('.playlist-card').forEach(card=>card.onclick=()=>{activePlaylist={id:card.dataset.id,title:card.dataset.title};activeView='playlist';document.querySelectorAll('.tab').forEach(tab=>tab.classList.remove('active'));syncBrowserRoute();loadCurrentView();});
   renderPager(data,loadPlaylists);
 }
 
