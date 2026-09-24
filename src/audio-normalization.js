@@ -42,8 +42,8 @@ export async function normalizeHybridFlac(filename) {
   const output = `${filename}${suffix}.flac`;
   try {
     await pipeline(fs.createReadStream(filename, { start: offset }), fs.createWriteStream(media, { mode: 0o640 }));
-    await run('ffmpeg', ['-nostdin', '-v', 'error', '-i', media, '-map', '0:a:0', '-c:a', 'copy', '-f', 'flac', '-y', output]);
-    await run('ffmpeg', ['-nostdin', '-v', 'error', '-xerror', '-i', output, '-map', '0:a:0', '-f', 'null', '-']);
+    await run('ffmpeg', ['-nostdin', '-v', 'error', '-threads', '1', '-i', media, '-map', '0:a:0', '-c:a', 'copy', '-f', 'flac', '-y', output]);
+    await run('ffmpeg', ['-nostdin', '-v', 'error', '-threads', '1', '-xerror', '-i', output, '-map', '0:a:0', '-f', 'null', '-']);
     return { normalized: true, output, offset };
   } catch (error) {
     fs.rmSync(output, { force: true });
@@ -52,4 +52,3 @@ export async function normalizeHybridFlac(filename) {
     fs.rmSync(media, { force: true });
   }
 }
-

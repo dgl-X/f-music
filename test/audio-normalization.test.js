@@ -32,7 +32,7 @@ test('normalizeHybridFlac losslessly remuxes embedded MP4 FLAC', async () => {
   const media = path.join(directory, 'media.m4a');
   const hybrid = path.join(directory, 'hybrid.flac');
   const generated = spawnSync('ffmpeg', [
-    '-nostdin', '-v', 'error', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=0.1',
+    '-nostdin', '-v', 'error', '-threads', '1', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=0.1',
     '-c:a', 'flac', '-strict', 'experimental', '-f', 'mp4', '-y', media,
   ]);
   assert.ifError(generated.error);
@@ -44,7 +44,7 @@ test('normalizeHybridFlac losslessly remuxes embedded MP4 FLAC', async () => {
   const result = await normalizeHybridFlac(hybrid);
   assert.equal(result.normalized, true);
   const decoded = spawnSync('ffmpeg', [
-    '-nostdin', '-v', 'error', '-xerror', '-i', result.output,
+    '-nostdin', '-v', 'error', '-threads', '1', '-xerror', '-i', result.output,
     '-map', '0:a:0', '-f', 'null', '-',
   ]);
   assert.ifError(decoded.error);
