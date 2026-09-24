@@ -50,7 +50,7 @@ pg_dump --format=custom --compress=6 --file="$temporary/database.dump" "$DATABAS
 pg_restore --list "$temporary/database.dump" >/dev/null
 
 include=()
-for directory in originals covers federation; do
+for directory in originals covers albums federation; do
   [[ -d "$STORAGE_DIR/$directory" ]] && include+=("$directory")
 done
 # Один поток держит фоновую задачу лёгкой для небольшой VM.
@@ -64,7 +64,7 @@ host=$(hostname)
 app_dir=$APP_DIR
 storage_dir=$STORAGE_DIR
 database_format=postgresql-custom
-media=originals,covers,federation
+media=originals,covers,albums,federation
 EOF
 (cd "$temporary" && sha256sum database.dump media.tar.zst app.env >SHA256SUMS)
 mv "$temporary" "$destination"

@@ -85,7 +85,7 @@ install -o root -g root -m 0644 deploy/family-music-worker.service /etc/systemd/
 systemctl daemon-reload
 systemctl enable --now family-music.service family-music-worker.service
 systemctl is-active family-music.service family-music-worker.service
-curl --fail http://127.0.0.1:8095/api/health
+curl --fail http://127.0.0.1:8095/api/v1/health
 ```
 
 Для диагностики:
@@ -106,8 +106,8 @@ Nginx нужны только чтение медиа и проход по ро�
 
 ```bash
 setfacl -m u:www-data:--x /opt/family-music
-setfacl -R -m u:www-data:rX /opt/family-music/storage/originals /opt/family-music/storage/derived /opt/family-music/storage/covers
-setfacl -R -d -m u:www-data:rX /opt/family-music/storage/originals /opt/family-music/storage/derived /opt/family-music/storage/covers
+setfacl -R -m u:www-data:rX /opt/family-music/storage/originals /opt/family-music/storage/derived /opt/family-music/storage/covers /opt/family-music/storage/albums
+setfacl -R -d -m u:www-data:rX /opt/family-music/storage/originals /opt/family-music/storage/derived /opt/family-music/storage/covers /opt/family-music/storage/albums
 nginx -t
 systemctl reload nginx
 ```
@@ -157,7 +157,7 @@ git merge --ff-only origin/main
 npm ci --omit=dev
 npm test
 systemctl start family-music-worker.service family-music.service
-curl --fail http://127.0.0.1:8095/api/health
+curl --fail http://127.0.0.1:8095/api/v1/health
 systemctl is-active family-music.service family-music-worker.service
 ```
 
@@ -185,7 +185,7 @@ git switch --detach ПРЕДЫДУЩИЙ_COMMIT
 npm ci --omit=dev
 npm test
 systemctl start family-music-worker.service family-music.service
-curl --fail http://127.0.0.1:8095/api/health
+curl --fail http://127.0.0.1:8095/api/v1/health
 ```
 
 После исправления можно вернуться на ветку и обновиться fast-forward:
@@ -205,7 +205,7 @@ git merge --ff-only origin/main
 ```bash
 systemctl is-enabled family-music.service family-music-worker.service nginx postgresql
 systemctl is-active family-music.service family-music-worker.service nginx postgresql
-curl --fail http://127.0.0.1:8095/api/health
+curl --fail http://127.0.0.1:8095/api/v1/health
 journalctl -u family-music.service -u family-music-worker.service --since boot --no-pager
 ```
 

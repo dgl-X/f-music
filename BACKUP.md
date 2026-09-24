@@ -7,7 +7,7 @@ VM удобен перед обновлением, но не заменяет о
 ## Что сохранять
 
 - PostgreSQL в формате custom dump;
-- `storage/originals` и `storage/covers`;
+- `storage/originals`, `storage/covers` и `storage/albums`;
 - `.env` с правами доступа только для администратора;
 - `storage/federation/identity.json`, если используется федерация.
 
@@ -70,7 +70,7 @@ scripts/backup-restore-smoke.sh \
 2. Не распаковывайте архив поверх рабочей медиатеки без snapshot или отдельной
    копии повреждённого состояния.
 3. Восстановите дамп сначала во временную PostgreSQL-базу и проверьте его.
-4. Восстановите оригиналы, обложки, `.env` и federation identity.
+4. Восстановите оригиналы, обложки треков и альбомов, `.env` и federation identity.
 5. Верните владельца файлов `family-music:family-music` и права каталогов `0750`.
 6. Запустите worker и API, затем проверьте health, вход и Range-воспроизведение.
 

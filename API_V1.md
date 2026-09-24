@@ -1,6 +1,6 @@
 # Family Music API v1
 
-Стабильный контракт для web и будущего Android-клиента. Базовый путь: `/api/v1`. Все ответы с JSON используют `Content-Type: application/json`; ошибки имеют вид `{ "error": "Описание" }`.
+Стабильный контракт для WEB и Android-клиента. Базовый путь: `/api/v1`. Все ответы с JSON используют `Content-Type: application/json`; ошибки имеют вид `{ "error": "Описание" }`.
 
 ## Совместимость
 

@@ -1,6 +1,6 @@
 # DEB-пакет Family Music
 
-Экспериментальный пакет предназначен для Debian 13 amd64. Он устанавливает код,
+Стабильный пакет предназначен для Debian 13 amd64. Он устанавливает код,
 проверенный официальный Node.js 24 runtime в `/opt/family-music`, два
 systemd-сервиса и примеры конфигурации. Системный Node.js не заменяется. PostgreSQL,
 медиатека, федеративная identity и `.env` не удаляются при обновлении или
@@ -10,10 +10,10 @@ systemd-сервиса и примеры конфигурации. Систем�
 
 ```bash
 npm ci --omit=dev
-./packaging/build-deb.sh 0.1.0 amd64
+./packaging/build-deb.sh 0.1.6 amd64
 ```
 
-Результат появляется в `dist/family-music-server_0.1.0_amd64.deb`.
+Результат появляется в `dist/family-music-server_0.1.6_amd64.deb`.
 Сборщик загружает официальный Node.js 24.20.0 один раз в игнорируемый Git
 локальный кэш и перед упаковкой сверяет закреплённый SHA-256.
 
@@ -23,8 +23,8 @@ npm ci --omit=dev
 сборку DEB и публикацию пакета вместе с `SHA256SUMS`.
 
 ```bash
-git tag -a v0.1.0 -m "Family Music Server v0.1.0"
-git push origin v0.1.0
+git tag -a v0.1.6 -m "Family Music Server v0.1.6"
+git push origin v0.1.6
 ```
 
 Версия DEB берётся из тега. Перед отправкой тега следует убедиться, что commit в
@@ -34,9 +34,9 @@ git push origin v0.1.0
 ## Установка и обновление
 
 ```bash
-apt install ./family-music-server_0.1.0_amd64.deb
+apt install ./family-music-server_0.1.6_amd64.deb
 systemctl status family-music family-music-worker
-node -e "fetch('http://127.0.0.1:8095/api/health').then(async r => { console.log(await r.text()); process.exit(r.ok ? 0 : 1) })"
+node -e "fetch('http://127.0.0.1:8095/api/v1/health').then(async r => { console.log(await r.text()); process.exit(r.ok ? 0 : 1) })"
 ```
 
 При первой установке пакет создаёт системного пользователя, локальную роль и БД
@@ -63,8 +63,8 @@ snapshot или проверенная резервная копия.
 
 ```bash
 ./scripts/deb-lxc-smoke.sh 107 \
-  ./dist/family-music-server_0.1.1_amd64.deb \
-  ./dist/family-music-server_0.1.2_amd64.deb
+  ./dist/family-music-server_0.1.5_amd64.deb \
+  ./dist/family-music-server_0.1.6_amd64.deb
 ```
 
 Скрипт запускается на хосте Proxmox VE и принимает уже созданный и запущенный
