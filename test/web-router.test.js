@@ -5,7 +5,7 @@ import { parseWebRoute, webRouteForState } from '../public/web-router.js';
 test('web router restores tabs and pagination from a direct URL', () => {
   assert.deepEqual(parseWebRoute('/tracks', '?q=Guf&scope=local&sort=album&page=3&page_size=100'), {
     view:'tracks', artistId:0, albumId:0, playlistId:'', query:'Guf', scope:'local', sort:'album',
-    page:2, pageSize:100, node:'', kind:'tracks', canonical:true,
+    page:2, pageSize:100, node:'', kind:'tracks', settingsSection:'', unknownPath:'', canonical:true,
   });
 });
 
@@ -24,4 +24,12 @@ test('root remains compatible and unknown paths are distinguishable', () => {
   assert.equal(parseWebRoute('/').view, 'liked');
   assert.equal(parseWebRoute('/').canonical, false);
   assert.equal(parseWebRoute('/does-not-exist').notFound, true);
+});
+
+test('settings sections and internal 404 survive a refresh', () => {
+  assert.equal(parseWebRoute('/settings/federation').settingsSection, 'federation');
+  assert.equal(webRouteForState({view:'settings',settingsSection:'reports'}), '/settings/reports');
+  const missing=parseWebRoute('/missing/page');
+  assert.equal(missing.view,'not-found');
+  assert.equal(webRouteForState({view:missing.view,unknownPath:missing.unknownPath}),'/missing/page');
 });

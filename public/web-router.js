@@ -8,7 +8,9 @@ const topLevelRoutes = new Map([
   ['albums', 'albums'],
   ['playlists', 'playlists'],
   ['upload', 'upload'],
+  ['settings', 'settings'],
 ]);
+const settingsSections = new Set(['statistics', 'users', 'federation', 'recognition', 'reports', 'duplicates', 'password']);
 
 const positiveInteger = value => {
   const number = Number(value);
@@ -27,16 +29,18 @@ export function parseWebRoute(pathname = '/', search = '') {
     sort: ['newest', 'oldest', 'title', 'artist', 'album', 'year'].includes(query.get('sort')) ? query.get('sort') : '',
     page: Math.max(0, positiveInteger(query.get('page')) - 1),
     pageSize: [50, 100, 200].includes(Number(query.get('page_size'))) ? Number(query.get('page_size')) : 0,
-    node: query.get('node') || '',
+    node: query.get('node') || '', settingsSection: '', unknownPath: '',
     kind: ['tracks', 'albums', 'artists'].includes(query.get('kind')) ? query.get('kind') : 'tracks',
     canonical: true,
   };
   if (!parts.length) { route.canonical = false; return route; }
   if (parts.length === 1 && topLevelRoutes.has(parts[0])) { route.view = topLevelRoutes.get(parts[0]); return route; }
+  if (parts.length === 2 && parts[0] === 'settings' && parts[1] === 'recognition-queue') { route.view = 'recognition'; return route; }
+  if (parts.length === 2 && parts[0] === 'settings' && settingsSections.has(parts[1])) { route.view = 'settings'; route.settingsSection = parts[1]; return route; }
   if (parts.length === 2 && parts[0] === 'albums' && positiveInteger(parts[1])) { route.view = 'collection'; route.albumId = positiveInteger(parts[1]); return route; }
   if (parts.length === 2 && parts[0] === 'artists' && positiveInteger(parts[1])) { route.view = 'collection'; route.artistId = positiveInteger(parts[1]); return route; }
   if (parts.length === 2 && parts[0] === 'playlists' && /^[0-9a-f-]{8,}$/i.test(parts[1])) { route.view = 'playlist'; route.playlistId = parts[1]; return route; }
-  route.notFound = true;
+  route.notFound = true; route.view = 'not-found'; route.unknownPath = String(pathname);
   return route;
 }
 
@@ -45,6 +49,9 @@ export function webRouteForState(state) {
   if (state.view === 'collection' && state.albumId) pathname = `/albums/${state.albumId}`;
   else if (state.view === 'collection' && state.artistId) pathname = `/artists/${state.artistId}`;
   else if (state.view === 'playlist' && state.playlistId) pathname = `/playlists/${encodeURIComponent(state.playlistId)}`;
+  else if (state.view === 'settings' && state.settingsSection) pathname = `/settings/${state.settingsSection}`;
+  else if (state.view === 'recognition') pathname = '/settings/recognition-queue';
+  else if (state.view === 'not-found' && state.unknownPath) pathname = state.unknownPath;
   else if ([...topLevelRoutes.values()].includes(state.view)) pathname = `/${state.view}`;
 
   const query = new URLSearchParams();
