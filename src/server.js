@@ -20,6 +20,7 @@ import { RegistrationLimiter, validateRegistration } from './registration.js';
 import { clearSessionCookie, createAuthenticationService, hasValidSessionOrigin, requestIp, requestOriginMatches } from './authentication.js';
 import { validateAudioDecode } from './audio-validation.js';
 import { createCatalogService } from './catalog-service.js';
+import { savePlaybackState } from './playback-state.js';
 
 const config = loadConfig();
 const db = await openDatabase(config.databaseUrl);
@@ -1696,27 +1697,7 @@ async function api(req, res, url, apiPrefix = '/api') {
     return sendJson(res, 200, { items: requested.map(id => byId.get(id)).filter(Boolean) });
   }
   if (url.pathname === '/api/catalog' && req.method === 'GET') {
-    const view=String(url.searchParams.get('view')||''),limit=Math.min(200,Math.max(1,Number(url.searchParams.get('limit'))||50)),offset=Math.max(0,Number(url.searchParams.get('offset'))||0);
-    const query=String(url.searchParams.get('q')||'').trim().slice(0,120),pageSql=view==='artists'||view==='albums'?' LIMIT @limit OFFSET @offset':'',pageParams={limit,offset,query:`%${query}%`};
-    const artistWhere=query?'AND artists.name ILIKE @query':'';
-    const artistTotal=view==='artists'?Number((await db.prepare(`SELECT count(*) count FROM artists WHERE EXISTS(SELECT 1 FROM track_artists WHERE track_artists.artist_id=artists.id) ${artistWhere}`).get(pageParams)).count):0;
-    const artists=view==='albums'?[]:await db.prepare(`SELECT artists.id,artists.name,artists.bio,artists.image_key,count(*) AS track_count,
-      min(tracks.id) FILTER (WHERE tracks.cover_key IS NOT NULL) AS cover_track_id,
-      count(*) FILTER (WHERE track_artists.role='featured') AS featured_count
-      FROM artists JOIN track_artists ON track_artists.artist_id=artists.id JOIN tracks ON tracks.id=track_artists.track_id WHERE TRUE ${artistWhere}
-      GROUP BY artists.id,artists.name,artists.bio,artists.image_key ORDER BY artists.name COLLATE NOCASE${view==='artists'?pageSql:''}`).all(pageParams);
-    for(const artist of artists){artist.image_url=artist.image_key?`${apiPrefix}/artists/${artist.id}/image`:null;delete artist.image_key;}
-    if(view==='artists')return sendJson(res,200,{items:artists,total:artistTotal,offset,limit,has_more:offset+artists.length<artistTotal});
-    const albumFilter=query?'AND (albums.name ILIKE @query OR albums.artist ILIKE @query)':'';
-    const albumTotal=view==='albums'?Number((await db.prepare(`SELECT count(*) count FROM albums WHERE EXISTS(SELECT 1 FROM tracks WHERE tracks.album_id=albums.id) ${albumFilter}`).get(pageParams)).count):0;
-    const albums = await db.prepare(`SELECT albums.id,albums.name,albums.artist,albums.bio,COALESCE(albums.year,max(tracks.year)) AS year,
-      count(tracks.id) AS track_count,
-      min(tracks.id) FILTER (WHERE tracks.cover_key IS NOT NULL) AS cover_track_id,
-      CASE WHEN albums.image_key IS NOT NULL THEN '${apiPrefix}/albums/'||albums.id||'/image' ELSE NULL END AS image_url
-      FROM albums JOIN tracks ON tracks.album_id=albums.id WHERE TRUE ${albumFilter}
-      GROUP BY albums.id ORDER BY albums.name COLLATE NOCASE${view==='albums'?pageSql:''}`).all(pageParams);
-    if(view==='albums')return sendJson(res,200,{items:albums,total:albumTotal,offset,limit,has_more:offset+albums.length<albumTotal});
-    return sendJson(res, 200, { artists, albums });
+    return sendJson(res, 200, await catalog.listCollections({ searchParams: url.searchParams }));
   }
   if (url.pathname === '/api/playlists' && req.method === 'GET') {
     const limit=Math.min(200,Math.max(1,Number(url.searchParams.get('limit'))||50)),offset=Math.max(0,Number(url.searchParams.get('offset'))||0);
@@ -1799,10 +1780,7 @@ async function api(req, res, url, apiPrefix = '/api') {
     return sendJson(res,200,{items,total,offset,limit,has_more:offset+items.length<total});
   }
   if(url.pathname==='/api/artists'&&req.method==='GET'){
-    const query=String(url.searchParams.get('q')||'').trim().slice(0,120),params={limit:Math.min(500,Math.max(1,Number(url.searchParams.get('limit'))||100))};
-    const where=query?'WHERE name ILIKE @query':'';if(query)params.query=`%${query}%`;
-    const items=await db.prepare(`SELECT id,name FROM artists ${where} ORDER BY name COLLATE NOCASE LIMIT @limit`).all(params);
-    return sendJson(res,200,{items});
+    return sendJson(res,200,await catalog.lookupArtists({searchParams:url.searchParams}));
   }
   const artistMatch=/^\/api\/artists\/(\d+)$/.exec(url.pathname);
   if(artistMatch&&req.method==='GET'){
@@ -1885,15 +1863,14 @@ async function api(req, res, url, apiPrefix = '/api') {
   if(url.pathname==='/api/playback-state'&&req.method==='PUT'){
     const body=await readJson(req,1024*1024);
     const requestedTrackId=body.track_id?String(body.track_id):null,remoteTrackRef=requestedTrackId?.startsWith('remote:')?requestedTrackId.slice(7):null,trackId=remoteTrackRef?null:requestedTrackId;
-    if(trackId&&!await db.prepare('SELECT id FROM tracks WHERE id=?').get(trackId))return sendJson(res,400,{error:'Некорректный текущий трек'});
-    if(remoteTrackRef){try{const decoded=decodeRemoteReference(remoteTrackRef);if(!await db.prepare('SELECT 1 FROM federation_remote_tracks WHERE origin_node_id=? AND object_id=?').get(decoded.nodeId,decoded.objectId))throw new Error();}catch{return sendJson(res,400,{error:'Некорректный удалённый текущий трек'});}}
+    let decodedRemote=null;
+    if(remoteTrackRef){try{decodedRemote=decodeRemoteReference(remoteTrackRef);}catch{return sendJson(res,400,{error:'Некорректный удалённый текущий трек'});}}
     const queue=Array.isArray(body.queue)?[...new Set(body.queue.map(String).filter(id=>/^[0-9a-f-]{36}$/.test(id)||id.startsWith('remote:')))].slice(0,10000):[];
     const repeatMode=['off','all','one'].includes(body.repeat_mode)?body.repeat_mode:'off';
     const queueSource=String(body.queue_source||'Очередь').trim().slice(0,120)||'Очередь';
     const position=Math.max(0,Number(body.position_seconds)||0);
-    await db.prepare(`INSERT INTO playback_state(user_id,track_id,remote_track_ref,position_seconds,queue_json,shuffle,repeat_mode,queue_source) VALUES(?,(SELECT id FROM tracks WHERE id=?),?,?,?,?,?,?)
-      ON CONFLICT(user_id) DO UPDATE SET track_id=excluded.track_id,remote_track_ref=excluded.remote_track_ref,position_seconds=excluded.position_seconds,queue_json=excluded.queue_json,
-      shuffle=excluded.shuffle,repeat_mode=excluded.repeat_mode,queue_source=excluded.queue_source,updated_at=CURRENT_TIMESTAMP`).run(user.id,trackId,remoteTrackRef,position,JSON.stringify(queue),body.shuffle?1:0,repeatMode,queueSource);
+    const saved=await savePlaybackState({db,userId:user.id,trackId,remoteTrackRef,decodedRemote,position,queue,shuffle:Boolean(body.shuffle),repeatMode,queueSource});
+    if(!saved)return sendJson(res,400,{error:remoteTrackRef?'Некорректный удалённый текущий трек':'Некорректный текущий трек'});
     return sendJson(res,200,{ok:true});
   }
   if (url.pathname === '/api/tracks/batch' && req.method === 'POST') {

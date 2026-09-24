@@ -27,6 +27,23 @@ export function parseTrackListRequest(searchParams) {
   };
 }
 
+export function parseCollectionListRequest(searchParams) {
+  const view = String(searchParams.get('view') || '');
+  return {
+    view: view === 'artists' || view === 'albums' ? view : '',
+    query: String(searchParams.get('q') || '').trim().slice(0, 120),
+    limit: Math.min(200, Math.max(1, Number(searchParams.get('limit')) || 50)),
+    offset: Math.max(0, Number(searchParams.get('offset')) || 0),
+  };
+}
+
+export function parseArtistLookupRequest(searchParams) {
+  return {
+    query: String(searchParams.get('q') || '').trim().slice(0, 120),
+    limit: Math.min(500, Math.max(1, Number(searchParams.get('limit')) || 100)),
+  };
+}
+
 export function createCatalogService({ db, apiPrefix }) {
   async function listTracks({ searchParams, userId }) {
     const request = parseTrackListRequest(searchParams);
@@ -78,5 +95,53 @@ export function createCatalogService({ db, apiPrefix }) {
     return { items, total, offset: request.offset, limit: request.limit, has_more: request.offset + items.length < total };
   }
 
-  return { listTracks };
+  async function listCollections({ searchParams }) {
+    const request = parseCollectionListRequest(searchParams);
+    const pageSql = request.view ? ' LIMIT @limit OFFSET @offset' : '';
+    const params = { limit: request.limit, offset: request.offset, query: `%${request.query}%` };
+    const artistWhere = request.query ? 'AND artists.name ILIKE @query' : '';
+    const artistTotal = request.view === 'artists'
+      ? Number((await db.prepare(`SELECT count(*) count FROM artists WHERE EXISTS(SELECT 1 FROM track_artists WHERE track_artists.artist_id=artists.id) ${artistWhere}`).get(params)).count)
+      : 0;
+    const artists = request.view === 'albums' ? [] : await db.prepare(`SELECT artists.id,artists.name,artists.bio,artists.image_key,count(*) AS track_count,
+      min(tracks.id) FILTER (WHERE tracks.cover_key IS NOT NULL) AS cover_track_id,
+      count(*) FILTER (WHERE track_artists.role='featured') AS featured_count
+      FROM artists JOIN track_artists ON track_artists.artist_id=artists.id JOIN tracks ON tracks.id=track_artists.track_id WHERE TRUE ${artistWhere}
+      GROUP BY artists.id,artists.name,artists.bio,artists.image_key ORDER BY artists.name COLLATE NOCASE${request.view === 'artists' ? pageSql : ''}`).all(params);
+    for (const artist of artists) {
+      artist.image_url = artist.image_key ? `${apiPrefix}/artists/${artist.id}/image` : null;
+      delete artist.image_key;
+    }
+    if (request.view === 'artists') return {
+      items: artists, total: artistTotal, offset: request.offset, limit: request.limit,
+      has_more: request.offset + artists.length < artistTotal,
+    };
+
+    const albumFilter = request.query ? 'AND (albums.name ILIKE @query OR albums.artist ILIKE @query)' : '';
+    const albumTotal = request.view === 'albums'
+      ? Number((await db.prepare(`SELECT count(*) count FROM albums WHERE EXISTS(SELECT 1 FROM tracks WHERE tracks.album_id=albums.id) ${albumFilter}`).get(params)).count)
+      : 0;
+    const albums = await db.prepare(`SELECT albums.id,albums.name,albums.artist,albums.bio,COALESCE(albums.year,max(tracks.year)) AS year,
+      count(tracks.id) AS track_count,
+      min(tracks.id) FILTER (WHERE tracks.cover_key IS NOT NULL) AS cover_track_id,
+      CASE WHEN albums.image_key IS NOT NULL THEN '${apiPrefix}/albums/'||albums.id||'/image' ELSE NULL END AS image_url
+      FROM albums JOIN tracks ON tracks.album_id=albums.id WHERE TRUE ${albumFilter}
+      GROUP BY albums.id ORDER BY albums.name COLLATE NOCASE${request.view === 'albums' ? pageSql : ''}`).all(params);
+    if (request.view === 'albums') return {
+      items: albums, total: albumTotal, offset: request.offset, limit: request.limit,
+      has_more: request.offset + albums.length < albumTotal,
+    };
+    return { artists, albums };
+  }
+
+  async function lookupArtists({ searchParams }) {
+    const request = parseArtistLookupRequest(searchParams);
+    const params = { limit: request.limit };
+    const where = request.query ? 'WHERE name ILIKE @query' : '';
+    if (request.query) params.query = `%${request.query}%`;
+    const items = await db.prepare(`SELECT id,name FROM artists ${where} ORDER BY name COLLATE NOCASE LIMIT @limit`).all(params);
+    return { items };
+  }
+
+  return { listTracks, listCollections, lookupArtists };
 }
