@@ -50,6 +50,7 @@ let uploadWorkers=0;
 let uploadTaskSequence=0;
 let audioContext=null,audioGain=null,audioSource=null;
 let instanceName='Family Music';
+let registrationEnabled=false;
 let settingsSection='';
 let unknownRoutePath='';
 let openingSettingsSection='';
@@ -115,6 +116,7 @@ function enableWebAudio(){
 async function start() {
   const setup = await api('/api/v1/setup/status');
   instanceName=setup.library_name||'Family Music';document.title=instanceName;
+  registrationEnabled=Boolean(setup.registration_enabled);
   if (setup.needs_setup) return renderSetup(setup);
   try { renderLibrary(await api('/api/v1/me')); } catch { renderAuth(false); }
 }
@@ -124,7 +126,7 @@ function renderSetup(status) {
   app.innerHTML=`<section class="auth setup-auth"><div class="card setup-card"><div class="brand">◉ Family Music</div><div class="setup-steps"><span class="active">1</span><span>2</span><span>3</span></div>
     <form id="setup-form"><section class="setup-page active" data-step="1"><div><h1>Добро пожаловать</h1><p class="subtitle">Проверим сервер и за пару шагов подготовим семейную библиотеку.</p></div><div class="setup-checks">${check('PostgreSQL',status.checks?.database)}${check('Хранилище',status.checks?.storage)}${check('Фоновая обработка',status.checks?.worker)}</div><small class="setup-version">Family Music Server ${escapeHtml(status.server_version||'')}</small></section>
     <section class="setup-page" data-step="2"><div><h2>Ваша библиотека</h2><p class="subtitle">Название будет видно на странице входа и в WEB-интерфейсе.</p></div><label>Название библиотеки<input name="library_name" value="${escapeHtml(status.library_name||'Family Music')}" minlength="2" maxlength="60" required></label><label class="setup-toggle"><input type="checkbox" name="recognition_enabled"><span><strong>Автораспознавание</strong><small>Искать метаданные для файлов без тегов. API-ключ можно добавить позже в настройках.</small></span></label></section>
-    <section class="setup-page" data-step="3"><div><h2>Администратор</h2><p class="subtitle">Публичной регистрации нет. Остальные аккаунты вы создадите после входа.</p></div><label>Отображаемое имя<input name="display_name" autocomplete="name" maxlength="80" required></label><label>Логин<input name="username" autocomplete="username" minlength="3" maxlength="32" pattern="[A-Za-z0-9_.-]+" required></label><label>Пароль<input type="password" name="password" autocomplete="new-password" minlength="10" required></label><label>Повторите пароль<input type="password" name="confirmation" autocomplete="new-password" minlength="10" required></label></section>
+    <section class="setup-page" data-step="3"><div><h2>Администратор</h2><p class="subtitle">Создайте первый аккаунт. Самостоятельная регистрация по умолчанию выключена и настраивается после входа.</p></div><label>Отображаемое имя<input name="display_name" autocomplete="name" maxlength="80" required></label><label>Логин<input name="username" autocomplete="username" minlength="3" maxlength="32" pattern="[A-Za-z0-9_.-]+" required></label><label>Пароль<input type="password" name="password" autocomplete="new-password" minlength="10" required></label><label>Повторите пароль<input type="password" name="confirmation" autocomplete="new-password" minlength="10" required></label></section>
     <div class="error" id="auth-error"></div><div class="setup-actions"><button type="button" class="secondary setup-back" hidden>Назад</button><button type="button" class="primary setup-next">Продолжить</button><button class="primary setup-finish" hidden>Завершить настройку</button></div></form></div></section>`;
   const form=document.querySelector('#setup-form'),pages=[...form.querySelectorAll('.setup-page')],steps=[...document.querySelectorAll('.setup-steps span')],back=form.querySelector('.setup-back'),next=form.querySelector('.setup-next'),finish=form.querySelector('.setup-finish');let current=0;
   const show=()=>{pages.forEach((page,index)=>page.classList.toggle('active',index===current));steps.forEach((step,index)=>step.classList.toggle('active',index<=current));back.hidden=current===0;next.hidden=current===pages.length-1;finish.hidden=current!==pages.length-1;};
@@ -142,6 +144,7 @@ function renderAuth(isSetup) {
       <label>Логин<input name="username" autocomplete="username" minlength="3" required></label>
       <label>Пароль<input type="password" name="password" autocomplete="${isSetup ? 'new-password' : 'current-password'}" minlength="10" required></label>
       <div class="error" id="auth-error"></div><button class="primary">${isSetup ? 'Создать аккаунт' : 'Войти'}</button>
+      ${!isSetup&&registrationEnabled?'<button type="button" class="secondary" id="open-registration">Создать аккаунт</button>':''}
     </form></div></section>`;
   document.querySelector('#auth-form').addEventListener('submit', async event => {
     event.preventDefault();
@@ -149,6 +152,13 @@ function renderAuth(isSetup) {
     try { await api(isSetup ? '/api/v1/setup' : '/api/v1/login', { method:'POST', body:JSON.stringify(values) }); if (isSetup) await api('/api/v1/login',{method:'POST',body:JSON.stringify(values)}); renderLibrary(await api('/api/v1/me')); }
     catch (error) { document.querySelector('#auth-error').textContent = error.message; }
   });
+  document.querySelector('#open-registration')?.addEventListener('click',renderRegistration);
+}
+
+function renderRegistration() {
+  app.innerHTML=`<section class="auth"><div class="card"><div class="brand">◉ ${escapeHtml(instanceName)}</div><p class="subtitle">Создайте личный аккаунт в этой библиотеке</p><form id="registration-form"><label>Отображаемое имя<input name="display_name" autocomplete="name" maxlength="80"></label><label>Логин<input name="username" autocomplete="username" minlength="3" maxlength="32" pattern="[A-Za-z0-9_.-]+" required></label><label>Пароль<input type="password" name="password" autocomplete="new-password" minlength="10" maxlength="256" required></label><label>Повторите пароль<input type="password" name="confirmation" autocomplete="new-password" minlength="10" maxlength="256" required></label><div class="error" id="auth-error"></div><button class="primary">Создать аккаунт</button><button type="button" class="secondary" id="back-to-login">Вернуться ко входу</button></form></div></section>`;
+  document.querySelector('#back-to-login').onclick=()=>renderAuth(false);
+  document.querySelector('#registration-form').onsubmit=async event=>{event.preventDefault();const form=event.currentTarget,values=Object.fromEntries(new FormData(form)),error=document.querySelector('#auth-error'),submit=form.querySelector('.primary');error.textContent='';if(values.password!==values.confirmation){error.textContent='Пароли не совпадают';return;}delete values.confirmation;submit.disabled=true;try{await api('/api/v1/register',{method:'POST',body:JSON.stringify(values)});await api('/api/v1/login',{method:'POST',body:JSON.stringify({username:values.username,password:values.password})});renderLibrary(await api('/api/v1/me'));}catch(problem){error.textContent=problem.message;submit.disabled=false;}};
 }
 
 async function renderLibrary(user) {
@@ -191,7 +201,7 @@ function showWebSettings(){
 
 function loadSettingsView(){
   const root=document.querySelector('#catalog-content');
-  const admin=sessionUser?.is_admin?`<div class="settings-group"><h3>Администрирование</h3><button data-section="statistics"><span>Статистика</span><small>Состояние сервера, очереди и громкость</small></button><button data-section="users"><span>Аккаунты</span><small>Пользователи и сброс паролей</small></button><button data-section="federation"><span>Федерация</span><small>Identity, адреса и доступность ноды</small></button><button data-section="recognition"><span>Автораспознавание</span><small>AcoustID, включение и Client API key</small></button><button data-section="reports"><span>Отчёты об ошибках</span><small>Диагностика из Android-приложения</small></button><button data-action="recognition-queue"><span>Требуют внимания</span><small>Распознавание и исправление метаданных</small></button></div>`:'';
+  const admin=sessionUser?.is_admin?`<div class="settings-group"><h3>Администрирование</h3><button data-section="statistics"><span>Статистика</span><small>Состояние сервера, очереди и громкость</small></button><button data-section="users"><span>Аккаунты</span><small>Пользователи и сброс паролей</small></button><button data-section="registration"><span>Регистрация</span><small>Разрешить пользователям создавать аккаунты самостоятельно</small></button><button data-section="federation"><span>Федерация</span><small>Identity, адреса и доступность ноды</small></button><button data-section="recognition"><span>Автораспознавание</span><small>AcoustID, включение и Client API key</small></button><button data-section="reports"><span>Отчёты об ошибках</span><small>Диагностика из Android-приложения</small></button><button data-action="recognition-queue"><span>Требуют внимания</span><small>Распознавание и исправление метаданных</small></button></div>`:'';
   root.innerHTML=`<section class="stats-shell settings-dialog routed-settings"><div class="stats-head"><div><div class="dialog-title">Настройки</div><small>${escapeHtml(sessionUser?.display_name||'')}</small></div><button class="stats-close" aria-label="Закрыть">×</button></div><div class="settings-group"><h3>Аккаунт</h3><button data-section="password"><span>Изменить пароль</span><small>Обновить пароль текущего пользователя</small></button></div><div class="settings-group"><h3>Библиотека</h3><label>«Все треки» по умолчанию<select name="library_scope"><option value="all">Общая библиотека</option><option value="local">Только этот сервер</option><option value="remote">Только федерация</option></select></label><button data-section="duplicates"><span>Возможные дубликаты</span><small>Совпадения по названию и исполнителю</small></button></div>${admin}</section>`;
   root.querySelector('.stats-close').onclick=()=>switchView('liked');
   const scopeSelect=root.querySelector('[name="library_scope"]');scopeSelect.value=searchScope;scopeSelect.onchange=()=>{searchScope=scopeSelect.value;localStorage.setItem('music-search-scope',searchScope);};
@@ -201,13 +211,20 @@ function loadSettingsView(){
 }
 
 function openSettingsSection(section,push=true){
-  const adminOnly=new Set(['statistics','users','federation','recognition','reports']);
+  const adminOnly=new Set(['statistics','users','registration','federation','recognition','reports']);
   if(adminOnly.has(section)&&!sessionUser?.is_admin){settingsSection='';syncBrowserRoute('replace');return;}
-  const actions={statistics:showAdminStats,users:manageUsers,federation:showFederationSettings,recognition:showRecognitionSettings,reports:showDiagnosticReports,duplicates:showDuplicates,password:changeOwnPassword};
+  const actions={statistics:showAdminStats,users:manageUsers,registration:showRegistrationSettings,federation:showFederationSettings,recognition:showRecognitionSettings,reports:showDiagnosticReports,duplicates:showDuplicates,password:changeOwnPassword};
   const action=actions[section];if(!action)return;
   settingsSection=section;openingSettingsSection=section;if(push)syncBrowserRoute();
   Promise.resolve(action()).catch(error=>alert(error.message));
   setTimeout(()=>{const dialogs=[...document.querySelectorAll('dialog[open]')],dialog=dialogs.at(-1);if(!dialog){openingSettingsSection='';return;}dialog.addEventListener('close',()=>{if(activeView==='settings'&&settingsSection===section){settingsSection='';openingSettingsSection='';syncBrowserRoute('replace');loadSettingsView();}},{once:true});},0);
+}
+
+async function showRegistrationSettings(){
+  const settings=await api('/api/v1/admin/registration-settings'),dialog=document.createElement('dialog');dialog.className='stats-dialog settings-dialog';
+  dialog.innerHTML=`<form class="stats-shell recognition-settings-form"><div class="stats-head"><div><div class="dialog-title">Регистрация</div><small>Самостоятельное создание обычных аккаунтов</small></div><button type="button" class="stats-close" aria-label="Закрыть">×</button></div><label class="settings-check"><input type="checkbox" name="enabled" ${settings.enabled?'checked':''}><span><strong>Разрешить регистрацию</strong><small>На странице входа появится кнопка создания аккаунта. Новые пользователи не получают права администратора.</small></span></label><small class="settings-hint">По умолчанию регистрация выключена. Попытки ограничены по IP, логины уникальны, минимальная длина пароля — 10 символов.</small><div class="error"></div><div class="dialog-actions"><button type="button" class="secondary cancel">Отмена</button><button class="primary">Сохранить</button></div></form>`;
+  document.body.append(dialog);dialog.showModal();const form=dialog.querySelector('form'),error=form.querySelector('.error');const close=value=>dialog.close(value);form.querySelector('.stats-close').onclick=()=>close('');form.querySelector('.cancel').onclick=()=>close('');form.onsubmit=async event=>{event.preventDefault();try{const result=await api('/api/v1/admin/registration-settings',{method:'PUT',body:JSON.stringify({enabled:form.elements.enabled.checked})});registrationEnabled=Boolean(result.enabled);close('saved');}catch(problem){error.textContent=problem.message;}};
+  return new Promise(resolve=>dialog.addEventListener('close',()=>{const changed=dialog.returnValue==='saved';dialog.remove();resolve(changed);},{once:true}));
 }
 
 async function editFederationCollection(collection=null){

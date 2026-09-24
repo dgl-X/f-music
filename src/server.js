@@ -15,6 +15,8 @@ import { resolveApiRoute } from './routing.js';
 import { acquireCounter, hashPassword, parseContentRange, parseCookies, randomToken, releaseCounter, tokenHash, verifyPassword } from './security.js';
 import { normalizeHybridFlac } from './audio-normalization.js';
 import { audioCodec, playbackVariant, requiresCompatibilityVariant } from './audio-compatibility.js';
+import { serveStoredMedia } from './media-stream.js';
+import { RegistrationLimiter, validateRegistration } from './registration.js';
 
 const config = loadConfig();
 const db = await openDatabase(config.databaseUrl);
@@ -37,6 +39,7 @@ fs.mkdirSync(federationReplicaDir, { recursive: true, mode: 0o750 });
 
 const jsonHeaders = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' };
 const loginAttempts = new Map();
+const registrationLimiter = new RegistrationLimiter();
 const workerMode = process.argv.includes('--worker');
 const processStartedAt = new Date();
 const httpMetrics = { requests: 0, errors5xx: 0 };
@@ -327,8 +330,11 @@ function recordLoginFailure(ip) {
 }
 function hasValidOrigin(req) {
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method) || !parseCookies(req.headers.cookie).music_session) return true;
+  return requestOriginMatches(req, false);
+}
+function requestOriginMatches(req, allowMissing = true) {
   const origin = req.headers.origin;
-  if (!origin) return false;
+  if (!origin) return allowMissing;
   const protocol = String(req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim();
   const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
   return origin === `${protocol}://${host}`;
@@ -556,6 +562,11 @@ async function recognitionSettings() {
     enabled: values.recognition_enabled === undefined ? config.recognitionEnabled : values.recognition_enabled === 'true',
     clientKey: values.acoustid_client_key === undefined ? config.acoustIdClientKey : values.acoustid_client_key,
   };
+}
+
+async function registrationEnabled() {
+  const row=await db.prepare("SELECT value FROM app_settings WHERE key='registration_enabled'").get();
+  return row===undefined?config.registrationEnabled:row.value==='true';
 }
 
 let transcodeActive = 0;
@@ -1005,10 +1016,11 @@ async function api(req, res, url, apiPrefix = '/api') {
     } catch { return sendJson(res, 503, { status: 'degraded' }); }
   }
   if (url.pathname === '/api/setup/status') {
-    const [users, settings, heartbeat] = await Promise.all([
+    const [users, settings, heartbeat, registration] = await Promise.all([
       db.prepare('SELECT count(*) count FROM users').get(),
       db.prepare("SELECT value FROM app_settings WHERE key='library_name'").get(),
       db.prepare("SELECT EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP-last_seen_at)) AS age_seconds FROM service_heartbeats WHERE service='worker'").get(),
+      registrationEnabled(),
     ]);
     const workerAge = heartbeat ? Number(heartbeat.age_seconds) : null;
     return sendJson(res, 200, {
@@ -1016,6 +1028,7 @@ async function api(req, res, url, apiPrefix = '/api') {
       setup_version: 1,
       server_version: softwareVersion,
       library_name: settings?.value || 'Family Music',
+      registration_enabled: registration,
       checks: { database: 'ok', storage: 'ok', worker: workerAge !== null && workerAge <= 45 ? 'ok' : 'starting' },
     });
   }
@@ -1063,6 +1076,19 @@ async function api(req, res, url, apiPrefix = '/api') {
     });
     if (!created) return sendJson(res, 409, { error: 'Первичная настройка уже выполнена' });
     return sendJson(res, 201, { ok: true, library_name: libraryName });
+  }
+  if (url.pathname === '/api/register' && req.method === 'POST') {
+    if (!requestOriginMatches(req)) return sendJson(res,403,{error:'Недоверенный источник запроса'});
+    if (!await registrationEnabled()) return sendJson(res,404,{error:'Регистрация отключена'});
+    if (Number((await db.prepare('SELECT count(*) count FROM users').get()).count)===0) return sendJson(res,409,{error:'Сначала выполните первоначальную настройку сервера'});
+    const ip=requestIp(req);
+    if(!registrationLimiter.take(ip))return sendJson(res,429,{error:'Слишком много регистраций. Повторите позже'},{'Retry-After':'3600'});
+    const values=validateRegistration(await readJson(req));
+    if(values.error)return sendJson(res,400,{error:values.error});
+    try{
+      const result=await db.prepare('INSERT INTO users(username,display_name,password_hash,is_admin) VALUES(?,?,?,0) RETURNING id').run(values.username,values.displayName,hashPassword(values.password));
+      return sendJson(res,201,{id:Number(result.rows[0].id),username:values.username,display_name:values.displayName});
+    }catch(error){if(error.code==='23505')return sendJson(res,409,{error:'Такой логин уже занят'});throw error;}
   }
   if (url.pathname === '/api/login' && req.method === 'POST') {
     const ip = requestIp(req);
@@ -1113,6 +1139,17 @@ async function api(req, res, url, apiPrefix = '/api') {
     if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
     const items = await db.prepare('SELECT id, username, display_name, is_admin, created_at FROM users ORDER BY created_at, id').all();
     return sendJson(res, 200, { items });
+  }
+  if (url.pathname === '/api/admin/registration-settings' && req.method === 'GET') {
+    if (!user.is_admin) return sendJson(res,403,{error:'Доступно только администратору'});
+    return sendJson(res,200,{enabled:await registrationEnabled()});
+  }
+  if (url.pathname === '/api/admin/registration-settings' && req.method === 'PUT') {
+    if (!user.is_admin) return sendJson(res,403,{error:'Доступно только администратору'});
+    const enabled=Boolean((await readJson(req)).enabled);
+    await db.prepare(`INSERT INTO app_settings(key,value,updated_at) VALUES('registration_enabled',?,CURRENT_TIMESTAMP)
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP`).run(enabled?'true':'false');
+    return sendJson(res,200,{enabled});
   }
   if (url.pathname === '/api/users' && req.method === 'POST') {
     if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
@@ -2221,24 +2258,8 @@ async function api(req, res, url, apiPrefix = '/api') {
     const storageKey = selected?.storage_key || track.storage_key;
     const mimeType = selected?.mime_type || track.mime_type;
     const actualVariant = selected?.variant || 'original';
-    const file = path.resolve(config.storageDir, storageKey);
-    if (!file.startsWith(config.storageDir + path.sep) || !fs.existsSync(file)) return sendJson(res, 404, { error: 'Файл не найден' });
-    if (config.xAccelRedirect) {
-      const internalPath = '/_protected_media/' + storageKey.split('/').map(encodeURIComponent).join('/');
-      res.writeHead(200, { 'Content-Type': mimeType, 'X-Music-Variant': actualVariant, 'X-Accel-Redirect': internalPath, 'Accept-Ranges': 'bytes', 'Cache-Control': 'private, no-store', 'Vary': 'Cookie' });
-      return res.end();
-    }
-    const size = fs.statSync(file).size;
-    const match = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range ?? '');
-    let start = 0, end = size - 1, status = 200;
-    if (match) {
-      if(!match[1]&&match[2]){const suffix=Number(match[2]);start=Math.max(0,size-suffix);end=size-1;}
-      else{start=match[1]?Number(match[1]):0;end=match[2]?Math.min(Number(match[2]),size-1):end;}
-      if (!Number.isSafeInteger(start)||!Number.isSafeInteger(end)||start > end || start >= size) { res.writeHead(416, { 'Content-Range': `bytes */${size}` }); return res.end(); }
-      status = 206;
-    }
-    res.writeHead(status, { 'Content-Type': mimeType, 'X-Music-Variant': actualVariant, 'Accept-Ranges': 'bytes', 'Content-Length': end - start + 1, 'Cache-Control': 'private, no-store', 'Vary': 'Cookie', ...(status === 206 ? { 'Content-Range': `bytes ${start}-${end}/${size}` } : {}) });
-    return fs.createReadStream(file, { start, end }).pipe(res);
+    if (!serveStoredMedia(req,res,{storageDir:config.storageDir,storageKey,mimeType,variant:actualVariant,xAccelRedirect:config.xAccelRedirect})) return sendJson(res,404,{error:'Файл не найден'});
+    return;
   }
   return sendJson(res, 404, { error: 'Маршрут не найден' });
 }
