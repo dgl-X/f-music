@@ -410,12 +410,15 @@ function storedFileExists(storageKey) {
 
 function inspectAudio(file) {
   return new Promise(resolve => {
-    const proc = spawn('ffprobe', ['-v', 'quiet', '-print_format', 'json', '-show_format', file]);
+    const proc = spawn('ffprobe', ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', file]);
     let output = '';
     proc.stdout.on('data', chunk => { output += chunk; });
     proc.on('close', code => {
       if (code !== 0) return resolve(null);
-      try { resolve(JSON.parse(output).format ?? null); } catch { resolve(null); }
+      try {
+        const parsed = JSON.parse(output);
+        resolve(parsed.format ? { ...parsed.format, streams: parsed.streams ?? [] } : null);
+      } catch { resolve(null); }
     });
     proc.on('error', () => resolve(null));
   });
@@ -653,19 +656,21 @@ async function finalizeUpload(upload) {
   const storedSize = fs.statSync(source).size;
   if (source === temporary) fs.renameSync(temporary, destination);
   const tags = normalizedTags(metadata);
+  const sourceCodec = String(metadata.streams?.find(stream => stream.codec_type === 'audio')?.codec_name || '').toLowerCase() || null;
   const fallbackTitle = path.basename(upload.filename, path.extname(upload.filename));
   const recognition = await recognitionSettings();
   await db.transaction(async tx => {
     await tx.prepare(`INSERT INTO tracks
-      (id, owner_id, title, artist, album, filename, mime_type, size_bytes, duration_seconds, storage_key, sha256, cover_key, cover_checked, genre, year, track_number, disc_number)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`).run(
+      (id, owner_id, title, artist, album, filename, mime_type, size_bytes, duration_seconds, storage_key, sha256, cover_key, cover_checked, genre, year, track_number, disc_number, source_codec)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`).run(
         trackId, upload.user_id, tags.title || fallbackTitle, tags.artist || 'Неизвестный исполнитель',
         tags.album, upload.filename, upload.mime_type, storedSize,
-        Number(metadata.duration) || null, storageKey, sha256, coverKey, tags.genre, tags.year, tags.trackNumber, tags.discNumber
+        Number(metadata.duration) || null, storageKey, sha256, coverKey, tags.genre, tags.year, tags.trackNumber, tags.discNumber, sourceCodec
       );
     await tx.prepare("UPDATE uploads SET status='ready', track_id=?, error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?").run(trackId, upload.id);
     if (recognition.enabled && recognition.clientKey && (!tags.title || !tags.artist)) await tx.prepare("INSERT INTO recognition_jobs(track_id,status) VALUES(?,'queued') ON CONFLICT(track_id) DO NOTHING").run(trackId);
     await tx.prepare("INSERT INTO loudness_jobs(track_id,status) VALUES(?,'queued') ON CONFLICT(track_id) DO NOTHING").run(trackId);
+    if (sourceCodec === 'alac') await tx.prepare("INSERT INTO track_files(track_id,variant,mime_type,codec,bitrate,status,priority) VALUES(?,'aac_192','audio/mp4','aac',192000,'queued',50) ON CONFLICT(track_id,variant) DO NOTHING").run(trackId);
   });
   return { trackId };
 }
@@ -2201,7 +2206,7 @@ async function api(req, res, url, apiPrefix = '/api') {
     const track = await db.prepare('SELECT * FROM tracks WHERE id=?').get(streamMatch[1]);
     if (!track) return sendJson(res, 404, { error: 'Трек не найден' });
     const requested = String(url.searchParams.get('quality') || 'original');
-    const variant = ['compact','aac_96'].includes(requested) ? 'aac_96' : ['high','medium','auto','aac_192'].includes(requested) ? 'aac_192' : null;
+    const variant = ['compact','aac_96'].includes(requested) ? 'aac_96' : ['high','medium','auto','aac_192'].includes(requested) || (requested === 'original' && track.source_codec === 'alac') ? 'aac_192' : null;
     const prepareVariant = ['aac_96','aac_192'].includes(String(url.searchParams.get('prepare'))) ? String(url.searchParams.get('prepare')) : null;
     if(prepareVariant){const prepared=await db.prepare("SELECT id FROM track_files WHERE track_id=? AND variant=? AND status='ready'").get(track.id,prepareVariant);if(!prepared){await db.prepare(`INSERT INTO track_files(track_id,variant,mime_type,codec,bitrate,status) VALUES(?,?,'audio/mp4','aac',?,'queued') ON CONFLICT(track_id,variant) DO UPDATE SET status=CASE WHEN track_files.status='failed' THEN 'queued' ELSE track_files.status END,updated_at=CURRENT_TIMESTAMP`).run(track.id,prepareVariant,prepareVariant==='aac_96'?96000:192000);}}
     let selected = null;
