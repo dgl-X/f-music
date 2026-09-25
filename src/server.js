@@ -12,7 +12,7 @@ import { FEDERATION_PROTOCOL_MINOR, negotiateFederation } from './federation-pro
 import { getFederationJson, openFederationStream, postFederationJson, probeFederationEndpoint } from './federation-endpoints.js';
 import { signFederationRequest, signFederationResponse, signPairingConfirmation, verifyFederationRequest, verifyFederationResponse, verifyPairingConfirmation } from './federation-signatures.js';
 import { resolveApiRoute } from './routing.js';
-import { acquireCounter, hashPassword, parseContentRange, randomToken, releaseCounter, tokenHash } from './security.js';
+import { acquireCounter, hashPassword, randomToken, releaseCounter, tokenHash } from './security.js';
 import { normalizeHybridFlac } from './audio-normalization.js';
 import { audioCodec, playbackVariant, requiresCompatibilityVariant } from './audio-compatibility.js';
 import { serveStoredMedia } from './media-stream.js';
@@ -22,6 +22,7 @@ import { validateAudioDecode } from './audio-validation.js';
 import { createCatalogService } from './catalog-service.js';
 import { savePlaybackState } from './playback-state.js';
 import { createUploadJobService } from './upload-jobs.js';
+import { createUploadService } from './upload-service.js';
 
 const config = loadConfig();
 const db = await openDatabase(config.databaseUrl);
@@ -47,6 +48,7 @@ const registrationLimiter = new RegistrationLimiter();
 const authentication = createAuthenticationService({ db, sessionDays: config.sessionDays, secureCookies: config.secureCookies });
 const catalog = createCatalogService({ db, apiPrefix: '/api' });
 const uploadJobs = createUploadJobService({ db });
+const uploads = createUploadService({ db, uploadDir, maxUploadBytes:config.maxUploadBytes, uploadJobs });
 const workerMode = process.argv.includes('--worker');
 const processStartedAt = new Date();
 const httpMetrics = { requests: 0, errors5xx: 0 };
@@ -356,10 +358,6 @@ async function requireUser(req, res) {
   const user = await currentUser(req);
   if (!user) sendJson(res, 401, { error: 'Требуется авторизация' });
   return user;
-}
-
-function safeFilename(name) {
-  return path.basename(String(name ?? '')).replace(/[\x00-\x1f]/g, '').slice(0, 240);
 }
 
 function storageStats(directory) {
@@ -1949,30 +1947,17 @@ async function api(req, res, url, apiPrefix = '/api') {
     return sendJson(res,200,{liked:req.method==='PUT'});
   }
   if (url.pathname === '/api/uploads' && req.method === 'GET') {
-    const items = (await db.prepare(`SELECT id,filename,mime_type,total_bytes,received_bytes,status,error,track_id,created_at,updated_at
-      FROM uploads WHERE user_id=? ORDER BY updated_at DESC LIMIT 100`).all(user.id)).map(upload => ({
-        ...upload, total_bytes: Number(upload.total_bytes), received_bytes: Number(upload.received_bytes),
-      }));
-    return sendJson(res, 200, { items });
+    return sendJson(res,200,await uploads.list({userId:user.id}));
   }
   if (url.pathname === '/api/uploads' && req.method === 'POST') {
-    const body = await readJson(req);
-    const filename = safeFilename(body.filename);
-    const total = Number(body.size);
-    if (!filename || !Number.isSafeInteger(total) || total < 1 || total > config.maxUploadBytes) {
-      return sendJson(res, 400, { error: 'Некорректное имя или размер файла' });
-    }
-    const id = crypto.randomUUID();
-    await db.prepare('INSERT INTO uploads (id,user_id,filename,mime_type,total_bytes) VALUES (?,?,?,?,?)')
-      .run(id, user.id, filename, String(body.mime_type || 'application/octet-stream'), total);
-    fs.closeSync(fs.openSync(path.join(uploadDir, `${id}.part`), 'wx', 0o640));
-    return sendJson(res, 201, { id, offset: 0, size: total });
+    const result=await uploads.create({userId:user.id,input:await readJson(req)});
+    if(result.status==='invalid')return sendJson(res,400,{error:'Некорректное имя или размер файла'});
+    return sendJson(res,201,{id:result.id,offset:result.offset,size:result.size});
   }
   const uploadMatch = /^\/api\/uploads\/([0-9a-f-]+)$/.exec(url.pathname);
   if (uploadMatch) {
-    const upload = await db.prepare('SELECT * FROM uploads WHERE id=? AND user_id=?').get(uploadMatch[1], user.id);
+    const upload = await uploads.get({uploadId:uploadMatch[1],userId:user.id});
     if (!upload) return sendJson(res, 404, { error: 'Загрузка не найдена' });
-    upload.received_bytes = Number(upload.received_bytes); upload.total_bytes = Number(upload.total_bytes);
     if (req.method === 'GET') return sendJson(res, 200, {
       id: upload.id, offset: upload.received_bytes, size: upload.total_bytes,
       status: upload.status, error: upload.error, track_id: upload.track_id,
@@ -1982,26 +1967,13 @@ async function api(req, res, url, apiPrefix = '/api') {
       return res.end();
     }
     if (req.method === 'PUT') {
-      if (upload.status !== 'uploading') return sendJson(res, 409, { error: 'Загрузка уже завершена' });
-      const range = parseContentRange(req.headers['content-range']);
-      if (!range || range.total !== upload.total_bytes || range.start !== upload.received_bytes) {
-        return sendJson(res, 409, { error: 'Неверное смещение', expected_offset: upload.received_bytes });
-      }
-      const declaredLength = Number(req.headers['content-length']);
-      if (declaredLength !== range.length) return sendJson(res, 400, { error: 'Размер части не совпадает с Content-Range' });
-      const target = path.join(uploadDir, `${upload.id}.part`);
-      const output = fs.createWriteStream(target, { flags: 'r+', start: range.start });
-      let written = 0;
-      for await (const chunk of req) { written += chunk.length; if (written > range.length) { output.destroy(); return sendJson(res, 400, { error: 'Получено слишком много данных' }); } if (!output.write(chunk)) await new Promise(resolve => output.once('drain', resolve)); }
-      await new Promise((resolve, reject) => output.end(err => err ? reject(err) : resolve()));
-      if (written !== range.length) return sendJson(res, 400, { error: 'Получена неполная часть' });
-      const next = range.end + 1;
-      await db.prepare('UPDATE uploads SET received_bytes=?, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(next, upload.id);
-      if (next === upload.total_bytes) {
-        await uploadJobs.enqueue({uploadId:upload.id,candidateTrackId:crypto.randomUUID()});
-        return sendJson(res, 202, { offset: next, complete: true, processing: true });
-      }
-      return sendJson(res, 200, { offset: next, complete: false });
+      const result=await uploads.writePart({upload,contentRange:req.headers['content-range'],contentLength:req.headers['content-length'],chunks:req});
+      if(result.status==='complete')return sendJson(res,409,{error:'Загрузка уже завершена'});
+      if(result.status==='offset_mismatch'||result.status==='busy')return sendJson(res,409,{error:'Неверное смещение',expected_offset:result.expectedOffset});
+      if(result.status==='length_mismatch')return sendJson(res,400,{error:'Размер части не совпадает с Content-Range'});
+      if(result.status==='too_large')return sendJson(res,400,{error:'Получено слишком много данных'});
+      if(result.status==='incomplete')return sendJson(res,400,{error:'Получена неполная часть'});
+      return sendJson(res,result.status==='accepted'?202:200,{offset:result.offset,complete:result.complete,...(result.processing?{processing:true}:{})});
     }
   }
   const coverMatch = /^\/api\/tracks\/([0-9a-f-]+)\/cover$/.exec(url.pathname);
