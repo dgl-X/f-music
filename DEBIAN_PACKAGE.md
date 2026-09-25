@@ -63,8 +63,8 @@ snapshot или проверенная резервная копия.
 
 ```bash
 ./scripts/deb-lxc-smoke.sh 107 \
-  ./dist/family-music-server_0.1.5_amd64.deb \
-  ./dist/family-music-server_0.1.6_amd64.deb
+  ./dist/family-music-server_PREVIOUS_amd64.deb \
+  ./dist/family-music-server_CURRENT_amd64.deb
 ```
 
 Скрипт запускается на хосте Proxmox VE и принимает уже созданный и запущенный
