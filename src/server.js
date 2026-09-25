@@ -54,9 +54,7 @@ const sendJson = (res, status, value, extra = {}) => {
 };
 
 async function canEditAlbum(user, albumId){
-  if(user.is_admin)return true;
-  const ownership=await db.prepare('SELECT count(*) total,count(*) FILTER(WHERE owner_id=?) mine FROM tracks WHERE album_id=?').get(user.id,albumId);
-  return Number(ownership.total)>0&&Number(ownership.mine)===Number(ownership.total);
+  return catalog.canEditAlbum({userId:user.id,isAdmin:Boolean(user.is_admin),albumId});
 }
 
 async function federationSettings() {
@@ -1784,15 +1782,9 @@ async function api(req, res, url, apiPrefix = '/api') {
   }
   const artistMatch=/^\/api\/artists\/(\d+)$/.exec(url.pathname);
   if(artistMatch&&req.method==='GET'){
-    const artist=await db.prepare(`SELECT artists.id,artists.name,artists.bio,artists.image_key,count(DISTINCT track_artists.track_id) track_count,
-      count(DISTINCT track_artists.track_id) FILTER(WHERE track_artists.role='featured') featured_count,
-      count(DISTINCT NULLIF(tracks.album,'')) album_count,COALESCE(sum(history.plays),0) play_count
-      FROM artists JOIN track_artists ON track_artists.artist_id=artists.id JOIN tracks ON tracks.id=track_artists.track_id
-      LEFT JOIN (SELECT track_id,sum(play_count) plays FROM play_history GROUP BY track_id) history ON history.track_id=tracks.id
-      WHERE artists.id=? GROUP BY artists.id`).get(Number(artistMatch[1]));
+    const artist=await catalog.getArtist({artistId:Number(artistMatch[1]),responsePrefix:apiPrefix});
     if(!artist)return sendJson(res,404,{error:'Исполнитель не найден'});
-    const albums=await db.prepare(`SELECT albums.id,albums.name,count(*) AS track_count,albums.year,min(tracks.id) FILTER(WHERE tracks.cover_key IS NOT NULL) AS cover_track_id FROM albums JOIN tracks ON tracks.album_id=albums.id JOIN track_artists ON track_artists.track_id=tracks.id WHERE track_artists.artist_id=? GROUP BY albums.id ORDER BY albums.name COLLATE NOCASE`).all(artist.id);
-    return sendJson(res,200,{...artist,image_url:artist.image_key?`${apiPrefix}/artists/${artist.id}/image`:null,image_key:undefined,albums});
+    return sendJson(res,200,artist);
   }
   if(artistMatch&&req.method==='PATCH'){
     if(!user.is_admin)return sendJson(res,403,{error:'Только администратор может изменять карточку исполнителя'});
@@ -1810,14 +1802,17 @@ async function api(req, res, url, apiPrefix = '/api') {
   }
   const albumMatch=/^\/api\/albums\/(\d+)$/.exec(url.pathname);
   if(albumMatch&&(req.method==='GET'||req.method==='PATCH')){
+    if(req.method==='GET'){
+      const album=await catalog.getAlbum({albumId:Number(albumMatch[1]),userId:user.id,isAdmin:Boolean(user.is_admin),responsePrefix:apiPrefix});
+      if(!album)return sendJson(res,404,{error:'Альбом не найден'});
+      return sendJson(res,200,album);
+    }
     const album=await db.prepare('SELECT id,name,artist,bio,image_key,year FROM albums WHERE id=?').get(Number(albumMatch[1]));
     if(!album)return sendJson(res,404,{error:'Альбом не найден'});
-    if(req.method==='PATCH'){
-      if(!await canEditAlbum(user,album.id))return sendJson(res,403,{error:'Недостаточно прав для изменения альбома'});
-      const body=await readJson(req),bio=String(body.bio??'').trim();
-      if(bio.length>5000)return sendJson(res,400,{error:'Описание слишком длинное'});
-      await db.prepare('UPDATE albums SET bio=? WHERE id=?').run(bio,album.id);album.bio=bio;
-    }
+    if(!await canEditAlbum(user,album.id))return sendJson(res,403,{error:'Недостаточно прав для изменения альбома'});
+    const body=await readJson(req),bio=String(body.bio??'').trim();
+    if(bio.length>5000)return sendJson(res,400,{error:'Описание слишком длинное'});
+    await db.prepare('UPDATE albums SET bio=? WHERE id=?').run(bio,album.id);album.bio=bio;
     return sendJson(res,200,{...album,image_url:album.image_key?`${apiPrefix}/albums/${album.id}/image`:null,image_key:undefined,can_edit:await canEditAlbum(user,album.id)});
   }
   const albumImageMatch=/^\/api\/albums\/(\d+)\/image$/.exec(url.pathname);

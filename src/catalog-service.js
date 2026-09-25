@@ -143,5 +143,43 @@ export function createCatalogService({ db, apiPrefix }) {
     return { items };
   }
 
-  return { listTracks, listCollections, lookupArtists };
+  async function canEditAlbum({ userId, isAdmin, albumId }) {
+    if (isAdmin) return true;
+    const ownership = await db.prepare(`SELECT count(*) total,
+      count(*) FILTER(WHERE owner_id=?) mine FROM tracks WHERE album_id=?`).get(userId, albumId);
+    return Number(ownership.total) > 0 && Number(ownership.mine) === Number(ownership.total);
+  }
+
+  async function getArtist({ artistId, responsePrefix = apiPrefix }) {
+    const artist = await db.prepare(`SELECT artists.id,artists.name,artists.bio,artists.image_key,count(DISTINCT track_artists.track_id) track_count,
+      count(DISTINCT track_artists.track_id) FILTER(WHERE track_artists.role='featured') featured_count,
+      count(DISTINCT NULLIF(tracks.album,'')) album_count,COALESCE(sum(history.plays),0) play_count
+      FROM artists JOIN track_artists ON track_artists.artist_id=artists.id JOIN tracks ON tracks.id=track_artists.track_id
+      LEFT JOIN (SELECT track_id,sum(play_count) plays FROM play_history GROUP BY track_id) history ON history.track_id=tracks.id
+      WHERE artists.id=? GROUP BY artists.id`).get(artistId);
+    if (!artist) return null;
+    const albums = await db.prepare(`SELECT albums.id,albums.name,count(*) AS track_count,albums.year,
+      min(tracks.id) FILTER(WHERE tracks.cover_key IS NOT NULL) AS cover_track_id
+      FROM albums JOIN tracks ON tracks.album_id=albums.id JOIN track_artists ON track_artists.track_id=tracks.id
+      WHERE track_artists.artist_id=? GROUP BY albums.id ORDER BY albums.name COLLATE NOCASE`).all(artist.id);
+    return {
+      ...artist,
+      image_url: artist.image_key ? `${responsePrefix}/artists/${artist.id}/image` : null,
+      image_key: undefined,
+      albums,
+    };
+  }
+
+  async function getAlbum({ albumId, userId, isAdmin, responsePrefix = apiPrefix }) {
+    const album = await db.prepare('SELECT id,name,artist,bio,image_key,year FROM albums WHERE id=?').get(albumId);
+    if (!album) return null;
+    return {
+      ...album,
+      image_url: album.image_key ? `${responsePrefix}/albums/${album.id}/image` : null,
+      image_key: undefined,
+      can_edit: await canEditAlbum({ userId, isAdmin, albumId: album.id }),
+    };
+  }
+
+  return { listTracks, listCollections, lookupArtists, getArtist, getAlbum, canEditAlbum };
 }

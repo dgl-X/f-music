@@ -100,3 +100,68 @@ test('artist lookup remains bounded and searchable for track editor suggestions'
   assert.match(captured.sql, /WHERE name ILIKE @query/);
   assert.deepEqual(captured.params, { limit: 20, query: '%A%' });
 });
+
+test('artist card hides its storage key and includes related albums', async () => {
+  const calls = [];
+  const db = { prepare(sql) { return {
+    async get(id) { calls.push({ type: 'get', sql, id }); return { id: 4, name: 'Artist', image_key: 'artists/4.jpg', track_count: 2 }; },
+    async all(id) { calls.push({ type: 'all', sql, id }); return [{ id: 9, name: 'Album', track_count: 2 }]; },
+  }; } };
+  const catalog = createCatalogService({ db, apiPrefix: '/api' });
+  assert.deepEqual(await catalog.getArtist({ artistId: 4 }), {
+    id: 4, name: 'Artist', image_key: undefined, track_count: 2,
+    image_url: '/api/artists/4/image', albums: [{ id: 9, name: 'Album', track_count: 2 }],
+  });
+  assert.equal(calls[0].id, 4);
+  assert.match(calls[1].sql, /ORDER BY albums\.name COLLATE NOCASE/);
+});
+
+test('missing artist and album cards return null', async () => {
+  const db = { prepare() { return { async get() { return undefined; } }; } };
+  const catalog = createCatalogService({ db, apiPrefix: '/api' });
+  assert.equal(await catalog.getArtist({ artistId: 404 }), null);
+  assert.equal(await catalog.getAlbum({ albumId: 404, userId: 1, isAdmin: false }), null);
+});
+
+test('album ownership requires at least one track and ownership of every track', async () => {
+  let ownership = { total: 2, mine: 2 };
+  const db = { prepare() { return { async get() { return ownership; } }; } };
+  const catalog = createCatalogService({ db, apiPrefix: '/api' });
+  assert.equal(await catalog.canEditAlbum({ albumId: 8, userId: 3, isAdmin: false }), true);
+  ownership = { total: 2, mine: 1 };
+  assert.equal(await catalog.canEditAlbum({ albumId: 8, userId: 3, isAdmin: false }), false);
+  ownership = { total: 0, mine: 0 };
+  assert.equal(await catalog.canEditAlbum({ albumId: 8, userId: 3, isAdmin: false }), false);
+  assert.equal(await catalog.canEditAlbum({ albumId: 8, userId: 3, isAdmin: true }), true);
+});
+
+test('album card exposes public image URL and computed edit permission', async () => {
+  const calls = [];
+  const db = { prepare(sql) { return { async get(...params) {
+    calls.push({ sql, params });
+    if (sql.startsWith('SELECT id,name')) return { id: 8, name: 'Album', image_key: 'albums/8.jpg', year: 2024 };
+    return { total: 3, mine: 3 };
+  } }; } };
+  const catalog = createCatalogService({ db, apiPrefix: '/api/v1' });
+  assert.deepEqual(await catalog.getAlbum({ albumId: 8, userId: 3, isAdmin: false }), {
+    id: 8, name: 'Album', image_key: undefined, year: 2024,
+    image_url: '/api/v1/albums/8/image', can_edit: true,
+  });
+  assert.deepEqual(calls[1].params, [3, 8]);
+});
+
+test('card image URLs retain the requested API version prefix', async () => {
+  let artistLookup = true;
+  const db = { prepare() { return {
+    async get() {
+      if (artistLookup) return { id: 4, name: 'Artist', image_key: 'artists/4.jpg' };
+      return { id: 8, name: 'Album', image_key: 'albums/8.jpg' };
+    },
+    async all() { artistLookup = false; return []; },
+  }; } };
+  const catalog = createCatalogService({ db, apiPrefix: '/api' });
+  const artist = await catalog.getArtist({ artistId: 4, responsePrefix: '/api/v1' });
+  const album = await catalog.getAlbum({ albumId: 8, userId: 1, isAdmin: true, responsePrefix: '/api/v1' });
+  assert.equal(artist.image_url, '/api/v1/artists/4/image');
+  assert.equal(album.image_url, '/api/v1/albums/8/image');
+});
