@@ -24,6 +24,7 @@ import { savePlaybackState } from './playback-state.js';
 import { createUploadJobService } from './upload-jobs.js';
 import { createUploadService } from './upload-service.js';
 import { createUploadProcessor } from './upload-processor.js';
+import { createCoverExtractor, inspectAudio, runProcess, sha256File } from './media-tools.js';
 
 const config = loadConfig();
 const db = await openDatabase(config.databaseUrl);
@@ -50,6 +51,7 @@ const authentication = createAuthenticationService({ db, sessionDays: config.ses
 const catalog = createCatalogService({ db, apiPrefix: '/api' });
 const uploadJobs = createUploadJobService({ db });
 const uploads = createUploadService({ db, uploadDir, maxUploadBytes:config.maxUploadBytes, uploadJobs });
+const extractCover = createCoverExtractor({ coverDir, storageDir:config.storageDir });
 const uploadProcessor = createUploadProcessor({
   db, uploadDir, originalDir, storageDir:config.storageDir, inspectAudio, sha256File,
   validateAudioDecode, extractCover, normalizeHybridFlac, normalizedTags, audioCodec,
@@ -387,40 +389,6 @@ function storedFileExists(storageKey) {
   return file.startsWith(config.storageDir + path.sep) && fs.existsSync(file) && fs.statSync(file).isFile();
 }
 
-function inspectAudio(file) {
-  return new Promise(resolve => {
-    const proc = spawn('ffprobe', ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', file]);
-    let output = '';
-    proc.stdout.on('data', chunk => { output += chunk; });
-    proc.on('close', code => {
-      if (code !== 0) return resolve(null);
-      try {
-        const parsed = JSON.parse(output);
-        resolve(parsed.format ? { ...parsed.format, streams: parsed.streams ?? [] } : null);
-      } catch { resolve(null); }
-    });
-    proc.on('error', () => resolve(null));
-  });
-}
-
-function sha256File(file) {
-  return new Promise((resolve, reject) => {
-    const hash = crypto.createHash('sha256');
-    const input = fs.createReadStream(file);
-    input.on('error', reject);
-    input.on('data', chunk => hash.update(chunk));
-    input.on('end', () => resolve(hash.digest('hex')));
-  });
-}
-
-function runProcess(command, args) {
-  return new Promise(resolve => {
-    const proc = spawn(command, args, { stdio: 'ignore' });
-    proc.on('close', code => resolve(code === 0));
-    proc.on('error', () => resolve(false));
-  });
-}
-
 function captureProcess(command, args) {
   return new Promise((resolve, reject) => {
     const proc = spawn(command, args); let output = '', errors = '';
@@ -577,17 +545,6 @@ function normalizedTags(format) {
     album: tags.album || '', genre: tags.genre || '', year: number(tags.date || tags.year),
     trackNumber: number(tags.track || tags.tracknumber), discNumber: number(tags.disc || tags.discnumber),
   };
-}
-
-async function extractCover(file, trackId) {
-  const shard = trackId.slice(0, 2);
-  const destinationDir = path.join(coverDir, shard);
-  fs.mkdirSync(destinationDir, { recursive: true, mode: 0o750 });
-  const coverKey = path.join('covers', shard, `${trackId}.jpg`);
-  const destination = path.join(config.storageDir, coverKey);
-  const ok = await runProcess('ffmpeg', ['-loglevel', 'error', '-y', '-i', file, '-map', '0:v:0', '-frames:v', '1', '-vf', "scale='min(1000,iw)':'min(1000,ih)':force_original_aspect_ratio=decrease", '-q:v', '3', destination]);
-  if (!ok) { fs.rmSync(destination, { force: true }); return null; }
-  return coverKey;
 }
 
 async function addExternalCover(trackId, releaseGroupId) {
