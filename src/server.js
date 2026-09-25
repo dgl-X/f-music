@@ -21,6 +21,7 @@ import { clearSessionCookie, createAuthenticationService, hasValidSessionOrigin,
 import { validateAudioDecode } from './audio-validation.js';
 import { createCatalogService } from './catalog-service.js';
 import { savePlaybackState } from './playback-state.js';
+import { createUploadJobService } from './upload-jobs.js';
 
 const config = loadConfig();
 const db = await openDatabase(config.databaseUrl);
@@ -45,6 +46,7 @@ const jsonHeaders = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-
 const registrationLimiter = new RegistrationLimiter();
 const authentication = createAuthenticationService({ db, sessionDays: config.sessionDays, secureCookies: config.secureCookies });
 const catalog = createCatalogService({ db, apiPrefix: '/api' });
+const uploadJobs = createUploadJobService({ db });
 const workerMode = process.argv.includes('--worker');
 const processStartedAt = new Date();
 const httpMetrics = { requests: 0, errors5xx: 0 };
@@ -659,59 +661,26 @@ async function finalizeUpload(upload) {
   return { trackId };
 }
 
-async function enqueueUpload(uploadId, trackId) {
-  await db.transaction(async tx => {
-    await tx.prepare("UPDATE uploads SET status='processing',candidate_track_id=?,error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(trackId, uploadId);
-    await tx.prepare(`INSERT INTO processing_jobs(upload_id,status) VALUES(?,'queued')
-      ON CONFLICT(upload_id) DO UPDATE SET status='queued',available_at=CURRENT_TIMESTAMP,last_error=NULL,updated_at=CURRENT_TIMESTAMP`).run(uploadId);
-  });
-}
-
-async function claimProcessingJob() {
-  return await db.transaction(async tx => {
-    const result = await tx.prepare(`UPDATE processing_jobs SET status='processing',attempts=attempts+1,started_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
-      WHERE id=(SELECT id FROM processing_jobs WHERE status IN ('queued','retry') AND available_at<=CURRENT_TIMESTAMP ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)
-      RETURNING id,upload_id,attempts`).run();
-    return result.rows[0] ?? null;
-  });
-}
-
 let workerBusy = false;
 async function processNextJob() {
   if (workerBusy) return;
   workerBusy = true;
   try {
-    const job = await claimProcessingJob();
+    const job = await uploadJobs.claim();
     if (!job) return;
     const upload = await db.prepare('SELECT * FROM uploads WHERE id=?').get(job.upload_id);
     if (!upload || upload.status !== 'processing') {
-      await db.prepare("UPDATE processing_jobs SET status='complete',finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(job.id);
+      await uploadJobs.complete(job.id);
       return;
     }
     try {
       await finalizeUpload(upload);
-      await db.prepare("UPDATE processing_jobs SET status='complete',finished_at=CURRENT_TIMESTAMP,last_error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(job.id);
+      await uploadJobs.complete(job.id);
     } catch (error) {
-      const message = String(error.message || error).slice(0, 1000);
-      if (Number(job.attempts) >= 5) {
-        await db.transaction(async tx => {
-          await tx.prepare("UPDATE processing_jobs SET status='failed',finished_at=CURRENT_TIMESTAMP,last_error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(message, job.id);
-          await tx.prepare("UPDATE uploads SET status='failed',error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(message, job.upload_id);
-        });
-      } else {
-        const delaySeconds = Math.min(300, 5 * (2 ** (Number(job.attempts) - 1)));
-        await db.prepare("UPDATE processing_jobs SET status='retry',available_at=CURRENT_TIMESTAMP + (? * INTERVAL '1 second'),last_error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
-          .run(delaySeconds, message, job.id);
-      }
-      console.error(`Ошибка обработки загрузки ${job.upload_id}:`, message);
+      const result=await uploadJobs.failOrRetry(job,error);
+      console.error(`Ошибка обработки загрузки ${job.upload_id}:`, result.message);
     }
   } finally { workerBusy = false; }
-}
-
-async function recoverProcessingJobs() {
-  await db.prepare("UPDATE processing_jobs SET status='retry',available_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE status='processing'").run();
-  await db.prepare(`INSERT INTO processing_jobs(upload_id,status)
-    SELECT id,'queued' FROM uploads WHERE status='processing' ON CONFLICT(upload_id) DO NOTHING`).run();
 }
 
 let federationReplicaBusy = false;
@@ -2029,7 +1998,7 @@ async function api(req, res, url, apiPrefix = '/api') {
       const next = range.end + 1;
       await db.prepare('UPDATE uploads SET received_bytes=?, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(next, upload.id);
       if (next === upload.total_bytes) {
-        await enqueueUpload(upload.id, crypto.randomUUID());
+        await uploadJobs.enqueue({uploadId:upload.id,candidateTrackId:crypto.randomUUID()});
         return sendJson(res, 202, { offset: next, complete: true, processing: true });
       }
       return sendJson(res, 200, { offset: next, complete: false });
@@ -2124,7 +2093,7 @@ function startWorkers() {
   updateWorkerHeartbeat().catch(error => console.error('Ошибка heartbeat worker:', error));
   setInterval(() => updateWorkerHeartbeat().catch(error => console.error('Ошибка heartbeat worker:', error)), 15000);
   enrichExistingTracks().catch(error => console.error('Ошибка фоновой индексации:', error));
-  recoverProcessingJobs()
+  uploadJobs.recover()
     .then(() => processNextJob())
     .catch(error => console.error('Ошибка восстановления очереди:', error));
   setInterval(() => processNextJob().catch(error => console.error('Ошибка worker:', error)), Math.max(250, config.workerPollMs));
