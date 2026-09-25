@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createCatalogService, parseArtistLookupRequest, parseCollectionListRequest, parseHistoryListRequest, parseTrackListRequest } from '../src/catalog-service.js';
+import { createCatalogService, parseArtistLookupRequest, parseCollectionListRequest, parseHistoryListRequest, parsePlaylistListRequest, parseTrackListRequest } from '../src/catalog-service.js';
 
 test('track catalog parameters have stable bounds and safe sorting', () => {
   const normal = parseTrackListRequest(new URLSearchParams('limit=9999&offset=-3&sort=unknown&seed=a!b&q=%20song%20'));
@@ -223,4 +223,63 @@ test('duplicate groups keep ownership permissions and hide normalization keys', 
   assert.equal(result.groups[0].items[0].cover_url, '/api/v1/tracks/one/cover');
   assert.equal(result.groups[0].items[0].cover_key, undefined);
   assert.equal(result.groups[0].items[0].title_key, undefined);
+});
+
+test('playlist parameters keep stable defaults and bounds', () => {
+  assert.deepEqual(parsePlaylistListRequest(new URLSearchParams()), { limit: 50, offset: 0 });
+  assert.deepEqual(parsePlaylistListRequest(new URLSearchParams('limit=500&offset=-1')), { limit: 200, offset: 0 });
+});
+
+test('playlist list remains owner-scoped and includes remote track totals', async () => {
+  const calls = [];
+  const db = { prepare(sql) { return {
+    async get(userId) { calls.push({ type: 'get', sql, params: [userId] }); return { count: 2 }; },
+    async all(...params) { calls.push({ type: 'all', sql, params }); return [{ id: 'playlist-1', track_count: 4 }]; },
+  }; } };
+  const catalog = createCatalogService({ db, apiPrefix: '/api' });
+  assert.deepEqual(await catalog.listPlaylists({ userId: 7, searchParams: new URLSearchParams('limit=1&offset=1') }), {
+    items: [{ id: 'playlist-1', track_count: 4 }], total: 2, offset: 1, limit: 1, has_more: false,
+  });
+  assert.match(calls[1].sql, /federation_playlist_tracks/);
+  assert.deepEqual(calls[1].params, [7, 1, 1]);
+});
+
+test('playlist creation validates and bounds user text', async () => {
+  const writes = [];
+  const db = { prepare(sql) { return { async run(...params) { writes.push({ sql, params }); } }; } };
+  const catalog = createCatalogService({ db, apiPrefix: '/api' });
+  assert.deepEqual(await catalog.createPlaylist({ userId: 3, input: { title: '   ' } }), { status: 'invalid' });
+  const created = await catalog.createPlaylist({ userId: 3, input: { title: `  ${'T'.repeat(140)}  `, description: 'D'.repeat(1200) } });
+  assert.equal(created.status, 'ok');
+  assert.match(created.id, /^[0-9a-f-]{36}$/);
+  assert.equal(created.title.length, 120);
+  assert.equal(writes[0].params[1], 3);
+  assert.equal(writes[0].params[2].length, 120);
+  assert.equal(writes[0].params[3].length, 1000);
+});
+
+test('playlist mutations never cross account ownership', async () => {
+  const writes = [];
+  let owned = null;
+  const db = { prepare(sql) { return {
+    async get(...params) {
+      if (sql.startsWith('SELECT * FROM playlists')) return owned;
+      if (sql.startsWith('SELECT id FROM tracks')) return { id: params[0] };
+      if (sql.startsWith('SELECT COALESCE')) return { position: 4 };
+      throw new Error(`Unexpected get: ${sql}`);
+    },
+    async run(...params) { writes.push({ sql, params }); return { changes: sql.startsWith('DELETE FROM playlists') ? 0 : 1 }; },
+  }; } };
+  const catalog = createCatalogService({ db, apiPrefix: '/api' });
+  assert.deepEqual(await catalog.updatePlaylist({ userId: 2, playlistId: 'p1', input: { title: 'New' } }), { status: 'not_found' });
+  assert.deepEqual(await catalog.addPlaylistTrack({ userId: 2, playlistId: 'p1', trackId: 't1' }), { status: 'playlist_not_found' });
+  assert.equal(writes.length, 0);
+
+  owned = { id: 'p1', owner_id: 2 };
+  assert.deepEqual(await catalog.updatePlaylist({ userId: 2, playlistId: 'p1', input: { title: ' New ', description: ' Text ' } }), { status: 'ok' });
+  assert.deepEqual(await catalog.addPlaylistTrack({ userId: 2, playlistId: 'p1', trackId: 't1' }), { status: 'ok' });
+  assert.deepEqual(await catalog.removePlaylistTrack({ userId: 2, playlistId: 'p1', trackId: 't1' }), { status: 'ok' });
+  assert.match(writes[0].sql, /UPDATE playlists SET title/);
+  assert.ok(writes.some(write => write.sql.startsWith('INSERT INTO playlist_tracks')));
+  assert.ok(writes.some(write => write.sql.startsWith('DELETE FROM playlist_tracks')));
 });

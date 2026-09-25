@@ -1,3 +1,5 @@
+import crypto from 'node:crypto';
+
 const TRACK_ORDERS = Object.freeze({
   newest: 'created_at DESC',
   oldest: 'created_at ASC',
@@ -48,6 +50,20 @@ export function parseHistoryListRequest(searchParams) {
   return {
     limit: Math.min(200, Math.max(1, Number(searchParams.get('limit')) || 50)),
     offset: Math.max(0, Number(searchParams.get('offset')) || 0),
+  };
+}
+
+export function parsePlaylistListRequest(searchParams) {
+  return {
+    limit: Math.min(200, Math.max(1, Number(searchParams.get('limit')) || 50)),
+    offset: Math.max(0, Number(searchParams.get('offset')) || 0),
+  };
+}
+
+function normalizePlaylistInput(input) {
+  return {
+    title: String(input?.title ?? '').trim().slice(0, 120),
+    description: String(input?.description ?? '').trim().slice(0, 1000),
   };
 }
 
@@ -248,8 +264,71 @@ export function createCatalogService({ db, apiPrefix }) {
     return { groups, total_groups: groups.length, total_tracks: rows.length };
   }
 
+  async function listPlaylists({ searchParams, userId }) {
+    const request = parsePlaylistListRequest(searchParams);
+    const total = Number((await db.prepare('SELECT count(*) count FROM playlists WHERE owner_id=?').get(userId)).count);
+    const items = await db.prepare(`SELECT playlists.id,playlists.title,playlists.description,playlists.created_at,
+      count(playlist_tracks.track_id)+(SELECT count(*) FROM federation_playlist_tracks fpt WHERE fpt.playlist_id=playlists.id) track_count,
+      COALESCE(sum(tracks.duration_seconds),0)+(SELECT COALESCE(sum(remote.duration_seconds),0) FROM federation_playlist_tracks fpt
+        JOIN federation_remote_tracks remote ON remote.origin_node_id=fpt.origin_node_id AND remote.object_id=fpt.object_id WHERE fpt.playlist_id=playlists.id) duration_seconds,
+      (SELECT track_id FROM playlist_tracks pt JOIN tracks t ON t.id=pt.track_id WHERE pt.playlist_id=playlists.id AND t.cover_key IS NOT NULL ORDER BY pt.position LIMIT 1) cover_track_id
+      FROM playlists LEFT JOIN playlist_tracks ON playlist_tracks.playlist_id=playlists.id LEFT JOIN tracks ON tracks.id=playlist_tracks.track_id
+      WHERE playlists.owner_id=? GROUP BY playlists.id ORDER BY playlists.updated_at DESC LIMIT ? OFFSET ?`).all(userId, request.limit, request.offset);
+    return {
+      items, total, offset: request.offset, limit: request.limit,
+      has_more: request.offset + items.length < total,
+    };
+  }
+
+  async function createPlaylist({ userId, input }) {
+    const playlist = normalizePlaylistInput(input);
+    if (!playlist.title) return { status: 'invalid' };
+    const id = crypto.randomUUID();
+    await db.prepare('INSERT INTO playlists(id,owner_id,title,description) VALUES(?,?,?,?)').run(id, userId, playlist.title, playlist.description);
+    return { status: 'ok', id, title: playlist.title };
+  }
+
+  async function getOwnedPlaylist({ userId, playlistId }) {
+    return await db.prepare('SELECT * FROM playlists WHERE id=? AND owner_id=?').get(playlistId, userId) || null;
+  }
+
+  async function updatePlaylist({ userId, playlistId, input }) {
+    const playlist = await getOwnedPlaylist({ userId, playlistId });
+    if (!playlist) return { status: 'not_found' };
+    const normalized = normalizePlaylistInput(input);
+    if (!normalized.title) return { status: 'invalid' };
+    await db.prepare('UPDATE playlists SET title=?,description=?,updated_at=CURRENT_TIMESTAMP WHERE id=?')
+      .run(normalized.title, normalized.description, playlist.id);
+    return { status: 'ok' };
+  }
+
+  async function deletePlaylist({ userId, playlistId }) {
+    const result = await db.prepare('DELETE FROM playlists WHERE id=? AND owner_id=?').run(playlistId, userId);
+    return Number(result.changes) > 0;
+  }
+
+  async function addPlaylistTrack({ userId, playlistId, trackId }) {
+    const playlist = await getOwnedPlaylist({ userId, playlistId });
+    if (!playlist) return { status: 'playlist_not_found' };
+    const track = await db.prepare('SELECT id FROM tracks WHERE id=?').get(trackId);
+    if (!track) return { status: 'track_not_found' };
+    const position = (await db.prepare('SELECT COALESCE(max(position),0)+1 position FROM playlist_tracks WHERE playlist_id=?').get(playlist.id)).position;
+    await db.prepare('INSERT INTO playlist_tracks(playlist_id,track_id,position) VALUES(?,?,?) ON CONFLICT DO NOTHING').run(playlist.id, track.id, position);
+    await db.prepare('UPDATE playlists SET updated_at=CURRENT_TIMESTAMP WHERE id=?').run(playlist.id);
+    return { status: 'ok' };
+  }
+
+  async function removePlaylistTrack({ userId, playlistId, trackId }) {
+    const playlist = await getOwnedPlaylist({ userId, playlistId });
+    if (!playlist) return { status: 'playlist_not_found' };
+    await db.prepare('DELETE FROM playlist_tracks WHERE playlist_id=? AND track_id=?').run(playlist.id, trackId);
+    await db.prepare('UPDATE playlists SET updated_at=CURRENT_TIMESTAMP WHERE id=?').run(playlist.id);
+    return { status: 'ok' };
+  }
+
   return {
     listTracks, listCollections, lookupArtists, getArtist, getAlbum, canEditAlbum,
-    recordHistory, listHistory, listDuplicates,
+    recordHistory, listHistory, listDuplicates, listPlaylists, createPlaylist,
+    getOwnedPlaylist, updatePlaylist, deletePlaylist, addPlaylistTrack, removePlaylistTrack,
   };
 }
