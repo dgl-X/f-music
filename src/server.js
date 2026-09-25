@@ -1758,24 +1758,12 @@ async function api(req, res, url, apiPrefix = '/api') {
     }
   }
   if(url.pathname==='/api/history'&&req.method==='POST'){
-    const body=await readJson(req);const track=await db.prepare('SELECT id FROM tracks WHERE id=?').get(String(body.track_id??''));
-    if(!track)return sendJson(res,404,{error:'Трек не найден'});
-    await db.prepare(`INSERT INTO play_history(user_id,track_id,play_count) VALUES(?,?,1)
-      ON CONFLICT(user_id,track_id) DO UPDATE SET play_count=play_history.play_count+1,last_played_at=CURRENT_TIMESTAMP`).run(user.id,track.id);
+    const body=await readJson(req);
+    if(!await catalog.recordHistory({userId:user.id,trackId:String(body.track_id??'')}))return sendJson(res,404,{error:'Трек не найден'});
     return sendJson(res,200,{ok:true});
   }
   if(url.pathname==='/api/history'&&req.method==='GET'){
-    const limit=Math.min(200,Math.max(1,Number(url.searchParams.get('limit'))||50)),offset=Math.max(0,Number(url.searchParams.get('offset'))||0);
-    const total=Number((await db.prepare('SELECT count(*) count FROM play_history WHERE user_id=?').get(user.id)).count);
-    const items=(await db.prepare(`SELECT tracks.id,tracks.title,tracks.artist,tracks.album,tracks.filename,tracks.mime_type,tracks.duration_seconds,tracks.cover_key,tracks.year,tracks.genre,tracks.track_number,tracks.disc_number,
-      (SELECT recommended_gain_db FROM loudness_jobs WHERE loudness_jobs.track_id=tracks.id AND status='ready') AS replay_gain_db,
-      EXISTS(SELECT 1 FROM track_files ready192 WHERE ready192.track_id=tracks.id AND ready192.variant='aac_192' AND ready192.status='ready') AS aac_192_ready,
-      EXISTS(SELECT 1 FROM track_files ready96 WHERE ready96.track_id=tracks.id AND ready96.variant='aac_96' AND ready96.status='ready') AS aac_96_ready,
-      play_history.play_count,play_history.last_played_at,
-      EXISTS(SELECT 1 FROM track_likes WHERE track_likes.track_id=tracks.id AND track_likes.user_id=@user_id) liked
-      FROM play_history JOIN tracks ON tracks.id=play_history.track_id WHERE play_history.user_id=@user_id
-      ORDER BY play_history.last_played_at DESC LIMIT @limit OFFSET @offset`).all({user_id:user.id,limit,offset})).map(track=>({...track,cover_url:track.cover_key?`${apiPrefix}/tracks/${track.id}/cover`:null,cover_key:undefined}));
-    return sendJson(res,200,{items,total,offset,limit,has_more:offset+items.length<total});
+    return sendJson(res,200,await catalog.listHistory({searchParams:url.searchParams,userId:user.id,responsePrefix:apiPrefix}));
   }
   if(url.pathname==='/api/artists'&&req.method==='GET'){
     return sendJson(res,200,await catalog.lookupArtists({searchParams:url.searchParams}));
@@ -1837,17 +1825,7 @@ async function api(req, res, url, apiPrefix = '/api') {
     }finally{fs.rmSync(source,{force:true});fs.rmSync(temporary,{force:true});}
   }
   if(url.pathname==='/api/duplicates'&&req.method==='GET'){
-    const rows=await db.prepare(`WITH normalized AS (
-      SELECT tracks.*,lower(regexp_replace(trim(title),'\\s+',' ','g')) title_key,lower(regexp_replace(trim(artist),'\\s+',' ','g')) artist_key
-      FROM tracks),duplicate_keys AS (
-      SELECT title_key,artist_key FROM normalized GROUP BY title_key,artist_key HAVING count(*)>1)
-      SELECT normalized.id,normalized.owner_id,normalized.title,normalized.artist,normalized.album,normalized.filename,normalized.mime_type,
-        normalized.size_bytes,normalized.duration_seconds,normalized.created_at,normalized.cover_key,normalized.title_key,normalized.artist_key,users.display_name owner_name
-      FROM normalized JOIN duplicate_keys USING(title_key,artist_key) JOIN users ON users.id=normalized.owner_id
-      ORDER BY normalized.artist_key,normalized.title_key,normalized.created_at`).all();
-    const groups=[];let current=null;
-    for(const row of rows){const key=`${row.artist_key}\n${row.title_key}`;if(!current||current.key!==key){current={key,title:row.title,artist:row.artist,items:[]};groups.push(current);}current.items.push({...row,liked:false,can_delete:Boolean(user.is_admin||row.owner_id===user.id),cover_url:row.cover_key?`${apiPrefix}/tracks/${row.id}/cover`:null,cover_key:undefined,title_key:undefined,artist_key:undefined});}
-    return sendJson(res,200,{groups,total_groups:groups.length,total_tracks:rows.length});
+    return sendJson(res,200,await catalog.listDuplicates({userId:user.id,isAdmin:Boolean(user.is_admin),responsePrefix:apiPrefix}));
   }
   if(url.pathname==='/api/playback-state'&&req.method==='GET'){
     const state=await db.prepare('SELECT track_id,remote_track_ref,position_seconds,queue_json,shuffle,repeat_mode,queue_source,updated_at FROM playback_state WHERE user_id=?').get(user.id);

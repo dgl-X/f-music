@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createCatalogService, parseArtistLookupRequest, parseCollectionListRequest, parseTrackListRequest } from '../src/catalog-service.js';
+import { createCatalogService, parseArtistLookupRequest, parseCollectionListRequest, parseHistoryListRequest, parseTrackListRequest } from '../src/catalog-service.js';
 
 test('track catalog parameters have stable bounds and safe sorting', () => {
   const normal = parseTrackListRequest(new URLSearchParams('limit=9999&offset=-3&sort=unknown&seed=a!b&q=%20song%20'));
@@ -164,4 +164,63 @@ test('card image URLs retain the requested API version prefix', async () => {
   const album = await catalog.getAlbum({ albumId: 8, userId: 1, isAdmin: true, responsePrefix: '/api/v1' });
   assert.equal(artist.image_url, '/api/v1/artists/4/image');
   assert.equal(album.image_url, '/api/v1/albums/8/image');
+});
+
+test('history parameters keep stable defaults and bounds', () => {
+  assert.deepEqual(parseHistoryListRequest(new URLSearchParams()), { limit: 50, offset: 0 });
+  assert.deepEqual(parseHistoryListRequest(new URLSearchParams('limit=999&offset=-5')), { limit: 200, offset: 0 });
+});
+
+test('history records only existing tracks', async () => {
+  const writes = [];
+  let track = null;
+  const db = { prepare(sql) { return {
+    async get(id) { assert.match(sql, /SELECT id FROM tracks/); assert.equal(id, 'track-1'); return track; },
+    async run(...params) { writes.push({ sql, params }); },
+  }; } };
+  const catalog = createCatalogService({ db, apiPrefix: '/api' });
+  assert.equal(await catalog.recordHistory({ userId: 7, trackId: 'track-1' }), false);
+  assert.equal(writes.length, 0);
+  track = { id: 'track-1' };
+  assert.equal(await catalog.recordHistory({ userId: 7, trackId: 'track-1' }), true);
+  assert.deepEqual(writes[0].params, [7, 'track-1']);
+  assert.match(writes[0].sql, /ON CONFLICT\(user_id,track_id\)/);
+});
+
+test('history list keeps pagination, likes and versioned cover URLs', async () => {
+  const calls = [];
+  const db = { prepare(sql) { return {
+    async get(userId) { calls.push({ type: 'get', sql, userId }); return { count: 3 }; },
+    async all(params) { calls.push({ type: 'all', sql, params }); return [{ id: 'track-1', cover_key: 'covers/1.jpg', liked: true }]; },
+  }; } };
+  const catalog = createCatalogService({ db, apiPrefix: '/api' });
+  const result = await catalog.listHistory({
+    userId: 7, responsePrefix: '/api/v1', searchParams: new URLSearchParams('limit=1&offset=1'),
+  });
+  assert.deepEqual(result, {
+    items: [{ id: 'track-1', cover_key: undefined, liked: true, cover_url: '/api/v1/tracks/track-1/cover' }],
+    total: 3, offset: 1, limit: 1, has_more: true,
+  });
+  assert.match(calls[1].sql, /track_likes/);
+  assert.deepEqual(calls[1].params, { user_id: 7, limit: 1, offset: 1 });
+});
+
+test('duplicate groups keep ownership permissions and hide normalization keys', async () => {
+  const db = { prepare(sql) { return { async all() {
+    assert.match(sql, /HAVING count\(\*\)>1/);
+    return [
+      { id: 'one', owner_id: 2, title: 'Song', artist: 'Artist', cover_key: 'covers/one.jpg', title_key: 'song', artist_key: 'artist' },
+      { id: 'two', owner_id: 3, title: 'SONG', artist: 'ARTIST', cover_key: null, title_key: 'song', artist_key: 'artist' },
+    ];
+  } }; } };
+  const catalog = createCatalogService({ db, apiPrefix: '/api' });
+  const result = await catalog.listDuplicates({ userId: 2, isAdmin: false, responsePrefix: '/api/v1' });
+  assert.equal(result.total_groups, 1);
+  assert.equal(result.total_tracks, 2);
+  assert.equal(result.groups[0].key, 'artist\nsong');
+  assert.equal(result.groups[0].items[0].can_delete, true);
+  assert.equal(result.groups[0].items[1].can_delete, false);
+  assert.equal(result.groups[0].items[0].cover_url, '/api/v1/tracks/one/cover');
+  assert.equal(result.groups[0].items[0].cover_key, undefined);
+  assert.equal(result.groups[0].items[0].title_key, undefined);
 });
