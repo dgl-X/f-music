@@ -1698,38 +1698,26 @@ async function api(req, res, url, apiPrefix = '/api') {
     return sendJson(res, 200, await catalog.listCollections({ searchParams: url.searchParams }));
   }
   if (url.pathname === '/api/playlists' && req.method === 'GET') {
-    const limit=Math.min(200,Math.max(1,Number(url.searchParams.get('limit'))||50)),offset=Math.max(0,Number(url.searchParams.get('offset'))||0);
-    const total=Number((await db.prepare('SELECT count(*) count FROM playlists WHERE owner_id=?').get(user.id)).count);
-    const items = await db.prepare(`SELECT playlists.id,playlists.title,playlists.description,playlists.created_at,count(playlist_tracks.track_id)+(SELECT count(*) FROM federation_playlist_tracks fpt WHERE fpt.playlist_id=playlists.id) track_count,COALESCE(sum(tracks.duration_seconds),0)+(SELECT COALESCE(sum(remote.duration_seconds),0) FROM federation_playlist_tracks fpt JOIN federation_remote_tracks remote ON remote.origin_node_id=fpt.origin_node_id AND remote.object_id=fpt.object_id WHERE fpt.playlist_id=playlists.id) duration_seconds,
-      (SELECT track_id FROM playlist_tracks pt JOIN tracks t ON t.id=pt.track_id WHERE pt.playlist_id=playlists.id AND t.cover_key IS NOT NULL ORDER BY pt.position LIMIT 1) cover_track_id
-      FROM playlists LEFT JOIN playlist_tracks ON playlist_tracks.playlist_id=playlists.id LEFT JOIN tracks ON tracks.id=playlist_tracks.track_id WHERE playlists.owner_id=?
-      GROUP BY playlists.id ORDER BY playlists.updated_at DESC LIMIT ? OFFSET ?`).all(user.id,limit,offset);
-    return sendJson(res, 200, { items,total,offset,limit,has_more:offset+items.length<total });
+    return sendJson(res,200,await catalog.listPlaylists({searchParams:url.searchParams,userId:user.id}));
   }
   if (url.pathname === '/api/playlists' && req.method === 'POST') {
-    const body = await readJson(req);
-    const title = String(body.title ?? '').trim().slice(0,120);
-    if (!title) return sendJson(res,400,{error:'Введите название плейлиста'});
-    const id = crypto.randomUUID();
-    await db.prepare('INSERT INTO playlists(id,owner_id,title,description) VALUES(?,?,?,?)').run(id,user.id,title,String(body.description??'').trim().slice(0,1000));
-    return sendJson(res,201,{id,title});
+    const result=await catalog.createPlaylist({userId:user.id,input:await readJson(req)});
+    if(result.status==='invalid')return sendJson(res,400,{error:'Введите название плейлиста'});
+    return sendJson(res,201,{id:result.id,title:result.title});
   }
   const playlistMatch = /^\/api\/playlists\/([0-9a-f-]+)$/.exec(url.pathname);
   if (playlistMatch && req.method === 'PATCH') {
-    const playlist=await db.prepare('SELECT * FROM playlists WHERE id=? AND owner_id=?').get(playlistMatch[1],user.id);
-    if(!playlist)return sendJson(res,404,{error:'Плейлист не найден'});
-    const body=await readJson(req);const title=String(body.title??'').trim().slice(0,120);
-    if(!title)return sendJson(res,400,{error:'Введите название плейлиста'});
-    await db.prepare('UPDATE playlists SET title=?,description=?,updated_at=CURRENT_TIMESTAMP WHERE id=?').run(title,String(body.description??'').trim().slice(0,1000),playlist.id);
+    const result=await catalog.updatePlaylist({userId:user.id,playlistId:playlistMatch[1],input:await readJson(req)});
+    if(result.status==='not_found')return sendJson(res,404,{error:'Плейлист не найден'});
+    if(result.status==='invalid')return sendJson(res,400,{error:'Введите название плейлиста'});
     return sendJson(res,200,{ok:true});
   }
   if (playlistMatch && req.method === 'DELETE') {
-    const result=await db.prepare('DELETE FROM playlists WHERE id=? AND owner_id=?').run(playlistMatch[1],user.id);
-    return result.changes?sendJson(res,200,{ok:true}):sendJson(res,404,{error:'Плейлист не найден'});
+    return await catalog.deletePlaylist({userId:user.id,playlistId:playlistMatch[1]})?sendJson(res,200,{ok:true}):sendJson(res,404,{error:'Плейлист не найден'});
   }
   const remotePlaylistMatch=/^\/api\/playlists\/([0-9a-f-]+)\/remote$/.exec(url.pathname);
   if(remotePlaylistMatch){
-    const playlist=await db.prepare('SELECT * FROM playlists WHERE id=? AND owner_id=?').get(remotePlaylistMatch[1],user.id);if(!playlist)return sendJson(res,404,{error:'Плейлист не найден'});
+    const playlist=await catalog.getOwnedPlaylist({playlistId:remotePlaylistMatch[1],userId:user.id});if(!playlist)return sendJson(res,404,{error:'Плейлист не найден'});
     if(req.method==='GET'){
       const rows=await db.prepare(`SELECT remote.*,peer.label,peer.endpoint,peer.status peer_status,peer.revoked_at,peer.last_synced_at,peer.sync_error,replica.status replica_status,replica.received_bytes replica_received_bytes,replica.size_bytes replica_size_bytes,EXISTS(SELECT 1 FROM federation_remote_likes likes WHERE likes.user_id=? AND likes.origin_node_id=remote.origin_node_id AND likes.object_id=remote.object_id) liked
         FROM federation_playlist_tracks item JOIN federation_remote_tracks remote ON remote.origin_node_id=item.origin_node_id AND remote.object_id=item.object_id JOIN federation_peers peer ON peer.node_id=remote.origin_node_id LEFT JOIN federation_remote_replicas replica ON replica.origin_node_id=remote.origin_node_id AND replica.object_id=remote.object_id WHERE item.playlist_id=? ORDER BY item.position`).all(user.id,playlist.id);
@@ -1741,19 +1729,15 @@ async function api(req, res, url, apiPrefix = '/api') {
   }
   const playlistTracksMatch=/^\/api\/playlists\/([0-9a-f-]+)\/tracks(?:\/([0-9a-f-]+))?$/.exec(url.pathname);
   if(playlistTracksMatch){
-    const playlist=await db.prepare('SELECT * FROM playlists WHERE id=? AND owner_id=?').get(playlistTracksMatch[1],user.id);
-    if(!playlist)return sendJson(res,404,{error:'Плейлист не найден'});
     if(req.method==='POST'){
-      const body=await readJson(req);const track=await db.prepare('SELECT id FROM tracks WHERE id=?').get(String(body.track_id??''));
-      if(!track)return sendJson(res,404,{error:'Трек не найден'});
-      const position=(await db.prepare('SELECT COALESCE(max(position),0)+1 position FROM playlist_tracks WHERE playlist_id=?').get(playlist.id)).position;
-      await db.prepare('INSERT INTO playlist_tracks(playlist_id,track_id,position) VALUES(?,?,?) ON CONFLICT DO NOTHING').run(playlist.id,track.id,position);
-      await db.prepare('UPDATE playlists SET updated_at=CURRENT_TIMESTAMP WHERE id=?').run(playlist.id);
+      const result=await catalog.addPlaylistTrack({userId:user.id,playlistId:playlistTracksMatch[1],trackId:String((await readJson(req)).track_id??'')});
+      if(result.status==='playlist_not_found')return sendJson(res,404,{error:'Плейлист не найден'});
+      if(result.status==='track_not_found')return sendJson(res,404,{error:'Трек не найден'});
       return sendJson(res,200,{ok:true});
     }
     if(req.method==='DELETE'&&playlistTracksMatch[2]){
-      await db.prepare('DELETE FROM playlist_tracks WHERE playlist_id=? AND track_id=?').run(playlist.id,playlistTracksMatch[2]);
-      await db.prepare('UPDATE playlists SET updated_at=CURRENT_TIMESTAMP WHERE id=?').run(playlist.id);
+      const result=await catalog.removePlaylistTrack({userId:user.id,playlistId:playlistTracksMatch[1],trackId:playlistTracksMatch[2]});
+      if(result.status==='playlist_not_found')return sendJson(res,404,{error:'Плейлист не найден'});
       return sendJson(res,200,{ok:true});
     }
   }
