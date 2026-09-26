@@ -23,6 +23,22 @@
 - `src/authentication.js` — вход, cookie, Origin-политика и жизненный цикл сессий.
 - `src/registration.js` — проверка данных и ограничение самостоятельной регистрации.
 - `src/media-stream.js` — безопасное разрешение пути и HTTP Range/X-Accel-Redirect.
+- `src/http-observability.js` — request ID, безопасный структурированный журнал
+  HTTP и агрегаты длительности запросов.
+- `src/operation-metrics.js` — ограниченные агрегаты длительности фоновых
+  операций, общие для API и worker через PostgreSQL.
+- `src/federation-service.js` — настройки федерации, endpoint, жизненный цикл
+  pairing-приглашений, доверенные peer и защита подписанных запросов от replay.
+- `src/federation-pairing.js` — двусторонний подписанный handshake, проверка
+  identity, capabilities и подтверждения challenge.
+- `src/federation-sync.js` — подписанные delta/notify, курсоры каталога,
+  ограничение страниц и retry/backoff фоновой синхронизации.
+- `src/federation-media.js` — проверка доступа к опубликованным трекам,
+  HTTP Range, лимиты и проксирование аудиопотоков и обложек между нодами.
+- `src/federation-availability.js` — единое online/offline-состояние peer,
+  фильтр автоматических очередей, circuit breaker и фоновая health-проверка.
+- `src/federation-import.js` — восстанавливаемая очередь загрузки оригиналов,
+  докачка по Range, SHA-256, дедупликация и превращение реплики в локальный трек.
 - `src/worker.js` — обработка загрузок, распознавание, AAC, loudness и федеративный импорт.
 - `public/` — web-клиент без стадии сборки.
 - `storage/uploads` — временные части.

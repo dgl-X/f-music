@@ -5,7 +5,7 @@ export function resolveApiRoute(input) {
     return { url, version: 1, prefix: '/api/v1', legacy: false };
   }
   if (url.pathname === '/api' || url.pathname.startsWith('/api/')) {
-    return { url, version: 1, prefix: '/api', legacy: true };
+    return { url, version: 1, prefix: '/api', retired: true };
   }
   return null;
 }

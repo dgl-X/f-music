@@ -38,7 +38,7 @@ DEB-пакет использует встроенный официальный 
 
 ```bash
 useradd --system --home /opt/family-music --shell /usr/sbin/nologin family-music
-git clone https://github.com/dgl-X/f-music.git /opt/family-music
+git clone https://github.com/OWNER/family-music.git /opt/family-music
 cd /opt/family-music
 npm ci --omit=dev
 install -d -o family-music -g family-music -m 0750 storage
@@ -120,7 +120,7 @@ nginx порт должен быть доступен только из дове
 ## 6. Первичная настройка
 
 Откройте HTTPS-адрес ноды и создайте первого администратора. После появления
-первого пользователя `/api/setup` блокируется, публичной регистрации нет.
+первого пользователя `/api/v1/setup` блокируется, публичной регистрации нет.
 
 Проверьте:
 
