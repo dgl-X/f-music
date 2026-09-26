@@ -88,6 +88,7 @@ CREATE INDEX IF NOT EXISTS recognition_jobs_queue ON recognition_jobs(status, av
 CREATE INDEX IF NOT EXISTS loudness_jobs_queue ON loudness_jobs(status, available_at, id);
 CREATE INDEX IF NOT EXISTS diagnostic_reports_created_at ON diagnostic_reports(created_at DESC);
 CREATE TABLE IF NOT EXISTS service_heartbeats (service TEXT PRIMARY KEY, started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, details_json TEXT NOT NULL DEFAULT '{}');
+CREATE TABLE IF NOT EXISTS operation_metrics (name TEXT PRIMARY KEY, count BIGINT NOT NULL DEFAULT 0, error_count BIGINT NOT NULL DEFAULT 0, duration_ms_total DOUBLE PRECISION NOT NULL DEFAULT 0, duration_ms_max DOUBLE PRECISION NOT NULL DEFAULT 0, last_duration_ms DOUBLE PRECISION NOT NULL DEFAULT 0, last_succeeded INTEGER NOT NULL DEFAULT 1, last_finished_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '', updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS federation_nonces (node_id TEXT NOT NULL, nonce TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, expires_at TIMESTAMPTZ NOT NULL, PRIMARY KEY(node_id,nonce));
 CREATE INDEX IF NOT EXISTS federation_nonces_expires ON federation_nonces(expires_at);
@@ -104,6 +105,13 @@ ALTER TABLE federation_peers ADD COLUMN IF NOT EXISTS last_notified_revision BIG
 ALTER TABLE federation_peers ADD COLUMN IF NOT EXISTS next_notify_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP;
 ALTER TABLE federation_peers ADD COLUMN IF NOT EXISTS notify_failures INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE federation_peers ADD COLUMN IF NOT EXISTS notify_error TEXT;
+ALTER TABLE federation_peers ADD COLUMN IF NOT EXISTS stream_failures INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE federation_peers ADD COLUMN IF NOT EXISTS stream_unavailable_until TIMESTAMPTZ;
+ALTER TABLE federation_peers ADD COLUMN IF NOT EXISTS last_stream_error TEXT;
+ALTER TABLE federation_peers ADD COLUMN IF NOT EXISTS last_stream_success_at TIMESTAMPTZ;
+ALTER TABLE federation_peers ADD COLUMN IF NOT EXISTS next_health_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP;
+ALTER TABLE federation_peers ADD COLUMN IF NOT EXISTS health_failures INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE federation_peers ADD COLUMN IF NOT EXISTS last_health_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS federation_peers_status ON federation_peers(status,updated_at DESC);
 CREATE TABLE IF NOT EXISTS federation_export_collections (
   id TEXT PRIMARY KEY,

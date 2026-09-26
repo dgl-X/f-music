@@ -6,13 +6,12 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { loadConfig } from './config.js';
 import { openDatabase } from './db.js';
-import { describePublicKeyValue, ensureFederationIdentity, loadFederationIdentity, publicNodeDescriptor } from './federation-identity.js';
-import { applyFederationDeltaPage, catalogEvent, decodeCatalogCursor, decodeRemoteReference, encodeCatalogCursor, encodeRemoteReference, federationCatalogRow, federationTrackVisible } from './federation-catalog.js';
-import { FEDERATION_PROTOCOL_MINOR, negotiateFederation } from './federation-protocol.js';
-import { getFederationJson, openFederationStream, postFederationJson, probeFederationEndpoint } from './federation-endpoints.js';
-import { signFederationRequest, signFederationResponse, signPairingConfirmation, verifyFederationRequest, verifyFederationResponse, verifyPairingConfirmation } from './federation-signatures.js';
+import { ensureFederationIdentity, loadFederationIdentity, publicNodeDescriptor } from './federation-identity.js';
+import { decodeRemoteReference, encodeRemoteReference, federationTrackVisible } from './federation-catalog.js';
+import { openFederationStream, probeFederationEndpoint } from './federation-endpoints.js';
+import { signFederationRequest, verifyFederationRequest } from './federation-signatures.js';
 import { resolveApiRoute } from './routing.js';
-import { acquireCounter, hashPassword, randomToken, releaseCounter, tokenHash } from './security.js';
+import { hashPassword, randomToken, tokenHash } from './security.js';
 import { normalizeHybridFlac } from './audio-normalization.js';
 import { audioCodec, playbackVariant, requiresCompatibilityVariant } from './audio-compatibility.js';
 import { serveStoredMedia } from './media-stream.js';
@@ -25,6 +24,15 @@ import { createUploadJobService } from './upload-jobs.js';
 import { createUploadService } from './upload-service.js';
 import { createUploadProcessor } from './upload-processor.js';
 import { createCoverExtractor, inspectAudio, runProcess, sha256File } from './media-tools.js';
+import { createFederationService, decodeFederationInvitationCode, encodeFederationInvitationCode, externalFederationRequestUri, parseFederationSettingList, validateFederationEndpoints } from './federation-service.js';
+import { createFederationPairingService } from './federation-pairing.js';
+import { createFederationSyncService } from './federation-sync.js';
+import { createFederationMediaService } from './federation-media.js';
+import { createFederationImportService, federationReplicaPaths as importReplicaPaths, federationSourceId } from './federation-import.js';
+import { createFederationAvailabilityService, FEDERATION_QUEUE_ONLINE_SQL } from './federation-availability.js';
+import { createHttpObserver, httpMetricSnapshot } from './http-observability.js';
+import { normalizeErrorResponse } from './api-errors.js';
+import { createOperationMetrics, operationMetricSnapshot } from './operation-metrics.js';
 
 const config = loadConfig();
 const db = await openDatabase(config.databaseUrl);
@@ -50,6 +58,22 @@ const registrationLimiter = new RegistrationLimiter();
 const authentication = createAuthenticationService({ db, sessionDays: config.sessionDays, secureCookies: config.secureCookies });
 const catalog = createCatalogService({ db, apiPrefix: '/api' });
 const uploadJobs = createUploadJobService({ db });
+const federation = createFederationService({ db });
+const federationAvailability = createFederationAvailabilityService({ db });
+const operationMetrics = createOperationMetrics({ db });
+const federationPairing = createFederationPairingService({ federation, softwareVersion, randomToken, tokenHash });
+const federationSync = createFederationSyncService({
+  db,
+  federation,
+  removeReplicaFiles(nodeId, replica) {
+    if (replica.storageKey) {
+      const file = path.resolve(config.storageDir, replica.storageKey);
+      if (file.startsWith(`${path.resolve(config.storageDir)}${path.sep}`)) fs.rmSync(file, { force:true });
+    }
+    fs.rmSync(importReplicaPaths(config.storageDir, nodeId, replica.objectId).temporaryPath, { force:true });
+  },
+  startOperation: operationMetrics.start,
+});
 const uploads = createUploadService({ db, uploadDir, maxUploadBytes:config.maxUploadBytes, uploadJobs });
 const extractCover = createCoverExtractor({ coverDir, storageDir:config.storageDir });
 const uploadProcessor = createUploadProcessor({
@@ -59,43 +83,33 @@ const uploadProcessor = createUploadProcessor({
 });
 const workerMode = process.argv.includes('--worker');
 const processStartedAt = new Date();
-const httpMetrics = { requests: 0, errors5xx: 0 };
+const httpMetrics = { requests:0, errors5xx:0, duration_ms_total:0, duration_ms_max:0, slow_requests:0 };
+const observeHttp = createHttpObserver({ metrics:httpMetrics });
 const sendJson = (res, status, value, extra = {}) => {
   res.writeHead(status, { ...jsonHeaders, ...extra });
-  res.end(JSON.stringify(value));
+  res.end(JSON.stringify(normalizeErrorResponse(status, value, res.getHeader('X-Request-ID'))));
 };
+const federationMedia = createFederationMediaService({
+  db,
+  federation,
+  availability: federationAvailability,
+  storageDir: config.storageDir,
+  loadIdentity: () => loadFederationIdentity(config.storageDir),
+  sendJson,
+});
+const federationImport = createFederationImportService({
+  db,
+  storageDir: config.storageDir,
+  uploadDir,
+  originalDir,
+  loadIdentity: () => loadFederationIdentity(config.storageDir),
+  extractCover,
+  sha256File,
+  startOperation: operationMetrics.start,
+});
 
 async function canEditAlbum(user, albumId){
   return catalog.canEditAlbum({userId:user.id,isAdmin:Boolean(user.is_admin),albumId});
-}
-
-async function federationSettings() {
-  const rows = await db.prepare("SELECT key,value FROM app_settings WHERE key IN ('federation_enabled','federation_endpoints','federation_export_policy','federation_export_albums','federation_export_collections')").all();
-  const values = Object.fromEntries(rows.map(row => [row.key, row.value]));
-  let endpoints = [], selectedAlbums = [], selectedCollections = [];
-  try { endpoints = JSON.parse(values.federation_endpoints || '[]'); } catch {}
-  try { selectedAlbums = JSON.parse(values.federation_export_albums || '[]'); } catch {}
-  try { selectedCollections = JSON.parse(values.federation_export_collections || '[]'); } catch {}
-  const policy = ['all','albums','collections'].includes(values.federation_export_policy) ? values.federation_export_policy : 'none';
-  return { enabled: values.federation_enabled === 'true', endpoints: Array.isArray(endpoints) ? endpoints : [], export_policy: policy,
-    selected_albums: Array.isArray(selectedAlbums) ? selectedAlbums.filter(value => typeof value === 'string').slice(0, 1000) : [],
-    selected_collections: Array.isArray(selectedCollections) ? selectedCollections.filter(value => typeof value === 'string').slice(0, 1000) : [] };
-}
-
-const parseSettingList = value => { try { const parsed=JSON.parse(value||'[]'); return Array.isArray(parsed)?parsed.map(String).slice(0,1000):[]; } catch { return []; } };
-
-async function federationExportSettings(peerNodeId = null) {
-  const global = await federationSettings();
-  let selected = global;
-  if (peerNodeId) {
-    const rule = await db.prepare('SELECT policy,selected_albums_json,selected_collections_json FROM federation_peer_export_rules WHERE peer_node_id=?').get(peerNodeId);
-    if (rule && rule.policy !== 'inherit') selected = { ...global, export_policy:rule.policy, selected_albums:parseSettingList(rule.selected_albums_json), selected_collections:parseSettingList(rule.selected_collections_json) };
-  }
-  let selectedTrackIds = [];
-  if (selected.export_policy === 'collections' && selected.selected_collections.length) {
-    selectedTrackIds = (await db.prepare(`SELECT DISTINCT track_id FROM federation_export_collection_tracks WHERE collection_id=ANY(?::text[])`).all(selected.selected_collections)).map(row=>row.track_id);
-  }
-  return { ...selected, selected_track_ids:selectedTrackIds };
 }
 
 async function appendFederationVisibilityEvents(tx, previousSettings, nextSettings, trackIds = null) {
@@ -120,21 +134,9 @@ async function appendFederationTrackRefreshEvents(tx, trackIds) {
   for(const track of tracks) await insertEvent.run(track.id,JSON.stringify({title:track.title,artist:track.artist,album:track.album,genre:track.genre,year:track.year,duration_seconds:track.duration_seconds,track_number:track.track_number,disc_number:track.disc_number,cover_available:Boolean(track.cover_key),created_at:track.created_at,policy_event:true}));
 }
 
-function validateFederationEndpoints(value) {
-  if (!Array.isArray(value) || value.length > 8) throw Object.assign(new Error('Допускается не более 8 адресов ноды'), { status: 400 });
-  return value.map((item, index) => {
-    const url = String(item?.url || '').trim();
-    let parsed;
-    try { parsed = new URL(url); } catch { throw Object.assign(new Error(`Некорректный адрес №${index + 1}`), { status: 400 }); }
-    if (parsed.protocol !== 'https:' || parsed.username || parsed.password) throw Object.assign(new Error('Адрес ноды должен использовать HTTPS и не содержать логин'), { status: 400 });
-    const scope = item?.scope === 'private' ? 'private' : 'public';
-    return { url: parsed.toString().replace(/\/$/, ''), scope, priority: Number.isInteger(item?.priority) ? Math.max(0, Math.min(1000, item.priority)) : index * 10 };
-  });
-}
-
 async function publicFederation(req, res, url) {
   if (!['/.well-known/family-music', '/federation/v1/node', '/federation/v1/health'].includes(url.pathname) || req.method !== 'GET') return false;
-  const settings = await federationSettings();
+  const settings = await federation.settings();
   const identity = loadFederationIdentity(config.storageDir);
   if (!settings.enabled || !identity) { sendJson(res, 404, { error: { code: 'federation_disabled', message: 'Федерация выключена', retryable: false } }); return true; }
   if (url.pathname === '/federation/v1/health') sendJson(res, 200, { status: 'ok', node_id: identity.node_id, protocol_version: 1 });
@@ -142,47 +144,18 @@ async function publicFederation(req, res, url) {
   return true;
 }
 
-function externalRequestUri(req, url) {
-  const protocol = String(req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
-  const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
-  return `${protocol}://${host}${url.pathname}${url.search}`;
-}
-
-async function consumeFederationNonce(nodeId, nonce, created) {
-  await db.prepare('DELETE FROM federation_nonces WHERE expires_at<CURRENT_TIMESTAMP').run();
-  const expires = new Date((created + 600) * 1000).toISOString();
-  const result = await db.prepare('INSERT INTO federation_nonces(node_id,nonce,expires_at) VALUES(?,?,?) ON CONFLICT DO NOTHING RETURNING nonce').run(nodeId, nonce, expires);
-  return result.changes === 1;
-}
-
 async function acceptFederationPairing(req, res, url) {
   if (url.pathname !== '/federation/v1/pairing/accept' || req.method !== 'POST') return false;
   try {
-  const settings = await federationSettings(), identity = loadFederationIdentity(config.storageDir);
+  const settings = await federation.settings(), identity = loadFederationIdentity(config.storageDir);
   if (!settings.enabled || !identity) { sendJson(res, 404, { error: { code: 'federation_disabled', message: 'Федерация выключена', retryable: false } }); return true; }
   const bytes = await readBytes(req, 64 * 1024); let body;
   try { body = JSON.parse(bytes.toString('utf8')); } catch { sendJson(res, 400, { error: { code: 'invalid_json', message: 'Некорректный JSON', retryable: false } }); return true; }
-  const invitation = await db.prepare(`SELECT * FROM federation_invitations WHERE id=? AND secret_hash=? AND used_at IS NULL AND revoked_at IS NULL AND expires_at>CURRENT_TIMESTAMP`).get(body.invitation_id, tokenHash(String(body.secret || '')));
-  if (!invitation) { sendJson(res, 403, { error: { code: 'invalid_invitation', message: 'Приглашение недействительно или истекло', retryable: false } }); return true; }
-  const remote = body.node || {}, described = describePublicKeyValue(String(remote.public_key?.value || ''));
-  if (described.nodeId !== remote.node_id) { sendJson(res, 400, { error: { code: 'node_id_mismatch', message: 'node_id не соответствует публичному ключу', retryable: false } }); return true; }
-  if (remote.node_id === identity.node_id) { sendJson(res, 409, { error: { code: 'self_pairing', message: 'Нельзя подключить ноду саму к себе', retryable: false } }); return true; }
-  await verifyFederationRequest({ method: req.method, targetUri: externalRequestUri(req, url), body: bytes, headers: req.headers, publicKey: remote.public_key.value, expectedNodeId: remote.node_id, consumeNonce: consumeFederationNonce });
-  const remoteEndpoint = remote.endpoints?.find(item => item.scope === 'public')?.url;
-  if (!remoteEndpoint) { sendJson(res, 400, { error: { code: 'endpoint_required', message: 'У подключаемой ноды нет публичного endpoint', retryable: false } }); return true; }
-  const negotiation = negotiateFederation(remote, ['pairing.v1']);
-  const remoteMinor = negotiation.minor ?? 0, status = negotiation.status;
-  const used = await db.prepare('UPDATE federation_invitations SET used_at=CURRENT_TIMESTAMP WHERE id=? AND used_at IS NULL RETURNING id').run(invitation.id);
-  if (!used.changes) { sendJson(res, 409, { error: { code: 'invitation_used', message: 'Приглашение уже использовано', retryable: false } }); return true; }
-  await db.prepare(`INSERT INTO federation_peers(node_id,label,public_key,endpoint,status,protocol_major,protocol_minor,capabilities_json,last_seen_at)
-    VALUES(?,?,?,?,?,1,?,?,CURRENT_TIMESTAMP) ON CONFLICT(node_id) DO UPDATE SET public_key=excluded.public_key,endpoint=excluded.endpoint,status=excluded.status,protocol_minor=excluded.protocol_minor,capabilities_json=excluded.capabilities_json,updated_at=CURRENT_TIMESTAMP,last_seen_at=CURRENT_TIMESTAMP,revoked_at=NULL`)
-    .run(remote.node_id, String(remote.label || '').slice(0, 120), remote.public_key.value, remoteEndpoint, status, Math.max(0, remoteMinor), JSON.stringify(remote.capabilities || {}));
-  const node = publicNodeDescriptor(identity, { softwareVersion, endpoints: settings.endpoints });
-  const confirmationValues = { invitationId: invitation.id, requesterNodeId: remote.node_id, issuerNodeId: identity.node_id, challenge: String(body.challenge || '') };
-  sendJson(res, 200, { node, status, confirmation: signPairingConfirmation(confirmationValues, identity.private_key_pem) }); return true;
+  const result = await federationPairing.accept({ body, bytes, method:req.method, targetUri:externalFederationRequestUri(req,url), headers:req.headers, settings, identity });
+  sendJson(res, 200, result); return true;
   } catch (error) {
     const clientCodes = new Set(['node_mismatch', 'invalid_nonce', 'invalid_signature', 'clock_skew', 'digest_mismatch', 'replay_detected']);
-    const status = clientCodes.has(error.code) ? 401 : 400;
+    const status = error.status || (clientCodes.has(error.code) ? 401 : 400);
     sendJson(res, status, { error: { code: error.code || 'invalid_pairing_request', message: error.message || 'Некорректный запрос pairing', retryable: false } });
     return true;
   }
@@ -191,19 +164,14 @@ async function acceptFederationPairing(req, res, url) {
 async function federationCatalog(req, res, url) {
   if (url.pathname !== '/federation/v1/catalog/delta' || req.method !== 'GET') return false;
   try {
-    const settings = await federationSettings(), identity = loadFederationIdentity(config.storageDir);
+    const settings = await federation.settings(), identity = loadFederationIdentity(config.storageDir);
     if (!settings.enabled || !identity) { sendJson(res, 404, { error: { code: 'federation_disabled', message: 'Федерация выключена', retryable: false } }); return true; }
     const remoteNodeId = String(req.headers['x-family-music-node'] || '');
-    const peer = await db.prepare("SELECT node_id,public_key FROM federation_peers WHERE node_id=? AND status IN ('compatible','limited') AND revoked_at IS NULL").get(remoteNodeId);
+    const peer = await federation.trustedPeer(remoteNodeId);
     if (!peer) { sendJson(res, 403, { error: { code: 'peer_not_trusted', message: 'Нода не подключена или отозвана', retryable: false } }); return true; }
-    await verifyFederationRequest({ method: req.method, targetUri: externalRequestUri(req, url), headers: req.headers, publicKey: peer.public_key, expectedNodeId: peer.node_id, consumeNonce: consumeFederationNonce });
-    const after = decodeCatalogCursor(url.searchParams.get('cursor')), limit = Math.max(1, Math.min(500, Number(url.searchParams.get('limit')) || 500));
-    const rows = await db.prepare(`SELECT events.revision,events.event_type,events.object_id,events.payload_json,events.occurred_at,tracks.album AS current_album
-      FROM federation_catalog_events events LEFT JOIN tracks ON tracks.id=events.object_id WHERE events.revision>? ORDER BY events.revision LIMIT ?`).all(after, limit + 1);
-    const exportSettings = await federationExportSettings(peer.node_id);
-    const rawPage = rows.slice(0, limit), page = rawPage.map(row => federationCatalogRow(row, exportSettings)), hasMore = rows.length > limit, lastRevision = rawPage.length ? Number(rawPage.at(-1).revision) : after;
-    const body = Buffer.from(JSON.stringify({ protocol_version: 1, producer_minor: FEDERATION_PROTOCOL_MINOR, min_reader_minor: 0, items: page.map(row => catalogEvent(row, identity.node_id)), next_cursor: encodeCatalogCursor(lastRevision), has_more: hasMore }));
-    res.writeHead(200, { ...jsonHeaders, ...signFederationResponse(body, identity.node_id, identity.private_key_pem) }); res.end(body);
+    await verifyFederationRequest({ method: req.method, targetUri: externalFederationRequestUri(req, url), headers: req.headers, publicKey: peer.public_key, expectedNodeId: peer.node_id, consumeNonce: federation.consumeNonce });
+    const result = await federationSync.delta({ peerNodeId:peer.node_id, identity, cursor:url.searchParams.get('cursor'), limit:url.searchParams.get('limit') });
+    res.writeHead(200, { ...jsonHeaders, ...result.headers }); res.end(result.body);
     return true;
   } catch (error) {
     const unauthorized = ['node_mismatch','invalid_nonce','invalid_signature','clock_skew','digest_mismatch','replay_detected'].includes(error.code);
@@ -215,121 +183,35 @@ async function federationCatalog(req, res, url) {
 async function federationNotify(req, res, url) {
   if (url.pathname !== '/federation/v1/catalog/notify' || req.method !== 'POST') return false;
   try {
-    const settings = await federationSettings(), identity = loadFederationIdentity(config.storageDir);
+    const settings = await federation.settings(), identity = loadFederationIdentity(config.storageDir);
     if (!settings.enabled || !identity) { sendJson(res, 404, { error: { code: 'federation_disabled', message: 'Федерация выключена', retryable: false } }); return true; }
     const bytes = await readBytes(req, 16 * 1024), remoteNodeId = String(req.headers['x-family-music-node'] || '');
-    const peer = await db.prepare("SELECT node_id,public_key FROM federation_peers WHERE node_id=? AND status IN ('compatible','limited') AND revoked_at IS NULL").get(remoteNodeId);
+    const peer = await federation.trustedPeer(remoteNodeId);
     if (!peer) { sendJson(res, 403, { error: { code: 'peer_not_trusted', message: 'Нода не подключена или отозвана', retryable: false } }); return true; }
-    await verifyFederationRequest({ method: req.method, targetUri: externalRequestUri(req, url), body: bytes, headers: req.headers, publicKey: peer.public_key, expectedNodeId: peer.node_id, consumeNonce: consumeFederationNonce });
+    await verifyFederationRequest({ method: req.method, targetUri: externalFederationRequestUri(req, url), body: bytes, headers: req.headers, publicKey: peer.public_key, expectedNodeId: peer.node_id, consumeNonce: federation.consumeNonce });
     let body; try { body=JSON.parse(bytes.toString('utf8')); } catch { throw Object.assign(new Error('Некорректный JSON notify'), { code: 'invalid_json' }); }
-    const revision=Number(body.latest_revision);
-    if (!Number.isSafeInteger(revision) || revision < 0) throw Object.assign(new Error('Некорректная latest_revision'), { code: 'invalid_revision' });
-    await db.prepare('UPDATE federation_peers SET remote_latest_revision=GREATEST(remote_latest_revision,?),next_sync_at=LEAST(next_sync_at,CURRENT_TIMESTAMP),last_seen_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE node_id=?').run(revision,peer.node_id);
-    sendJson(res, 202, { accepted: true, latest_revision: revision }); return true;
+    sendJson(res, 202, await federationSync.acceptNotification(peer.node_id, body.latest_revision)); return true;
   } catch (error) {
     const unauthorized=['node_mismatch','invalid_nonce','invalid_signature','clock_skew','digest_mismatch','replay_detected'].includes(error.code);
     sendJson(res,unauthorized?401:400,{ error:{ code:error.code||'notify_failed',message:error.message||'Некорректный notify',retryable:false } }); return true;
   }
 }
 
-const incomingFederationStreams=new Map(),outgoingFederationStreams=new Map();
-
-async function federationCover(req,res,url){
-  const match=/^\/federation\/v1\/tracks\/([0-9a-f-]{36})\/cover$/.exec(url.pathname);
-  if(!match||req.method!=='GET')return false;
-  try{
-    const settings=await federationSettings(),identity=loadFederationIdentity(config.storageDir);
-    if(!settings.enabled||!identity)return sendJson(res,404,{error:{code:'federation_disabled',message:'Федерация выключена',retryable:false}}),true;
-    const remoteNodeId=String(req.headers['x-family-music-node']||''),peer=await db.prepare("SELECT node_id,public_key FROM federation_peers WHERE node_id=? AND status IN ('compatible','limited') AND revoked_at IS NULL").get(remoteNodeId);
-    if(!peer)return sendJson(res,403,{error:{code:'peer_not_trusted',message:'Нода не подключена или отозвана',retryable:false}}),true;
-    await verifyFederationRequest({method:req.method,targetUri:externalRequestUri(req,url),headers:req.headers,publicKey:peer.public_key,expectedNodeId:peer.node_id,consumeNonce:consumeFederationNonce});
-    const track=await db.prepare('SELECT id,cover_key,album FROM tracks WHERE id=?').get(match[1]);
-    if(!federationTrackVisible(track,await federationExportSettings(peer.node_id)))return sendJson(res,403,{error:{code:'track_not_shared',message:'Трек не опубликован',retryable:false}}),true;
-    if(!track?.cover_key)return sendJson(res,404,{error:{code:'cover_not_found',message:'Обложка отсутствует',retryable:false}}),true;
-    const file=path.resolve(config.storageDir,track.cover_key);
-    if(!file.startsWith(config.storageDir+path.sep)||!fs.existsSync(file))return sendJson(res,404,{error:{code:'cover_not_found',message:'Файл обложки отсутствует',retryable:false}}),true;
-    const size=fs.statSync(file).size;
-    res.writeHead(200,{'Content-Type':'image/jpeg','Content-Length':size,'Cache-Control':'private, max-age=3600'});
-    fs.createReadStream(file).pipe(res);return true;
-  }catch(error){if(!res.headersSent)sendJson(res,401,{error:{code:error.code||'cover_denied',message:error.message||'Обложка недоступна',retryable:false}});else res.destroy();return true;}
-}
-
-async function federationAudio(req,res,url){
-  const match=/^\/federation\/v1\/tracks\/([0-9a-f-]{36})\/stream$/.exec(url.pathname);
-  if(!match||req.method!=='GET')return false;
-  let peer, acquired = false;
-  try{
-    const settings=await federationSettings(),identity=loadFederationIdentity(config.storageDir);
-    if(!settings.enabled||!identity)return sendJson(res,404,{error:{code:'federation_disabled',message:'Федерация выключена',retryable:false}}),true;
-    const remoteNodeId=String(req.headers['x-family-music-node']||'');peer=await db.prepare("SELECT node_id,public_key FROM federation_peers WHERE node_id=? AND status IN ('compatible','limited') AND revoked_at IS NULL").get(remoteNodeId);
-    if(!peer)return sendJson(res,403,{error:{code:'peer_not_trusted',message:'Нода не подключена или отозвана',retryable:false}}),true;
-    await verifyFederationRequest({method:req.method,targetUri:externalRequestUri(req,url),headers:req.headers,publicKey:peer.public_key,expectedNodeId:peer.node_id,consumeNonce:consumeFederationNonce});
-    const exportedTrack=await db.prepare('SELECT id,album FROM tracks WHERE id=?').get(match[1]);
-    if(!federationTrackVisible(exportedTrack,await federationExportSettings(peer.node_id)))return sendJson(res,403,{error:{code:'track_not_shared',message:'Трек не опубликован',retryable:false}}),true;
-    if(!acquireCounter(incomingFederationStreams,peer.node_id,4))return sendJson(res,429,{error:{code:'stream_limit',message:'Слишком много одновременных потоков',retryable:true}}),true;
-    acquired = true;
-    const quality=['original','aac_96','aac_192'].includes(url.searchParams.get('quality'))?url.searchParams.get('quality'):'original';
-    const selected=quality==='original'?await db.prepare('SELECT storage_key,mime_type,size_bytes,sha256 FROM tracks WHERE id=?').get(match[1]):await db.prepare("SELECT * FROM track_files WHERE track_id=? AND variant=? AND status='ready'").get(match[1],quality);
-    if(!selected){await db.prepare(`INSERT INTO track_files(track_id,variant,mime_type,codec,bitrate,status,priority) SELECT id,?,'audio/mp4','aac',?,'queued',100 FROM tracks WHERE id=? ON CONFLICT(track_id,variant) DO UPDATE SET status=CASE WHEN track_files.status='failed' THEN 'queued' ELSE track_files.status END,priority=GREATEST(track_files.priority,100),updated_at=CURRENT_TIMESTAMP`).run(quality,quality==='aac_96'?96000:192000,match[1]);releaseCounter(incomingFederationStreams,peer.node_id);acquired=false;return sendJson(res,409,{error:{code:'variant_not_ready',message:'AAC-вариант готовится, повторите запрос позже',retryable:true}}),true;}
-    const file=path.resolve(config.storageDir,selected.storage_key||'');if(!file.startsWith(config.storageDir+path.sep)||!fs.existsSync(file)){releaseCounter(incomingFederationStreams,peer.node_id);acquired=false;return sendJson(res,404,{error:{code:'file_not_found',message:'Аудиофайл не найден',retryable:false}}),true;}
-    const size=fs.statSync(file).size,range=String(url.searchParams.get('range')||''),rangeMatch=/^bytes=(\d*)-(\d*)$/.exec(range);let start=0,end=size-1,status=200;
-    if(range){if(!rangeMatch){releaseCounter(incomingFederationStreams,peer.node_id);acquired=false;res.writeHead(416,{'Content-Range':`bytes */${size}`});res.end();return true;}if(!rangeMatch[1]&&rangeMatch[2])start=Math.max(0,size-Number(rangeMatch[2]));else{start=rangeMatch[1]?Number(rangeMatch[1]):0;end=rangeMatch[2]?Math.min(Number(rangeMatch[2]),size-1):end;}if(!Number.isSafeInteger(start)||!Number.isSafeInteger(end)||start>end||start>=size){releaseCounter(incomingFederationStreams,peer.node_id);acquired=false;res.writeHead(416,{'Content-Range':`bytes */${size}`});res.end();return true;}status=206;}
-    res.writeHead(status,{'Content-Type':selected.mime_type||'audio/mp4','X-Music-Variant':quality,'X-Music-SHA256':selected.sha256||'', 'Accept-Ranges':'bytes','Content-Length':end-start+1,'Cache-Control':'private, no-store',...(status===206?{'Content-Range':`bytes ${start}-${end}/${size}`}:{})});
-    const stream=fs.createReadStream(file,{start,end});let released=false;const done=()=>{if(released)return;released=true;releaseCounter(incomingFederationStreams,peer.node_id);};stream.once('close',done);stream.once('error',()=>res.destroy());req.once('aborted',()=>stream.destroy());stream.pipe(res);return true;
-  }catch(error){if(acquired&&peer)releaseCounter(incomingFederationStreams,peer.node_id);if(!res.headersSent)sendJson(res,401,{error:{code:error.code||'stream_denied',message:error.message||'Поток отклонён',retryable:false}});else res.destroy();return true;}
-}
-
-let federationSyncBusy = false;
 async function syncFederationCatalogs() {
-  if (federationSyncBusy) return;
-  federationSyncBusy = true;
-  try {
-    const settings = await federationSettings(), identity = loadFederationIdentity(config.storageDir);
-    if (!settings.enabled || !identity) return;
-    const peers = await db.prepare("SELECT * FROM federation_peers WHERE status IN ('compatible','limited') AND revoked_at IS NULL AND next_sync_at<=CURRENT_TIMESTAMP ORDER BY next_sync_at LIMIT 4").all();
-    for (const peer of peers) try {
-      let cursor = peer.catalog_cursor || '', pages = 0, hasMore = true;
-      while (hasMore && pages++ < 4) {
-        const query = new URLSearchParams({ limit: '500' }); if (cursor) query.set('cursor', cursor);
-        const path = `/federation/v1/catalog/delta?${query}`, targetUri = `${peer.endpoint.replace(/\/$/, '')}${path}`;
-        const headers = signFederationRequest({ method: 'GET', targetUri, nodeId: identity.node_id, privateKeyPem: identity.private_key_pem });
-        const response = await getFederationJson(peer.endpoint, path, headers);
-        if (!verifyFederationResponse(response.bytes, response.headers, peer.node_id, peer.public_key)) throw Object.assign(new Error('Подпись ответа каталога не прошла проверку'), { code: 'invalid_response_signature' });
-        const page = response.body;
-        const removedReplicas = await applyFederationDeltaPage(db, peer.node_id, page);
-        for (const removed of removedReplicas) {
-          if (removed.storageKey) { const file=path.resolve(config.storageDir,removed.storageKey);if(file.startsWith(`${path.resolve(config.storageDir)}${path.sep}`))fs.rmSync(file,{force:true}); }
-          fs.rmSync(federationReplicaPaths(peer.node_id,removed.objectId).temporaryPath,{force:true});
-        }
-        cursor = page.next_cursor; hasMore = Boolean(page.has_more);
-      }
-    } catch (error) {
-      const failures = Number(peer.sync_failures || 0) + 1, delay = Math.min(3600, 15 * 2 ** Math.min(8, failures - 1)) + Math.floor(Math.random() * 10);
-      await db.prepare("UPDATE federation_peers SET sync_failures=?,sync_error=?,next_sync_at=CURRENT_TIMESTAMP+(?*INTERVAL '1 second'),updated_at=CURRENT_TIMESTAMP WHERE node_id=?").run(failures,String(error.message||error).slice(0,1000),delay,peer.node_id);
-    }
-  } finally { federationSyncBusy = false; }
+  const settings = await federation.settings();
+  const identity = loadFederationIdentity(config.storageDir);
+  if (settings.enabled && identity) await federationSync.sync(identity);
 }
 
-let federationNotifyBusy = false;
 async function notifyFederationPeers() {
-  if (federationNotifyBusy) return;
-  federationNotifyBusy = true;
-  try {
-    const settings=await federationSettings(),identity=loadFederationIdentity(config.storageDir);
-    if (!settings.enabled || !identity) return;
-    const head=Number((await db.prepare('SELECT COALESCE(max(revision),0) AS revision FROM federation_catalog_events').get()).revision);
-    const peers=await db.prepare("SELECT * FROM federation_peers WHERE status IN ('compatible','limited') AND revoked_at IS NULL AND last_notified_revision<? AND next_notify_at<=CURRENT_TIMESTAMP ORDER BY next_notify_at LIMIT 8").all(head);
-    for (const peer of peers) try {
-      const path='/federation/v1/catalog/notify',targetUri=`${peer.endpoint.replace(/\/$/,'')}${path}`;
-      const payload=JSON.stringify({ latest_revision:head,changed_at:new Date().toISOString() });
-      const headers=signFederationRequest({method:'POST',targetUri,body:payload,nodeId:identity.node_id,privateKeyPem:identity.private_key_pem});
-      await postFederationJson(peer.endpoint,path,payload,headers);
-      await db.prepare('UPDATE federation_peers SET last_notified_revision=?,next_notify_at=CURRENT_TIMESTAMP,notify_failures=0,notify_error=NULL WHERE node_id=?').run(head,peer.node_id);
-    } catch(error) {
-      const failures=Number(peer.notify_failures||0)+1,delay=Math.min(3600,15*2**Math.min(8,failures-1))+Math.floor(Math.random()*10);
-      await db.prepare("UPDATE federation_peers SET notify_failures=?,notify_error=?,next_notify_at=CURRENT_TIMESTAMP+(?*INTERVAL '1 second') WHERE node_id=?").run(failures,String(error.message||error).slice(0,1000),delay,peer.node_id);
-    }
-  } finally { federationNotifyBusy=false; }
+  const settings = await federation.settings();
+  const identity = loadFederationIdentity(config.storageDir);
+  if (settings.enabled && identity) await federationSync.notify(identity);
+}
+
+async function checkFederationPeers() {
+  const settings = await federation.settings();
+  if (settings.enabled) await federationAvailability.check(probeFederationEndpoint);
 }
 
 async function readJson(req, limit = 64 * 1024) {
@@ -421,23 +303,25 @@ const loudnessConcurrency = 2;
 let loudnessActive = 0;
 async function processNextLoudness() {
   if (loudnessActive >= loudnessConcurrency) return;
-  loudnessActive++; let job;
+  loudnessActive++; let job, finish; let succeeded = false;
   try {
     const result = await db.prepare(`UPDATE loudness_jobs SET status='processing',attempts=attempts+1,updated_at=CURRENT_TIMESTAMP
       WHERE id=(SELECT id FROM loudness_jobs WHERE status IN ('queued','retry') AND available_at<=CURRENT_TIMESTAMP ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *`).run();
     job = result.rows[0]; if (!job) return;
+    finish = operationMetrics.start('audio.loudness');
     const track = await db.prepare('SELECT storage_key FROM tracks WHERE id=?').get(job.track_id);
     if (!track || !storedFileExists(track.storage_key)) throw new Error('Исходный файл не найден');
     const output = await captureProcessOutput('ffmpeg', ['-hide_banner','-nostats','-i',path.join(config.storageDir,track.storage_key),'-map','0:a:0','-af','loudnorm=I=-14:TP=-1:LRA=11:print_format=json','-f','null','-']);
     const value = parseLoudness(output);
     await db.prepare(`UPDATE loudness_jobs SET status='ready',integrated_lufs=?,true_peak_db=?,loudness_range_lu=?,recommended_gain_db=?,error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?`)
       .run(value.integrated,value.peak,value.range,value.gain,job.id);
+    succeeded = true;
   } catch (error) {
     const message = String(error.message || error).slice(-2000), attempts = Number(job?.attempts || 0);
     if (job) await db.prepare(`UPDATE loudness_jobs SET status=?,available_at=CURRENT_TIMESTAMP + (? * INTERVAL '1 second'),error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`)
       .run(attempts >= 3 ? 'failed' : 'retry', Math.min(900, 30 * (2 ** Math.max(0,attempts-1))), message, job.id).catch(()=>{});
     console.error('Ошибка анализа громкости:', message);
-  } finally { loudnessActive--; }
+  } finally { await finish?.(succeeded); loudnessActive--; }
 }
 
 function pumpLoudness() {
@@ -513,12 +397,13 @@ let transcodeActive = 0;
 async function processNextTranscode() {
   if (transcodeActive >= 2) return;
   transcodeActive++;
-  let job;
+  let job, finish; let succeeded = false;
   try {
     const result = await db.prepare(`UPDATE track_files SET status='processing',updated_at=CURRENT_TIMESTAMP
       WHERE id=(SELECT id FROM track_files WHERE status IN ('queued','retry') ORDER BY priority DESC,updated_at,id FOR UPDATE SKIP LOCKED LIMIT 1)
       RETURNING *`).run();
     job = result.rows[0]; if (!job) return;
+    finish = operationMetrics.start('audio.transcode');
     const track = await db.prepare('SELECT storage_key FROM tracks WHERE id=?').get(job.track_id);
     if (!track) return await db.prepare("UPDATE track_files SET status='failed',error='Трек удалён',updated_at=CURRENT_TIMESTAMP WHERE id=?").run(job.id);
     const source = path.resolve(config.storageDir, track.storage_key), shard = job.track_id.slice(0, 2);
@@ -529,11 +414,12 @@ async function processNextTranscode() {
     if (!ok || !fs.existsSync(temporary)) throw new Error('ffmpeg не создал AAC');
     fs.renameSync(temporary, target); const size = fs.statSync(target).size;
     await db.prepare("UPDATE track_files SET status='ready',mime_type='audio/mp4',codec='aac',bitrate=?,size_bytes=?,storage_key=?,error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(job.variant === 'aac_96' ? 96000 : 192000, size, storageKey, job.id);
+    succeeded = true;
   } catch (error) {
     console.error('Ошибка транскодирования:', error);
     if (job) await db.prepare("UPDATE track_files SET status='failed',error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(String(error.message || error).slice(0,1000), job.id).catch(() => {});
   }
-  finally { transcodeActive--; }
+  finally { await finish?.(succeeded); transcodeActive--; }
 }
 
 function normalizedTags(format) {
@@ -562,192 +448,26 @@ let workerBusy = false;
 async function processNextJob() {
   if (workerBusy) return;
   workerBusy = true;
+  let finish; let succeeded = false;
   try {
     const job = await uploadJobs.claim();
     if (!job) return;
+    finish = operationMetrics.start('upload.process');
     const upload = await db.prepare('SELECT * FROM uploads WHERE id=?').get(job.upload_id);
     if (!upload || upload.status !== 'processing') {
       await uploadJobs.complete(job.id);
+      succeeded = true;
       return;
     }
     try {
       await uploadProcessor.process(upload);
       await uploadJobs.complete(job.id);
+      succeeded = true;
     } catch (error) {
       const result=await uploadJobs.failOrRetry(job,error);
       console.error(`Ошибка обработки загрузки ${job.upload_id}:`, result.message);
     }
-  } finally { workerBusy = false; }
-}
-
-let federationReplicaBusy = false;
-
-function federationReplicaPaths(nodeId, objectId) {
-  const shard = crypto.createHash('sha256').update(nodeId).digest('hex').slice(0, 16);
-  return {
-    temporaryPath: path.join(config.storageDir, 'federation', 'replicas', shard, `.${objectId}.part`),
-  };
-}
-
-const federationSourceId = (nodeId,objectId) => `${nodeId}\n${objectId}`;
-
-async function downloadFederationCover(nodeId,objectId,trackId){
-  const remote=await db.prepare('SELECT cover_available FROM federation_remote_tracks WHERE origin_node_id=? AND object_id=?').get(nodeId,objectId);
-  if(!remote?.cover_available)return null;
-  const peer=await db.prepare("SELECT * FROM federation_peers WHERE node_id=? AND revoked_at IS NULL AND status IN ('compatible','limited')").get(nodeId),identity=loadFederationIdentity(config.storageDir);
-  if(!peer||!identity)return null;
-  const remotePath=`/federation/v1/tracks/${encodeURIComponent(objectId)}/cover`,targetUri=`${peer.endpoint.replace(/\/$/,'')}${remotePath}`;
-  const headers=signFederationRequest({method:'GET',targetUri,nodeId:identity.node_id,privateKeyPem:identity.private_key_pem});
-  const upstream=await openFederationStream(peer.endpoint,remotePath,headers,{timeoutMs:15000}),status=upstream.response.statusCode||502;
-  if(status!==200){upstream.response.resume();return null;}
-  const declared=Number(upstream.response.headers['content-length']);
-  if(Number.isFinite(declared)&&(declared<1||declared>12*1024*1024)){upstream.response.destroy();throw new Error('Некорректный размер федеративной обложки');}
-  const temporary=path.join(uploadDir,`federation-cover-${crypto.randomUUID()}.image`);let received=0;
-  try{
-    const output=fs.createWriteStream(temporary,{flags:'wx',mode:0o640});
-    try{for await(const chunk of upstream.response){received+=chunk.length;if(received>12*1024*1024)throw new Error('Федеративная обложка превышает 12 МиБ');if(!output.write(chunk))await new Promise(resolve=>output.once('drain',resolve));}await new Promise((resolve,reject)=>output.end(error=>error?reject(error):resolve()));}catch(error){output.destroy();throw error;}
-    if(!received)return null;
-    return await extractCover(temporary,trackId);
-  }finally{fs.rmSync(temporary,{force:true});}
-}
-
-async function completeFederationImport(job, paths, mimeType, total, sha256) {
-  const remote=await db.prepare('SELECT * FROM federation_remote_tracks WHERE origin_node_id=? AND object_id=?').get(job.origin_node_id,job.object_id);
-  const likers=await db.prepare('SELECT user_id FROM federation_remote_likes WHERE origin_node_id=? AND object_id=? ORDER BY created_at').all(job.origin_node_id,job.object_id);
-  if(!remote||!likers.length){fs.rmSync(paths.temporaryPath,{force:true});await db.prepare("UPDATE federation_remote_replicas SET status='removed',received_bytes=0,error=NULL,updated_at=CURRENT_TIMESTAMP WHERE origin_node_id=? AND object_id=?").run(job.origin_node_id,job.object_id);return;}
-  const sourceId=federationSourceId(job.origin_node_id,job.object_id);
-  const duplicate=await db.prepare('SELECT id FROM tracks WHERE sha256=?').get(sha256);
-  if(duplicate){
-    fs.rmSync(paths.temporaryPath,{force:true});
-    const duplicateTrack=await db.prepare('SELECT cover_key FROM tracks WHERE id=?').get(duplicate.id);
-    let importedCover=null;if(!duplicateTrack?.cover_key)try{importedCover=await downloadFederationCover(job.origin_node_id,job.object_id,duplicate.id);}catch(error){console.error(`Не удалось импортировать обложку ${job.object_id}:`,error.message||error);}
-    await db.transaction(async tx=>{
-      if(importedCover)await tx.prepare('UPDATE tracks SET cover_key=?,cover_checked=1 WHERE id=? AND cover_key IS NULL').run(importedCover,duplicate.id);
-      for(const liker of likers)await tx.prepare('INSERT INTO track_likes(user_id,track_id) VALUES(?,?) ON CONFLICT DO NOTHING').run(liker.user_id,duplicate.id);
-      await tx.prepare("INSERT INTO track_sources(source,source_id,track_id) VALUES('federation',?,?) ON CONFLICT(source,source_id) DO UPDATE SET track_id=excluded.track_id").run(sourceId,duplicate.id);
-      await tx.prepare('DELETE FROM federation_remote_likes WHERE origin_node_id=? AND object_id=?').run(job.origin_node_id,job.object_id);
-      await tx.prepare("UPDATE federation_remote_replicas SET status='imported',local_track_id=?,storage_key=NULL,mime_type=?,size_bytes=?,received_bytes=?,sha256=?,error=NULL,updated_at=CURRENT_TIMESTAMP WHERE origin_node_id=? AND object_id=?").run(duplicate.id,mimeType,total,total,sha256,job.origin_node_id,job.object_id);
-    });
-    return;
-  }
-  const trackId=crypto.randomUUID(),shard=trackId.slice(0,2),destinationDir=path.join(originalDir,shard),destination=path.join(destinationDir,trackId);
-  fs.mkdirSync(destinationDir,{recursive:true,mode:0o750});
-  let coverKey=await extractCover(paths.temporaryPath,trackId);
-  if(!coverKey)try{coverKey=await downloadFederationCover(job.origin_node_id,job.object_id,trackId);}catch(error){console.error(`Не удалось импортировать обложку ${job.object_id}:`,error.message||error);}
-  fs.renameSync(paths.temporaryPath,destination);
-  try{
-    await db.transaction(async tx=>{
-      await tx.prepare(`INSERT INTO tracks(id,owner_id,title,artist,album,filename,mime_type,size_bytes,duration_seconds,storage_key,sha256,cover_key,cover_checked,genre,year,track_number,disc_number)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?)`).run(trackId,likers[0].user_id,remote.title||'Без названия',remote.artist||'Неизвестный исполнитель',remote.album||'',`${remote.artist||'Исполнитель'} - ${remote.title||trackId}`,mimeType,total,remote.duration_seconds,path.posix.join('originals',shard,trackId),sha256,coverKey,remote.genre||'',remote.year,remote.track_number,remote.disc_number);
-      for(const liker of likers)await tx.prepare('INSERT INTO track_likes(user_id,track_id) VALUES(?,?) ON CONFLICT DO NOTHING').run(liker.user_id,trackId);
-      await tx.prepare("INSERT INTO track_sources(source,source_id,track_id) VALUES('federation',?,?)").run(sourceId,trackId);
-      await tx.prepare('DELETE FROM federation_remote_likes WHERE origin_node_id=? AND object_id=?').run(job.origin_node_id,job.object_id);
-      await tx.prepare("UPDATE federation_remote_replicas SET status='imported',local_track_id=?,storage_key=NULL,mime_type=?,size_bytes=?,received_bytes=?,sha256=?,error=NULL,updated_at=CURRENT_TIMESTAMP WHERE origin_node_id=? AND object_id=?").run(trackId,mimeType,total,total,sha256,job.origin_node_id,job.object_id);
-    });
-  }catch(error){fs.renameSync(destination,paths.temporaryPath);if(coverKey)fs.rmSync(path.join(config.storageDir,coverKey),{force:true});throw error;}
-}
-
-async function claimFederationReplica() {
-  return db.transaction(async tx => {
-    const result = await tx.prepare(`UPDATE federation_remote_replicas SET status='downloading',attempts=attempts+1,error=NULL,updated_at=CURRENT_TIMESTAMP
-      WHERE (origin_node_id,object_id)=(SELECT origin_node_id,object_id FROM federation_remote_replicas
-        WHERE status IN ('queued','retry') AND available_at<=CURRENT_TIMESTAMP ORDER BY updated_at FOR UPDATE SKIP LOCKED LIMIT 1)
-      RETURNING *`).run();
-    return result.rows[0] ?? null;
-  });
-}
-
-async function processNextFederationReplica() {
-  if (federationReplicaBusy) return;
-  federationReplicaBusy = true;
-  let job;
-  try {
-    job = await claimFederationReplica();
-    if (!job) return;
-    const peer = await db.prepare("SELECT * FROM federation_peers WHERE node_id=? AND revoked_at IS NULL AND status IN ('compatible','limited')").get(job.origin_node_id);
-    const identity = loadFederationIdentity(config.storageDir);
-    if (!peer || !identity) throw new Error('Исходная нода недоступна или доверие отозвано');
-
-    const paths = federationReplicaPaths(job.origin_node_id, job.object_id);
-    fs.mkdirSync(path.dirname(paths.temporaryPath), { recursive: true, mode: 0o750 });
-    let offset = fs.existsSync(paths.temporaryPath) ? fs.statSync(paths.temporaryPath).size : 0;
-    if(offset&&Number(job.size_bytes)===offset&&/^[0-9a-f]{64}$/.test(String(job.sha256||''))){
-      const existingSha=await sha256File(paths.temporaryPath);
-      if(existingSha===job.sha256){await completeFederationImport(job,paths,job.mime_type||'application/octet-stream',offset,existingSha);return;}
-      fs.rmSync(paths.temporaryPath,{force:true});offset=0;
-    }
-    const query = new URLSearchParams({ quality: 'original' });
-    if (offset) query.set('range', `bytes=${offset}-`);
-    const remotePath = `/federation/v1/tracks/${encodeURIComponent(job.object_id)}/stream?${query}`;
-    const targetUri = `${peer.endpoint.replace(/\/$/, '')}${remotePath}`;
-    const headers = signFederationRequest({ method: 'GET', targetUri, nodeId: identity.node_id, privateKeyPem: identity.private_key_pem });
-    const upstream = await openFederationStream(peer.endpoint, remotePath, headers, { timeoutMs: 30000 });
-    const status = upstream.response.statusCode || 502;
-    if (status !== 200 && status !== 206) {
-      upstream.response.resume();
-      throw new Error(`Исходная нода вернула HTTP ${status}`);
-    }
-    if (offset && status !== 206) {
-      fs.rmSync(paths.temporaryPath, { force: true });
-      offset = 0;
-    }
-    const range = String(upstream.response.headers['content-range'] || '').match(/^bytes (\d+)-(\d+)\/(\d+)$/);
-    if (status === 206 && (!range || Number(range[1]) !== offset)) {
-      upstream.response.destroy();
-      throw new Error('Исходная нода вернула неверный Content-Range');
-    }
-    const contentLength = Number(upstream.response.headers['content-length']);
-    const total = range ? Number(range[3]) : contentLength;
-    if (!Number.isSafeInteger(total) || total <= 0) {
-      upstream.response.destroy();
-      throw new Error('Исходная нода не сообщила корректный размер оригинала');
-    }
-    await db.prepare("UPDATE federation_remote_replicas SET size_bytes=?,received_bytes=?,updated_at=CURRENT_TIMESTAMP WHERE origin_node_id=? AND object_id=? AND status='downloading'")
-      .run(total,offset,job.origin_node_id,job.object_id);
-    const output = fs.createWriteStream(paths.temporaryPath, { flags: offset ? 'a' : 'w', mode: 0o640 });
-    let received = offset, reported = offset;
-    try {
-      for await (const chunk of upstream.response) {
-        received += chunk.length;
-        if (received > total) throw new Error('Получено больше заявленного размера оригинала');
-        if (!output.write(chunk)) await new Promise(resolve => output.once('drain', resolve));
-        if (received - reported >= 1024 * 1024) {
-          reported = received;
-          await db.prepare("UPDATE federation_remote_replicas SET received_bytes=?,updated_at=CURRENT_TIMESTAMP WHERE origin_node_id=? AND object_id=? AND status='downloading'")
-            .run(received,job.origin_node_id,job.object_id);
-        }
-      }
-      await new Promise((resolve, reject) => output.end(error => error ? reject(error) : resolve()));
-    } catch (error) {
-      output.destroy();
-      throw error;
-    }
-    if (received !== total) throw new Error(`Оригинал загружен не полностью: ${received} из ${total}`);
-    const actualSha256 = await sha256File(paths.temporaryPath);
-    const expectedSha256 = String(upstream.response.headers['x-music-sha256'] || '').toLowerCase();
-    if (expectedSha256 && !/^[0-9a-f]{64}$/.test(expectedSha256)) throw new Error('Исходная нода вернула некорректный SHA-256');
-    if (expectedSha256 && actualSha256 !== expectedSha256) throw new Error('SHA-256 реплики не совпадает с оригиналом');
-    const current = await db.prepare('SELECT status FROM federation_remote_replicas WHERE origin_node_id=? AND object_id=?').get(job.origin_node_id,job.object_id);
-    if (!current || current.status !== 'downloading') { fs.rmSync(paths.temporaryPath,{force:true}); return; }
-    await completeFederationImport(job,paths,String(upstream.response.headers['content-type']||'application/octet-stream'),total,actualSha256);
-  } catch (error) {
-    if (job) {
-      const paths = federationReplicaPaths(job.origin_node_id, job.object_id);
-      const received = fs.existsSync(paths.temporaryPath) ? fs.statSync(paths.temporaryPath).size : 0;
-      const delay = Math.min(3600, 10 * (2 ** Math.min(8, Math.max(0, Number(job.attempts) - 1))));
-      await db.prepare("UPDATE federation_remote_replicas SET status='retry',received_bytes=?,available_at=CURRENT_TIMESTAMP+(? * INTERVAL '1 second'),error=?,updated_at=CURRENT_TIMESTAMP WHERE origin_node_id=? AND object_id=?")
-        .run(received,delay,String(error.message||error).slice(0,1000),job.origin_node_id,job.object_id);
-      console.error(`Ошибка репликации ${job.object_id}:`, error.message || error);
-    }
-  } finally { federationReplicaBusy = false; }
-}
-
-async function recoverFederationReplicas() {
-  await db.prepare("UPDATE federation_remote_replicas SET status='retry',available_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE status='downloading'").run();
-  const ready=await db.prepare("SELECT * FROM federation_remote_replicas WHERE status='ready' AND storage_key IS NOT NULL").all();
-  for(const replica of ready){const paths=federationReplicaPaths(replica.origin_node_id,replica.object_id),source=path.resolve(config.storageDir,replica.storage_key);fs.mkdirSync(path.dirname(paths.temporaryPath),{recursive:true,mode:0o750});if(source.startsWith(`${path.resolve(config.storageDir)}${path.sep}`)&&fs.existsSync(source))fs.renameSync(source,paths.temporaryPath);await db.prepare("UPDATE federation_remote_replicas SET status='queued',storage_key=NULL,available_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE origin_node_id=? AND object_id=?").run(replica.origin_node_id,replica.object_id);}
-  await db.prepare(`INSERT INTO federation_remote_replicas(origin_node_id,object_id,status)
-    SELECT DISTINCT origin_node_id,object_id,'queued' FROM federation_remote_likes ON CONFLICT(origin_node_id,object_id) DO NOTHING`).run();
+  } finally { await finish?.(succeeded); workerBusy = false; }
 }
 
 async function cleanupAbandonedUploads() {
@@ -782,7 +502,7 @@ async function updateWorkerHeartbeat() {
 }
 
 async function adminMetrics() {
-  const [heartbeat, uploads, transcodes, recognition, loudness, replicas, summary, federation] = await Promise.all([
+  const [heartbeat, uploads, transcodes, recognition, loudness, replicas, summary, federation, operations] = await Promise.all([
     db.prepare(`SELECT started_at,last_seen_at,EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP-last_seen_at)) AS age_seconds
       FROM service_heartbeats WHERE service='worker'`).get(),
     db.prepare(`SELECT status,count(*) AS count,COALESCE(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP-min(updated_at))),0) AS oldest_seconds
@@ -805,17 +525,20 @@ async function adminMetrics() {
       (SELECT count(*) FROM federation_playlist_tracks) remote_playlist_tracks,
       COALESCE(max(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP-last_synced_at))) FILTER(WHERE revoked_at IS NULL),0) oldest_sync_seconds,
       count(*) FILTER(WHERE sync_error IS NOT NULL) sync_errors,count(*) FILTER(WHERE notify_error IS NOT NULL) notify_errors FROM federation_peers`).get(),
+    db.prepare(`SELECT name,count,error_count,duration_ms_total,duration_ms_max,last_duration_ms,last_succeeded,last_finished_at
+      FROM operation_metrics ORDER BY name`).all(),
   ]);
   const queue = rows => Object.fromEntries(rows.map(row => [row.status, { count: Number(row.count), oldest_seconds: Math.round(Number(row.oldest_seconds)) }]));
   const workerAge = heartbeat ? Math.round(Number(heartbeat.age_seconds)) : null;
   return {
     generated_at: new Date().toISOString(),
     status: workerAge !== null && workerAge <= 45 ? 'ok' : 'degraded',
-    api: { uptime_seconds: Math.floor(process.uptime()), started_at: processStartedAt.toISOString(), requests: httpMetrics.requests, errors_5xx: httpMetrics.errors5xx, memory_rss_bytes: process.memoryUsage().rss },
+    api: { uptime_seconds:Math.floor(process.uptime()), started_at:processStartedAt.toISOString(), ...httpMetricSnapshot(httpMetrics), memory_rss_bytes:process.memoryUsage().rss },
     worker: { status: workerAge !== null && workerAge <= 45 ? 'ok' : 'stale', last_seen_at: heartbeat?.last_seen_at ?? null, age_seconds: workerAge },
     queues: { uploads: queue(uploads), transcodes: queue(transcodes), recognition: queue(recognition), loudness: queue(loudness), federation_replicas: queue(replicas) },
+    operations: operationMetricSnapshot(operations),
     summary: Object.fromEntries(Object.entries(summary).map(([key,value]) => [key, Number(value)])),
-    federation: {...Object.fromEntries(Object.entries(federation).map(([key,value])=>[key,Number(value||0)])),incoming_streams:[...incomingFederationStreams.values()].reduce((sum,value)=>sum+value,0),outgoing_streams:[...outgoingFederationStreams.values()].reduce((sum,value)=>sum+value,0)},
+    federation: {...Object.fromEntries(Object.entries(federation).map(([key,value])=>[key,Number(value||0)])),...federationMedia.stats()},
   };
 }
 
@@ -1018,7 +741,7 @@ async function api(req, res, url, apiPrefix = '/api') {
   }
   if (url.pathname === '/api/admin/federation' && req.method === 'GET') {
     if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
-    const settings = await federationSettings(), identity = loadFederationIdentity(config.storageDir);
+    const settings = await federation.settings(), identity = loadFederationIdentity(config.storageDir);
     const availableAlbums = await db.prepare(`SELECT album AS name,count(*) AS track_count,max(year) AS year,min(artist) AS artist
       FROM tracks WHERE album<>'' GROUP BY album ORDER BY album COLLATE "C" LIMIT 1000`).all();
     const collections = await db.prepare(`SELECT collection.id,collection.name,count(item.track_id) AS track_count
@@ -1033,7 +756,7 @@ async function api(req, res, url, apiPrefix = '/api') {
     const selectedCollections = [...new Set((Array.isArray(body.selected_collections) ? body.selected_collections : []).map(value => String(value).trim()).filter(Boolean))].slice(0, 1000);
     const existingCollections = selectedCollections.length ? (await db.prepare('SELECT id FROM federation_export_collections WHERE id=ANY(?::text[])').all(selectedCollections)).map(item=>item.id) : [];
     if (existingCollections.length !== selectedCollections.length) return sendJson(res,400,{error:'Выбрана несуществующая коллекция'});
-    const previousSettings = await federationExportSettings();
+    const previousSettings = await federation.exportSettings();
     const selectedTrackIds = selectedCollections.length ? (await db.prepare('SELECT DISTINCT track_id FROM federation_export_collection_tracks WHERE collection_id=ANY(?::text[])').all(selectedCollections)).map(item=>item.track_id) : [];
     const nextSettings = { export_policy: exportPolicy, selected_albums: selectedAlbums, selected_collections: selectedCollections, selected_track_ids:selectedTrackIds };
     const endpoints = validateFederationEndpoints(body.endpoints ?? []);
@@ -1096,7 +819,7 @@ async function api(req, res, url, apiPrefix = '/api') {
     if(!user.is_admin)return sendJson(res,403,{error:'Доступно только администратору'});
     const collection=await db.prepare('SELECT id FROM federation_export_collections WHERE id=?').get(collectionMatch[1]);if(!collection)return sendJson(res,404,{error:'Коллекция не найдена'});
     const oldIds=(await db.prepare('SELECT track_id FROM federation_export_collection_tracks WHERE collection_id=?').all(collection.id)).map(item=>item.track_id);
-    await db.transaction(async tx=>{await tx.prepare('DELETE FROM federation_export_collections WHERE id=?').run(collection.id);const setting=await tx.prepare("SELECT value FROM app_settings WHERE key='federation_export_collections'").get();if(setting)await tx.prepare("UPDATE app_settings SET value=?,updated_at=CURRENT_TIMESTAMP WHERE key='federation_export_collections'").run(JSON.stringify(parseSettingList(setting.value).filter(id=>id!==collection.id)));const rules=await tx.prepare('SELECT peer_node_id,selected_collections_json FROM federation_peer_export_rules').all();for(const rule of rules)await tx.prepare('UPDATE federation_peer_export_rules SET selected_collections_json=?,updated_at=CURRENT_TIMESTAMP WHERE peer_node_id=?').run(JSON.stringify(parseSettingList(rule.selected_collections_json).filter(id=>id!==collection.id)),rule.peer_node_id);await appendFederationTrackRefreshEvents(tx,oldIds);});
+    await db.transaction(async tx=>{await tx.prepare('DELETE FROM federation_export_collections WHERE id=?').run(collection.id);const setting=await tx.prepare("SELECT value FROM app_settings WHERE key='federation_export_collections'").get();if(setting)await tx.prepare("UPDATE app_settings SET value=?,updated_at=CURRENT_TIMESTAMP WHERE key='federation_export_collections'").run(JSON.stringify(parseFederationSettingList(setting.value).filter(id=>id!==collection.id)));const rules=await tx.prepare('SELECT peer_node_id,selected_collections_json FROM federation_peer_export_rules').all();for(const rule of rules)await tx.prepare('UPDATE federation_peer_export_rules SET selected_collections_json=?,updated_at=CURRENT_TIMESTAMP WHERE peer_node_id=?').run(JSON.stringify(parseFederationSettingList(rule.selected_collections_json).filter(id=>id!==collection.id)),rule.peer_node_id);await appendFederationTrackRefreshEvents(tx,oldIds);});
     return sendJson(res,200,{ok:true});
   }
   if (url.pathname === '/api/admin/federation/check-endpoint' && req.method === 'POST') {
@@ -1107,39 +830,30 @@ async function api(req, res, url, apiPrefix = '/api') {
   }
   if (url.pathname === '/api/admin/federation/invitations' && req.method === 'GET') {
     if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
-    const items = await db.prepare(`SELECT id,endpoint,expires_at,used_at,revoked_at,created_at,
-      CASE WHEN revoked_at IS NOT NULL THEN 'revoked' WHEN used_at IS NOT NULL THEN 'used' WHEN expires_at<=CURRENT_TIMESTAMP THEN 'expired' ELSE 'active' END AS status
-      FROM federation_invitations ORDER BY created_at DESC LIMIT 50`).all();
+    const items = await federation.listInvitations();
     return sendJson(res, 200, { items });
   }
   if (url.pathname === '/api/admin/federation/invitations' && req.method === 'POST') {
     if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
-    const settings = await federationSettings(), identity = loadFederationIdentity(config.storageDir);
+    const settings = await federation.settings(), identity = loadFederationIdentity(config.storageDir);
     if (!settings.enabled || !identity) return sendJson(res, 409, { error: 'Сначала создайте identity и включите федерацию' });
     const publicEndpoint = settings.endpoints.find(item => item.scope === 'public')?.url;
     if (!publicEndpoint) return sendJson(res, 409, { error: 'Сначала сохраните публичный endpoint' });
     const body = await readJson(req), minutes = Math.max(5, Math.min(60, Number(body.expires_minutes) || 15));
     const id = crypto.randomUUID(), secret = randomToken(), expiresAt = new Date(Date.now() + minutes * 60000).toISOString();
-    await db.prepare('INSERT INTO federation_invitations(id,secret_hash,endpoint,expires_at,created_by) VALUES(?,?,?,?,?)')
-      .run(id, tokenHash(secret), publicEndpoint, expiresAt, user.id);
+    await federation.createInvitation({ id, secretHash:tokenHash(secret), endpoint:publicEndpoint, expiresAt, createdBy:user.id });
     const invitation = { version: 1, invitation_id: id, issuer_node_id: identity.node_id, endpoint: publicEndpoint, public_key: identity.public_key, secret, expires_at: expiresAt };
-    return sendJson(res, 201, { invitation, code: `fm-invite-v1:${Buffer.from(JSON.stringify(invitation)).toString('base64url')}` });
+    return sendJson(res, 201, { invitation, code: encodeFederationInvitationCode(invitation) });
   }
   const invitationDelete = /^\/api\/admin\/federation\/invitations\/([0-9a-f-]{36})$/.exec(url.pathname);
   if (invitationDelete && req.method === 'DELETE') {
     if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
-    const result = await db.prepare('UPDATE federation_invitations SET revoked_at=CURRENT_TIMESTAMP WHERE id=? AND used_at IS NULL AND revoked_at IS NULL RETURNING id').run(invitationDelete[1]);
-    if (!result.changes) return sendJson(res, 404, { error: 'Активное приглашение не найдено' });
+    if (!await federation.revokeInvitation(invitationDelete[1])) return sendJson(res, 404, { error: 'Активное приглашение не найдено' });
     return sendJson(res, 200, { ok: true });
   }
   if (url.pathname === '/api/admin/federation/peers' && req.method === 'GET') {
     if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
-    const items = await db.prepare(`SELECT federation_peers.node_id,federation_peers.label,federation_peers.endpoint,federation_peers.status,federation_peers.protocol_major,federation_peers.protocol_minor,federation_peers.capabilities_json,federation_peers.created_at,federation_peers.updated_at,federation_peers.last_seen_at,federation_peers.revoked_at,
-      federation_peers.catalog_cursor,federation_peers.last_synced_at,federation_peers.next_sync_at,federation_peers.sync_failures,federation_peers.sync_error,federation_peers.remote_latest_revision,federation_peers.last_notified_revision,federation_peers.notify_failures,federation_peers.notify_error,
-      (SELECT count(*) FROM federation_remote_tracks WHERE origin_node_id=federation_peers.node_id) AS remote_tracks,
-      rule.policy AS export_policy,rule.selected_albums_json,rule.selected_collections_json
-      FROM federation_peers LEFT JOIN federation_peer_export_rules rule ON rule.peer_node_id=federation_peers.node_id ORDER BY federation_peers.created_at DESC`).all();
-    return sendJson(res, 200, { items: items.map(item => ({ ...item, export_policy:item.export_policy||'inherit',selected_albums:parseSettingList(item.selected_albums_json),selected_collections:parseSettingList(item.selected_collections_json),selected_albums_json:undefined,selected_collections_json:undefined,capabilities: JSON.parse(item.capabilities_json || '{}'), capabilities_json: undefined })) });
+    return sendJson(res, 200, { items: await federation.listPeers() });
   }
   const peerPolicyMatch=/^\/api\/admin\/federation\/peers\/(fm:[A-Za-z0-9_-]{16,128})\/export-policy$/.exec(url.pathname);
   if(peerPolicyMatch&&req.method==='PUT'){
@@ -1147,7 +861,7 @@ async function api(req, res, url, apiPrefix = '/api') {
     const peer=await db.prepare('SELECT node_id FROM federation_peers WHERE node_id=? AND revoked_at IS NULL').get(peerPolicyMatch[1]);if(!peer)return sendJson(res,404,{error:'Активная нода не найдена'});
     const body=await readJson(req),policy=['inherit','none','all','albums','collections'].includes(body.policy)?body.policy:'inherit',selectedAlbums=[...new Set((Array.isArray(body.selected_albums)?body.selected_albums:[]).map(value=>String(value).trim()).filter(Boolean))].slice(0,1000),selectedCollections=[...new Set((Array.isArray(body.selected_collections)?body.selected_collections:[]).map(String))].slice(0,1000);
     const existing=selectedCollections.length?(await db.prepare('SELECT id FROM federation_export_collections WHERE id=ANY(?::text[])').all(selectedCollections)).map(item=>item.id):[];if(existing.length!==selectedCollections.length)return sendJson(res,400,{error:'Выбрана несуществующая коллекция'});
-    const previous=await federationExportSettings(peer.node_id),selectedTrackIds=selectedCollections.length?(await db.prepare('SELECT DISTINCT track_id FROM federation_export_collection_tracks WHERE collection_id=ANY(?::text[])').all(selectedCollections)).map(item=>item.track_id):[],global=await federationExportSettings(),next=policy==='inherit'?global:{...global,export_policy:policy,selected_albums:selectedAlbums,selected_collections:selectedCollections,selected_track_ids:selectedTrackIds};
+    const previous=await federation.exportSettings(peer.node_id),selectedTrackIds=selectedCollections.length?(await db.prepare('SELECT DISTINCT track_id FROM federation_export_collection_tracks WHERE collection_id=ANY(?::text[])').all(selectedCollections)).map(item=>item.track_id):[],global=await federation.exportSettings(),next=policy==='inherit'?global:{...global,export_policy:policy,selected_albums:selectedAlbums,selected_collections:selectedCollections,selected_track_ids:selectedTrackIds};
     await db.transaction(async tx=>{await tx.prepare(`INSERT INTO federation_peer_export_rules(peer_node_id,policy,selected_albums_json,selected_collections_json,updated_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP)
       ON CONFLICT(peer_node_id) DO UPDATE SET policy=excluded.policy,selected_albums_json=excluded.selected_albums_json,selected_collections_json=excluded.selected_collections_json,updated_at=CURRENT_TIMESTAMP`).run(peer.node_id,policy,JSON.stringify(selectedAlbums),JSON.stringify(selectedCollections));await appendFederationVisibilityEvents(tx,previous,next);});
     return sendJson(res,200,{ok:true,policy,selected_albums:selectedAlbums,selected_collections:selectedCollections});
@@ -1155,43 +869,21 @@ async function api(req, res, url, apiPrefix = '/api') {
   if (url.pathname === '/api/admin/federation/accept' && req.method === 'POST') {
     if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
     try {
-    const settings = await federationSettings(), identity = loadFederationIdentity(config.storageDir);
+    const settings = await federation.settings(), identity = loadFederationIdentity(config.storageDir);
     if (!settings.enabled || !identity) return sendJson(res, 409, { error: 'Сначала создайте identity и включите федерацию' });
     if (!settings.endpoints.some(item => item.scope === 'public')) return sendJson(res, 409, { error: 'Сначала сохраните публичный endpoint этой ноды' });
-    const input = String((await readJson(req)).code || '').trim(), prefix = 'fm-invite-v1:';
-    if (!input.startsWith(prefix) || input.length > 16384) return sendJson(res, 400, { error: 'Некорректный код приглашения' });
-    let invitation;
-    try { invitation = JSON.parse(Buffer.from(input.slice(prefix.length), 'base64url').toString('utf8')); } catch { return sendJson(res, 400, { error: 'Некорректный код приглашения' }); }
+    const invitation = decodeFederationInvitationCode((await readJson(req)).code);
+    if (!invitation) return sendJson(res, 400, { error: 'Некорректный код приглашения' });
     if (invitation.version !== 1 || !invitation.invitation_id || !invitation.secret || Date.parse(invitation.expires_at) <= Date.now()) return sendJson(res, 400, { error: 'Приглашение повреждено или истекло' });
-    const described = describePublicKeyValue(String(invitation.public_key || ''));
-    if (described.nodeId !== invitation.issuer_node_id) return sendJson(res, 400, { error: 'node_id приглашения не соответствует ключу' });
-    if (invitation.issuer_node_id === identity.node_id) return sendJson(res, 409, { error: 'Нельзя принять приглашение собственной ноды' });
-    const probe = await probeFederationEndpoint(invitation.endpoint, 'public');
-    if (probe.node_id !== invitation.issuer_node_id) return sendJson(res, 409, { error: 'Endpoint отвечает от имени другой ноды' });
-    const challenge = randomToken(), node = publicNodeDescriptor(identity, { softwareVersion, endpoints: settings.endpoints });
-    const payload = JSON.stringify({ invitation_id: invitation.invitation_id, secret: invitation.secret, challenge, node });
-    const targetUri = `${String(invitation.endpoint).replace(/\/$/, '')}/federation/v1/pairing/accept`;
-    const headers = signFederationRequest({ method: 'POST', targetUri, body: payload, nodeId: identity.node_id, privateKeyPem: identity.private_key_pem });
-    const response = await postFederationJson(invitation.endpoint, '/federation/v1/pairing/accept', payload, headers);
-    const issuer = response.node || {}, issuerDescription = describePublicKeyValue(String(issuer.public_key?.value || ''));
-    if (issuer.node_id !== invitation.issuer_node_id || issuerDescription.nodeId !== invitation.issuer_node_id || issuer.public_key.value !== invitation.public_key) return sendJson(res, 409, { error: 'Ответ подписан неожиданной identity' });
-    const confirmationValues = { invitationId: invitation.invitation_id, requesterNodeId: identity.node_id, issuerNodeId: issuer.node_id, challenge };
-    if (!verifyPairingConfirmation(confirmationValues, String(response.confirmation || ''), issuer.public_key.value)) return sendJson(res, 409, { error: 'Не удалось проверить подтверждение pairing' });
-    const negotiation = negotiateFederation(issuer, ['pairing.v1']);
-    const remoteMinor = negotiation.minor ?? 0, status = negotiation.status;
-    await db.prepare(`INSERT INTO federation_peers(node_id,label,public_key,endpoint,status,protocol_major,protocol_minor,capabilities_json,last_seen_at)
-      VALUES(?,?,?,?,?,1,?,?,CURRENT_TIMESTAMP) ON CONFLICT(node_id) DO UPDATE SET public_key=excluded.public_key,endpoint=excluded.endpoint,status=excluded.status,protocol_minor=excluded.protocol_minor,capabilities_json=excluded.capabilities_json,updated_at=CURRENT_TIMESTAMP,last_seen_at=CURRENT_TIMESTAMP,revoked_at=NULL`)
-      .run(issuer.node_id, '', issuer.public_key.value, invitation.endpoint, status, Math.max(0, remoteMinor), JSON.stringify(issuer.capabilities || {}));
-    return sendJson(res, 200, { ok: true, node_id: issuer.node_id, endpoint: invitation.endpoint, status });
+    return sendJson(res, 200, await federationPairing.connect({ invitation, identity, settings }));
     } catch (error) {
-      return sendJson(res, 422, { error: error.message || 'Не удалось подключить ноду', code: error.code || 'pairing_failed' });
+      return sendJson(res, error.status || 422, { error: error.message || 'Не удалось подключить ноду', code: error.code || 'pairing_failed' });
     }
   }
   const peerDelete = /^\/api\/admin\/federation\/peers\/(fm:[A-Za-z0-9_-]{16,128})$/.exec(url.pathname);
   if (peerDelete && req.method === 'DELETE') {
     if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
-    const result = await db.prepare("UPDATE federation_peers SET status='revoked',revoked_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE node_id=? AND revoked_at IS NULL RETURNING node_id").run(peerDelete[1]);
-    if (!result.changes) return sendJson(res, 404, { error: 'Активная нода не найдена' });
+    if (!await federation.revokePeer(peerDelete[1])) return sendJson(res, 404, { error: 'Активная нода не найдена' });
     return sendJson(res, 200, { ok: true });
   }
   if (url.pathname === '/api/admin/recognition-settings' && req.method === 'PUT') {
@@ -1344,14 +1036,14 @@ async function api(req, res, url, apiPrefix = '/api') {
   if (url.pathname === '/api/federation/search' && req.method === 'GET') {
     const query=String(url.searchParams.get('q')||'').trim().slice(0,120),nodeId=String(url.searchParams.get('node_id')||''),queueRequest=url.searchParams.get('queue')==='1',limit=Math.min(queueRequest?10000:100,Math.max(1,Number(url.searchParams.get('limit'))||30)),offset=Math.max(0,Number(url.searchParams.get('offset'))||0);
     if(query.length<2&&!nodeId)return sendJson(res,200,{items:[],artists:[],albums:[],total:0,offset,limit,has_more:false});
-    const params={query:`%${query}%`,node_id:nodeId,limit,offset,user_id:user.id};
+    const params={query:`%${query}%`,node_id:nodeId,limit,offset,user_id:user.id},queueOnline=queueRequest?`AND ${FEDERATION_QUEUE_ONLINE_SQL}`:'';
     const filter=`${nodeId?'remote.origin_node_id=@node_id AND ':''}(remote.title ILIKE @query OR remote.artist ILIKE @query OR remote.album ILIKE @query OR remote.genre ILIKE @query)`;
-    const total=Number((await db.prepare(`SELECT count(*) count FROM federation_remote_tracks remote JOIN federation_peers peer ON peer.node_id=remote.origin_node_id WHERE peer.revoked_at IS NULL AND peer.status<>'revoked' AND ${filter}`).get(params)).count);
-    const rows=await db.prepare(`SELECT remote.*,peer.endpoint,peer.label,peer.status,peer.last_synced_at,peer.sync_error,
+    const total=Number((await db.prepare(`SELECT count(*) count FROM federation_remote_tracks remote JOIN federation_peers peer ON peer.node_id=remote.origin_node_id WHERE peer.revoked_at IS NULL AND peer.status<>'revoked' ${queueOnline} AND ${filter}`).get(params)).count);
+    const rows=await db.prepare(`SELECT remote.*,peer.endpoint,peer.label,peer.status,peer.last_synced_at,peer.sync_error,peer.stream_unavailable_until,
       (EXISTS(SELECT 1 FROM federation_remote_likes likes WHERE likes.user_id=@user_id AND likes.origin_node_id=remote.origin_node_id AND likes.object_id=remote.object_id) OR EXISTS(SELECT 1 FROM track_sources source JOIN track_likes local_like ON local_like.track_id=source.track_id WHERE source.source='federation' AND source.source_id=remote.origin_node_id||E'\n'||remote.object_id AND local_like.user_id=@user_id)) AS liked,
-      (peer.sync_error IS NOT NULL OR peer.last_synced_at<CURRENT_TIMESTAMP-INTERVAL '10 minutes') AS offline
+      (peer.sync_error IS NOT NULL OR peer.last_synced_at<CURRENT_TIMESTAMP-INTERVAL '10 minutes' OR peer.stream_unavailable_until>CURRENT_TIMESTAMP) AS offline
       FROM federation_remote_tracks remote JOIN federation_peers peer ON peer.node_id=remote.origin_node_id
-      WHERE peer.revoked_at IS NULL AND peer.status<>'revoked' AND ${filter}
+      WHERE peer.revoked_at IS NULL AND peer.status<>'revoked' ${queueOnline} AND ${filter}
       ORDER BY remote.artist COLLATE NOCASE,remote.album COLLATE NOCASE,remote.disc_number,remote.track_number,remote.title COLLATE NOCASE LIMIT @limit OFFSET @offset`).all(params);
     const items=rows.map(row=>{const remote_ref=encodeRemoteReference(row.origin_node_id,row.object_id);return {...row,id:`remote:${remote_ref}`,remote:true,remote_ref,stream_url:`${apiPrefix}/federation/stream?ref=${encodeURIComponent(remote_ref)}&quality=original`,source_label:row.label||row.endpoint,read_only:true,stream_available:!row.offline};});
     const artists=await db.prepare(`SELECT remote.origin_node_id,remote.artist AS name,peer.endpoint,peer.label,count(*) track_count FROM federation_remote_tracks remote JOIN federation_peers peer ON peer.node_id=remote.origin_node_id WHERE peer.revoked_at IS NULL AND peer.status<>'revoked' ${nodeId?'AND remote.origin_node_id=@node_id':''} AND remote.artist ILIKE @query GROUP BY remote.origin_node_id,remote.artist,peer.endpoint,peer.label ORDER BY track_count DESC LIMIT 100`).all(params);
@@ -1359,7 +1051,7 @@ async function api(req, res, url, apiPrefix = '/api') {
     return sendJson(res,200,{items,artists,albums,total,offset,limit,has_more:offset+items.length<total});
   }
   if (url.pathname === '/api/federation/nodes' && req.method === 'GET') {
-    const items=await db.prepare(`SELECT peer.node_id,peer.label,peer.endpoint,peer.status,peer.last_synced_at,peer.sync_error,count(remote.object_id) track_count
+    const items=await db.prepare(`SELECT peer.node_id,peer.label,peer.endpoint,peer.status,peer.last_synced_at,peer.sync_error,peer.stream_failures,peer.stream_unavailable_until,peer.last_stream_error,count(remote.object_id) track_count
       FROM federation_peers peer LEFT JOIN federation_remote_tracks remote ON remote.origin_node_id=peer.node_id
       WHERE peer.revoked_at IS NULL AND peer.status<>'revoked' GROUP BY peer.node_id ORDER BY peer.label,peer.endpoint`).all();
     return sendJson(res,200,{items});
@@ -1368,11 +1060,11 @@ async function api(req, res, url, apiPrefix = '/api') {
     const query=String(url.searchParams.get('q')||'').trim().slice(0,120),queueRequest=url.searchParams.get('queue')==='1';
     const limit=Math.min(queueRequest?10000:200,Math.max(1,Number(url.searchParams.get('limit'))||50)),offset=Math.max(0,Number(url.searchParams.get('offset'))||0);
     const sortSql={newest:'liked_at DESC',oldest:'liked_at ASC',title:'title COLLATE "C"',artist:'artist COLLATE "C",title COLLATE "C"',album:'album COLLATE "C",disc_number NULLS LAST,track_number NULLS LAST,title COLLATE "C"',year:'year DESC NULLS LAST,title COLLATE "C"'}[url.searchParams.get('sort')]||'liked_at DESC';
-    const params={user_id:user.id,query:`%${query}%`,limit,offset};
+    const params={user_id:user.id,query:`%${query}%`,limit,offset},queueOnline=queueRequest?`AND ${FEDERATION_QUEUE_ONLINE_SQL}`:'';
     const filter=query?'AND (title ILIKE @query OR artist ILIKE @query OR album ILIKE @query OR genre ILIKE @query)':'';
     const total=Number((await db.prepare(`SELECT
       (SELECT count(*) FROM track_likes likes JOIN tracks ON tracks.id=likes.track_id WHERE likes.user_id=@user_id ${filter})+
-      (SELECT count(*) FROM federation_remote_likes likes JOIN federation_remote_tracks remote ON remote.origin_node_id=likes.origin_node_id AND remote.object_id=likes.object_id WHERE likes.user_id=@user_id ${filter}) count`).get(params)).count);
+      (SELECT count(*) FROM federation_remote_likes likes JOIN federation_remote_tracks remote ON remote.origin_node_id=likes.origin_node_id AND remote.object_id=likes.object_id JOIN federation_peers peer ON peer.node_id=remote.origin_node_id WHERE likes.user_id=@user_id ${queueOnline} ${filter}) count`).get(params)).count);
     const rows=await db.prepare(`SELECT * FROM (
       SELECT 'local' kind,tracks.id,NULL::text origin_node_id,tracks.title,tracks.artist,tracks.album,tracks.filename,tracks.mime_type,
         tracks.size_bytes,tracks.duration_seconds,tracks.created_at,tracks.genre,tracks.year,tracks.track_number,tracks.disc_number,tracks.cover_key,
@@ -1387,7 +1079,7 @@ async function api(req, res, url, apiPrefix = '/api') {
       FROM federation_remote_likes likes JOIN federation_remote_tracks remote ON remote.origin_node_id=likes.origin_node_id AND remote.object_id=likes.object_id
       JOIN federation_peers peer ON peer.node_id=remote.origin_node_id
       LEFT JOIN federation_remote_replicas replica ON replica.origin_node_id=remote.origin_node_id AND replica.object_id=remote.object_id
-      WHERE likes.user_id=@user_id ${filter}
+      WHERE likes.user_id=@user_id ${queueOnline} ${filter}
     ) favorites ORDER BY ${sortSql},kind,origin_node_id NULLS FIRST,id LIMIT @limit OFFSET @offset`).all(params);
     const items=rows.map(row=>{
       if(row.kind==='local'){const {kind,cover_key,...track}=row;return{...track,liked:true,cover_url:cover_key?`${apiPrefix}/tracks/${row.id}/cover`:null};}
@@ -1400,7 +1092,7 @@ async function api(req, res, url, apiPrefix = '/api') {
     const query=String(url.searchParams.get('q')||'').trim().slice(0,120),scope=['local','remote'].includes(url.searchParams.get('scope'))?url.searchParams.get('scope'):'all',queueRequest=url.searchParams.get('queue')==='1';
     const limit=Math.min(queueRequest?10000:200,Math.max(1,Number(url.searchParams.get('limit'))||50)),offset=Math.max(0,Number(url.searchParams.get('offset'))||0);
     const sortSql={newest:'created_at DESC NULLS LAST',oldest:'created_at ASC NULLS LAST',title:'title COLLATE "C"',artist:'artist COLLATE "C",title COLLATE "C"',album:'album COLLATE "C",disc_number NULLS LAST,track_number NULLS LAST,title COLLATE "C"',year:'year DESC NULLS LAST,title COLLATE "C"'}[url.searchParams.get('sort')]||'created_at DESC NULLS LAST';
-    const params={user_id:user.id,query:`%${query}%`,limit,offset},filter=query?'AND (title ILIKE @query OR artist ILIKE @query OR album ILIKE @query OR genre ILIKE @query)':'';
+    const params={user_id:user.id,query:`%${query}%`,limit,offset},filter=query?'AND (title ILIKE @query OR artist ILIKE @query OR album ILIKE @query OR genre ILIKE @query)':'',queueOnline=queueRequest?`AND ${FEDERATION_QUEUE_ONLINE_SQL}`:'';
     const localSql=scope==='remote'?'':`SELECT 'local' kind,tracks.id,NULL::text origin_node_id,tracks.title,tracks.artist,tracks.album,tracks.filename,tracks.mime_type,tracks.size_bytes,tracks.duration_seconds,tracks.created_at,tracks.genre,tracks.year,tracks.track_number,tracks.disc_number,tracks.cover_key,
       EXISTS(SELECT 1 FROM track_likes WHERE track_likes.user_id=@user_id AND track_likes.track_id=tracks.id) liked,
       (SELECT recommended_gain_db FROM loudness_jobs WHERE loudness_jobs.track_id=tracks.id AND status='ready') replay_gain_db,
@@ -1413,7 +1105,7 @@ async function api(req, res, url, apiPrefix = '/api') {
       (EXISTS(SELECT 1 FROM federation_remote_likes likes WHERE likes.user_id=@user_id AND likes.origin_node_id=remote.origin_node_id AND likes.object_id=remote.object_id) OR EXISTS(SELECT 1 FROM track_sources source JOIN track_likes local_like ON local_like.track_id=source.track_id WHERE source.source='federation' AND source.source_id=remote.origin_node_id||E'\\n'||remote.object_id AND local_like.user_id=@user_id)) liked,
       NULL::double precision replay_gain_db,FALSE aac_192_ready,FALSE aac_96_ready,peer.endpoint,peer.label,peer.status peer_status,peer.revoked_at,peer.last_synced_at,peer.sync_error
       FROM federation_remote_tracks remote JOIN federation_peers peer ON peer.node_id=remote.origin_node_id
-      WHERE peer.revoked_at IS NULL AND peer.status<>'revoked' ${importedFilter} ${filter}`;
+      WHERE peer.revoked_at IS NULL AND peer.status<>'revoked' ${queueOnline} ${importedFilter} ${filter}`;
     const union=[localSql,remoteSql].filter(Boolean).join(' UNION ALL ');
     const total=Number((await db.prepare(`SELECT count(*) count FROM (${union}) library`).get(params)).count);
     const rows=await db.prepare(`SELECT * FROM (${union}) library ORDER BY ${sortSql},kind,origin_node_id NULLS FIRST,id LIMIT @limit OFFSET @offset`).all(params);
@@ -1476,37 +1168,19 @@ async function api(req, res, url, apiPrefix = '/api') {
     if(!user.is_admin&&!await db.prepare('SELECT 1 FROM federation_remote_likes WHERE user_id=? AND origin_node_id=? AND object_id=?').get(user.id,decoded.nodeId,decoded.objectId))return sendJson(res,403,{error:'Удалять реплику может администратор или пользователь, добавивший трек в «Мне нравится»'});
     if(replica?.status==='downloading')return sendJson(res,409,{error:'Реплика сейчас загружается, повторите удаление позже'});
     if(replica?.storage_key){const file=path.resolve(config.storageDir,replica.storage_key);if(file.startsWith(`${path.resolve(config.storageDir)}${path.sep}`))fs.rmSync(file,{force:true});}
-    const paths=federationReplicaPaths(decoded.nodeId,decoded.objectId);fs.rmSync(paths.temporaryPath,{force:true});
+    const paths=importReplicaPaths(config.storageDir,decoded.nodeId,decoded.objectId);fs.rmSync(paths.temporaryPath,{force:true});
     await db.prepare("UPDATE federation_remote_replicas SET status='removed',storage_key=NULL,mime_type=NULL,size_bytes=NULL,received_bytes=0,sha256=NULL,error=NULL,updated_at=CURRENT_TIMESTAMP WHERE origin_node_id=? AND object_id=?").run(decoded.nodeId,decoded.objectId);
     return sendJson(res,200,{ok:true});
   }
   if (url.pathname === '/api/federation/prepare' && req.method === 'POST') {
     const body=await readJson(req),quality=['aac_96','aac_192'].includes(body.quality)?body.quality:'aac_192';let decoded;
     try{decoded=decodeRemoteReference(body.ref);}catch{return sendJson(res,400,{error:'Некорректная ссылка на удалённый трек'});}
-    const peer=await db.prepare("SELECT peer.* FROM federation_peers peer JOIN federation_remote_tracks remote ON remote.origin_node_id=peer.node_id WHERE peer.node_id=? AND remote.object_id=? AND peer.revoked_at IS NULL AND peer.status<>'revoked'").get(decoded.nodeId,decoded.objectId);
-    if(!peer)return sendJson(res,404,{error:'Удалённый трек не найден или доступ отозван'});
-    try{
-      const identity=loadFederationIdentity(config.storageDir),query=new URLSearchParams({quality,range:'bytes=0-0'}),remotePath=`/federation/v1/tracks/${encodeURIComponent(decoded.objectId)}/stream?${query}`,targetUri=`${peer.endpoint.replace(/\/$/,'')}${remotePath}`;
-      const headers=signFederationRequest({method:'GET',targetUri,nodeId:identity.node_id,privateKeyPem:identity.private_key_pem}),upstream=await openFederationStream(peer.endpoint,remotePath,headers),status=upstream.response.statusCode||502;
-      upstream.response.resume();await new Promise(resolve=>{upstream.response.once('end',resolve);upstream.response.once('close',resolve);upstream.response.once('error',resolve);});
-      if(status===200||status===206)return sendJson(res,200,{ready:true,quality});
-      if(status===409)return sendJson(res,202,{ready:false,quality,retry_after_ms:500});
-      return sendJson(res,502,{error:'Исходная нода не смогла подготовить аудио'});
-    }catch(error){return sendJson(res,502,{error:error.message||'Удалённая нода недоступна'});}
+    return federationMedia.prepareRemote(req,res,{nodeId:decoded.nodeId,objectId:decoded.objectId,quality});
   }
   if (url.pathname === '/api/federation/stream' && req.method === 'GET') {
     let decoded;try{decoded=decodeRemoteReference(url.searchParams.get('ref'));}catch{return sendJson(res,400,{error:'Некорректная ссылка на удалённый трек'});}
-    const peer=await db.prepare("SELECT peer.* FROM federation_peers peer JOIN federation_remote_tracks remote ON remote.origin_node_id=peer.node_id WHERE peer.node_id=? AND remote.object_id=? AND peer.revoked_at IS NULL AND peer.status<>'revoked'").get(decoded.nodeId,decoded.objectId);
-    if(!peer)return sendJson(res,404,{error:'Удалённый трек не найден или доступ отозван'});
-    if(!acquireCounter(outgoingFederationStreams,peer.node_id,6))return sendJson(res,429,{error:'Слишком много одновременных удалённых потоков'});
-    try{
-      const identity=loadFederationIdentity(config.storageDir),quality=['original','aac_96','aac_192'].includes(url.searchParams.get('quality'))?url.searchParams.get('quality'):'original';
-      const range=String(req.headers.range||'');if(range&&!/^bytes=(\d*)-(\d*)$/.test(range)){releaseCounter(outgoingFederationStreams,peer.node_id);res.writeHead(416);return res.end();}
-      const query=new URLSearchParams({quality});if(range)query.set('range',range);const remotePath=`/federation/v1/tracks/${encodeURIComponent(decoded.objectId)}/stream?${query}`,targetUri=`${peer.endpoint.replace(/\/$/,'')}${remotePath}`;
-      const headers=signFederationRequest({method:'GET',targetUri,nodeId:identity.node_id,privateKeyPem:identity.private_key_pem}),upstream=await openFederationStream(peer.endpoint,remotePath,headers);
-      const allowed=['content-type','content-length','content-range','accept-ranges','x-music-variant','cache-control'],responseHeaders=Object.fromEntries(allowed.filter(name=>upstream.response.headers[name]!=null).map(name=>[name,upstream.response.headers[name]]));res.writeHead(upstream.response.statusCode||502,responseHeaders);
-      let released=false;const done=()=>{if(released)return;released=true;releaseCounter(outgoingFederationStreams,peer.node_id);};upstream.response.once('close',done);upstream.response.once('error',()=>res.destroy());req.once('aborted',()=>upstream.request.destroy());res.once('close',()=>{if(!res.writableEnded){upstream.request.destroy();upstream.response.destroy();}});upstream.response.pipe(res);return;
-    }catch(error){releaseCounter(outgoingFederationStreams,peer.node_id);return sendJson(res,502,{error:error.message||'Удалённая нода недоступна'});}
+    const quality=['original','aac_96','aac_192'].includes(url.searchParams.get('quality'))?url.searchParams.get('quality'):'original';
+    return federationMedia.proxyRemote(req,res,{nodeId:decoded.nodeId,objectId:decoded.objectId,quality,range:String(req.headers.range||'')});
   }
   const userPasswordMatch = /^\/api\/users\/(\d+)\/password$/.exec(url.pathname);
   if (userPasswordMatch && req.method === 'PUT') {
@@ -1932,29 +1606,29 @@ function staticFile(res, pathname) {
 }
 
 const server = http.createServer(async (req, res) => {
-  httpMetrics.requests++;
-  res.once('finish', () => { if (res.statusCode >= 500) httpMetrics.errors5xx++; });
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  observeHttp(req, res, url);
   try {
     if (await acceptFederationPairing(req, res, url)) return;
     if (await federationNotify(req, res, url)) return;
-    if (await federationCover(req, res, url)) return;
-    if (await federationAudio(req, res, url)) return;
+    if (await federationMedia.serveCover(req, res, url)) return;
+    if (await federationMedia.serveAudio(req, res, url)) return;
     if (await federationCatalog(req, res, url)) return;
     if (await publicFederation(req, res, url)) return;
     const route = resolveApiRoute(url);
+    if (route?.retired) return sendJson(res, 410, {
+      error:'Эта версия API отключена. Используйте /api/v1',
+      error_code:'api_version_retired',
+      retryable:false,
+    }, { Link:'</api/v1>; rel="successor-version"' });
     if (route && !hasValidSessionOrigin(req)) return sendJson(res, 403, { error: 'Недоверенный источник запроса' });
     if (route) {
       res.setHeader('X-API-Version', String(route.version));
-      if (route.legacy) {
-        res.setHeader('Deprecation', 'true');
-        res.setHeader('Link', '</api/v1>; rel="successor-version"');
-      }
       return await api(req, res, route.url, route.prefix);
     }
     if (!staticFile(res, url.pathname)) staticFile(res, '/');
   } catch (error) {
-    console.error(error);
+    console.error(JSON.stringify({ time:new Date().toISOString(), level:'error', event:'request_error', request_id:req.requestId, method:req.method, path:url.pathname, error_code:error.code || 'internal_error', message:String(error.message || error).slice(0,1000) }));
     if (!res.headersSent) sendJson(res, error.status ?? 500, { error: error.status ? error.message : 'Внутренняя ошибка сервера' });
     else res.destroy();
   }
@@ -1976,8 +1650,8 @@ function startWorkers() {
   db.prepare("UPDATE loudness_jobs SET status='retry',available_at=CURRENT_TIMESTAMP WHERE status='processing'").run()
     .then(() => pumpLoudness()).catch(error => console.error('Ошибка восстановления анализа громкости:', error));
   setInterval(pumpLoudness, 3000);
-  recoverFederationReplicas().then(()=>processNextFederationReplica()).catch(error=>console.error('Ошибка восстановления реплик:',error));
-  setInterval(()=>processNextFederationReplica().catch(error=>console.error('Ошибка worker реплик:',error)),2000);
+  federationImport.recover().then(()=>federationImport.processNext()).catch(error=>console.error('Ошибка восстановления реплик:',error));
+  setInterval(()=>federationImport.processNext().catch(error=>console.error('Ошибка worker реплик:',error)),2000);
   cleanupAbandonedUploads().catch(error => console.error('Ошибка очистки загрузок:', error));
   setInterval(() => cleanupAbandonedUploads().catch(error => console.error('Ошибка очистки загрузок:', error)), Math.max(1, config.uploadCleanupMinutes) * 60000);
   cleanupDiagnosticReports().catch(error => console.error('Ошибка ротации отчётов:', error));
@@ -1988,6 +1662,8 @@ function startWorkers() {
   setInterval(() => syncFederationCatalogs().catch(error => console.error('Ошибка federation sync:', error)), 5000);
   notifyFederationPeers().catch(error => console.error('Ошибка federation notify:', error));
   setInterval(() => notifyFederationPeers().catch(error => console.error('Ошибка federation notify:', error)), 5000);
+  checkFederationPeers().catch(error => console.error('Ошибка federation health:', error));
+  setInterval(() => checkFederationPeers().catch(error => console.error('Ошибка federation health:', error)), 15000);
 }
 
 if (workerMode) {

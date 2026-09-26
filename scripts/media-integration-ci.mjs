@@ -66,7 +66,14 @@ try {
   await waitFor(async () => (await fetch(`${origin}/api/v1/health`)).ok, 'API did not start');
   db = await openDatabase(databaseUrl);
 
-  let result = await json('/api/v1/setup/status');
+  let result = await json('/api/health');
+  assert.equal(result.response.status, 410);
+  assert.equal(result.body.error_code, 'api_version_retired');
+  assert.equal(result.body.retryable, false);
+  assert.equal(result.body.request_id, result.response.headers.get('x-request-id'));
+  assert.equal(result.response.headers.get('link'), '</api/v1>; rel="successor-version"');
+
+  result = await json('/api/v1/setup/status');
   assert.equal(result.body.needs_setup, true);
   assert.equal(result.body.checks.database, 'ok');
   assert.equal(result.body.checks.storage, 'ok');
@@ -86,6 +93,9 @@ try {
     body: JSON.stringify({ username: 'family', display_name: 'Family', password: accountSecret }),
   });
   assert.equal(result.response.status, 404);
+  assert.equal(result.body.error_code, 'not_found');
+  assert.equal(result.body.retryable, false);
+  assert.equal(result.body.request_id, result.response.headers.get('x-request-id'));
   result = await json('/api/v1/setup', {
     method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin },
     body: JSON.stringify({ username: 'secondadmin', display_name: 'Second', password: accountSecret, library_name: 'Changed Music' }),
@@ -185,6 +195,15 @@ try {
   assert.equal(rejected.error,'Файл не распознан как аудио');
   assert.equal(await db.prepare("SELECT count(*) count FROM tracks WHERE filename='broken.mp3'").get().then(row=>Number(row.count)),0);
   assert.equal(fs.existsSync(path.join(storageDir,'uploads',`${invalidUploadId}.part`)),false);
+  result=await waitFor(async()=>{
+    const metrics=await json('/api/v1/admin/metrics',{headers:{Cookie:cookie}});
+    return metrics.body.operations?.['upload.process']?.count>=2?metrics:null;
+  },'Operation metrics were not persisted');
+  assert.equal(result.response.status,200);
+  assert.ok(result.body.operations['upload.process'].count>=2);
+  assert.equal(result.body.operations['upload.process'].errors,0);
+  assert.equal(result.body.operations['upload.process'].last_succeeded,true);
+  assert.equal(typeof result.body.operations['upload.process'].duration_ms_average,'number');
 
   let stream = await fetch(`${origin}/api/v1/tracks/${ready.track_id}/stream`, { headers: { Cookie: cookie, Range: 'bytes=0-15' } });
   assert.equal(stream.status, 206);

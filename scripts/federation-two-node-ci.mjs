@@ -2,6 +2,7 @@
 import crypto from 'node:crypto';
 import { openDatabase } from '../src/db.js';
 import { applyFederationDeltaPage, catalogEvent, encodeCatalogCursor } from '../src/federation-catalog.js';
+import { FEDERATION_QUEUE_ONLINE_SQL } from '../src/federation-availability.js';
 
 const sourceUrl = process.env.FEDERATION_SOURCE_DATABASE_URL;
 const targetUrl = process.env.FEDERATION_TARGET_DATABASE_URL;
@@ -45,6 +46,13 @@ try {
   if (remote?.title !== 'Песня с первой ноды' || remote.artist !== 'Исполнитель A') throw new Error('Вторая нода не применила track.upsert.v1');
   const localStillExists = await target.prepare('SELECT title FROM tracks WHERE id=?').get(targetTrack);
   if (localStillExists?.title !== 'Локальная песня второй ноды') throw new Error('Синхронизация затронула локальную библиотеку');
+  const queueCount = async () => Number((await target.prepare(`SELECT count(*) count FROM federation_remote_tracks remote JOIN federation_peers peer ON peer.node_id=remote.origin_node_id WHERE ${FEDERATION_QUEUE_ONLINE_SQL}`).get()).count);
+  if ((await queueCount()) !== 1) throw new Error('Свежая online-нода исключена из автоматической очереди');
+  await target.prepare("UPDATE federation_peers SET stream_unavailable_until=CURRENT_TIMESTAMP+INTERVAL '5 minutes' WHERE node_id=?").run(sourceNode);
+  if ((await queueCount()) !== 0) throw new Error('Открытый stream circuit не исключил ноду из автоматической очереди');
+  await target.prepare("UPDATE federation_peers SET stream_unavailable_until=NULL,last_synced_at=CURRENT_TIMESTAMP-INTERVAL '20 minutes' WHERE node_id=?").run(sourceNode);
+  if ((await queueCount()) !== 0) throw new Error('Устаревшая нода попала в автоматическую очередь');
+  await target.prepare('UPDATE federation_peers SET last_synced_at=CURRENT_TIMESTAMP WHERE node_id=?').run(sourceNode);
 
   let rejected = false;
   try {

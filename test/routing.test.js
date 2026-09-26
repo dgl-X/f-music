@@ -10,11 +10,11 @@ test('v1 routes are normalized without losing query parameters', () => {
   assert.equal(route.legacy, false);
 });
 
-test('legacy API remains available and is marked legacy', () => {
+test('unversioned API is recognized as retired', () => {
   const route = resolveApiRoute('/api/health');
   assert.equal(route.url.pathname, '/api/health');
   assert.equal(route.prefix, '/api');
-  assert.equal(route.legacy, true);
+  assert.equal(route.retired, true);
 });
 
 test('static and unknown version paths are not treated as API v1', () => {
