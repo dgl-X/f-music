@@ -28,6 +28,7 @@ let searchScope = localStorage.getItem('music-search-scope') || 'all';
 let federationNode='';
 let federationKind='tracks';
 let federationPage=0;
+let searchProvider=localStorage.getItem('music-search-provider')||'federation';
 let sortMode = 'newest';
 let pageIndex = 0;
 let pageSize = Math.min(200,Math.max(50,Number(localStorage.getItem('music-page-size'))||50));
@@ -188,7 +189,7 @@ async function renderLibrary(user) {
   document.querySelector('#queue-toggle').onclick=()=>{document.querySelector('#queue-panel').classList.toggle('open');renderQueue();};
   document.querySelector('#queue-close').onclick=()=>document.querySelector('#queue-panel').classList.remove('open');
   document.querySelector('#player-like').onclick=toggleCurrentLike;
-  document.querySelector('#now-details').onclick=()=>{const track=queue[currentIndex];if(track?.remote)return showRemoteTrack(track.remote_ref);if(track)editTrack(track);};
+  document.querySelector('#now-details').onclick=()=>{const track=queue[currentIndex];if(track?.external_preview)return alert('Сначала добавьте трек в свою библиотеку.');if(track?.remote)return showRemoteTrack(track.remote_ref);if(track)editTrack(track);};
   setupPlayer();
   updateViewControls();
   if(!initialRoute.canonical)syncBrowserRoute('replace');
@@ -202,7 +203,7 @@ function showWebSettings(){
 function loadSettingsView(){
   const root=document.querySelector('#catalog-content');
   const scopeNames={all:'Общая библиотека',local:'Только этот сервер',remote:'Только федерация'};
-  const admin=sessionUser?.is_admin?`<div class="settings-group"><h3>Администрирование</h3><button data-section="statistics"><span>Статистика</span><small>Состояние сервера, очереди и громкость</small></button><button data-section="users"><span>Аккаунты</span><small>Пользователи и сброс паролей</small></button><button data-section="registration"><span>Регистрация</span><small>Разрешить пользователям создавать аккаунты самостоятельно</small></button><button data-section="federation"><span>Федерация</span><small>Identity, адреса и доступность ноды</small></button><button data-section="recognition"><span>Автораспознавание</span><small>AcoustID, включение и Client API key</small></button><button data-section="reports"><span>Отчёты об ошибках</span><small>Диагностика из Android-приложения</small></button><button data-action="recognition-queue"><span>Требуют внимания</span><small>Распознавание и исправление метаданных</small></button></div>`:'';
+  const admin=sessionUser?.is_admin?`<div class="settings-group"><h3>Администрирование</h3><button data-section="statistics"><span>Статистика</span><small>Состояние сервера, очереди и громкость</small></button><button data-section="users"><span>Аккаунты</span><small>Пользователи и сброс паролей</small></button><button data-section="registration"><span>Регистрация</span><small>Разрешить пользователям создавать аккаунты самостоятельно</small></button><button data-section="federation"><span>Федерация</span><small>Identity, адреса и доступность ноды</small></button><button data-section="recognition"><span>Автораспознавание</span><small>AcoustID, включение и Client API key</small></button><button data-section="openvk"><span>OpenVK</span><small>Внешний поиск и импорт музыки в WEB</small></button><button data-section="reports"><span>Отчёты об ошибках</span><small>Диагностика из Android-приложения</small></button><button data-action="recognition-queue"><span>Требуют внимания</span><small>Распознавание и исправление метаданных</small></button></div>`:'';
   root.innerHTML=`<section class="stats-shell settings-dialog routed-settings"><div class="stats-head"><div><div class="dialog-title">Настройки</div><small>${escapeHtml(sessionUser?.display_name||'')}</small></div><button class="stats-close" aria-label="Закрыть">×</button></div><div class="settings-group"><h3>Аккаунт</h3><button data-section="password"><span>Изменить пароль</span><small>Обновить пароль текущего пользователя</small></button></div><div class="settings-group"><h3>Библиотека</h3><button data-section="library"><span>«Все треки» по умолчанию</span><small>${escapeHtml(scopeNames[searchScope]||scopeNames.all)}</small></button><button data-section="duplicates"><span>Возможные дубликаты</span><small>Совпадения по названию и исполнителю</small></button></div>${admin}</section>`;
   root.querySelector('.stats-close').onclick=()=>switchView('liked');
   root.querySelectorAll('[data-section]').forEach(button=>button.onclick=()=>openSettingsSection(button.dataset.section));
@@ -211,9 +212,9 @@ function loadSettingsView(){
 }
 
 function openSettingsSection(section,push=true){
-  const adminOnly=new Set(['statistics','users','registration','federation','recognition','reports']);
+  const adminOnly=new Set(['statistics','users','registration','federation','recognition','openvk','reports']);
   if(adminOnly.has(section)&&!sessionUser?.is_admin){settingsSection='';syncBrowserRoute('replace');return;}
-  const actions={library:showLibraryDisplaySettings,statistics:showAdminStats,users:manageUsers,registration:showRegistrationSettings,federation:showFederationSettings,recognition:showRecognitionSettings,reports:showDiagnosticReports,duplicates:showDuplicates,password:changeOwnPassword};
+  const actions={library:showLibraryDisplaySettings,statistics:showAdminStats,users:manageUsers,registration:showRegistrationSettings,federation:showFederationSettings,recognition:showRecognitionSettings,openvk:showOpenVkSettings,reports:showDiagnosticReports,duplicates:showDuplicates,password:changeOwnPassword};
   const action=actions[section];if(!action)return;
   settingsSection=section;openingSettingsSection=section;if(push)syncBrowserRoute();
   Promise.resolve(action()).catch(error=>alert(error.message));
@@ -305,6 +306,14 @@ async function showRecognitionSettings(){
   form.onsubmit=async event=>{event.preventDefault();error.textContent='';const body={enabled:form.elements.enabled.checked};if(keyInput.value.trim())body.client_key=keyInput.value.trim();else if(form.elements.remove_key.checked)body.client_key='';try{await api('/api/v1/admin/recognition-settings',{method:'PUT',body:JSON.stringify(body)});dialog.close();}catch(problem){error.textContent=problem.message;}};
 }
 
+async function showOpenVkSettings(){
+  const dialog=document.createElement('dialog');dialog.className='stats-dialog settings-dialog';
+  dialog.innerHTML=`<form class="stats-shell recognition-settings-form"><div class="stats-head"><div><div class="dialog-title">OpenVK</div><small>Необязательный источник музыки для WEB</small></div><button type="button" class="stats-close" aria-label="Закрыть">×</button></div><label class="settings-check"><input type="checkbox" name="enabled"><span><strong>Включить поиск OpenVK</strong><small>Сбой внешнего сервиса не влияет на локальную библиотеку</small></span></label><label>Access token OpenVK<input name="access_token" type="password" maxlength="1024" autocomplete="off" placeholder="Загрузка…"></label><small class="settings-hint">Токен хранится только на сервере и никогда не возвращается браузеру. Пустое поле оставит сохранённое значение.</small><label class="settings-check remove-key"><input type="checkbox" name="remove_token"><span><strong>Удалить сохранённый токен</strong><small>Поиск OpenVK перестанет работать</small></span></label><div class="error"></div><div class="dialog-actions"><button type="button" class="secondary cancel">Отмена</button><button class="primary">Сохранить</button></div></form>`;
+  document.body.append(dialog);dialog.showModal();const form=dialog.querySelector('form'),error=form.querySelector('.error'),token=form.elements.access_token;const close=()=>dialog.close();form.querySelector('.stats-close').onclick=close;form.querySelector('.cancel').onclick=close;dialog.addEventListener('close',()=>dialog.remove());
+  try{const state=await api('/api/v1/admin/openvk-settings');form.elements.enabled.checked=state.enabled;token.placeholder=state.token_configured?'Токен сохранён · введите только для замены':'Введите access token';}catch(problem){error.textContent=problem.message;form.querySelector('.primary').disabled=true;}
+  form.onsubmit=async event=>{event.preventDefault();error.textContent='';const body={enabled:form.elements.enabled.checked};if(token.value.trim())body.access_token=token.value.trim();else if(form.elements.remove_token.checked)body.access_token='';try{await api('/api/v1/admin/openvk-settings',{method:'PUT',body:JSON.stringify(body)});dialog.close();}catch(problem){error.textContent=problem.message;}};
+}
+
 async function manageUsers(){
   const dialog=document.createElement('dialog');
   dialog.innerHTML=`<div class="users-dialog"><div class="dialog-title">Аккаунты</div><div class="users-list">Загрузка…</div>
@@ -389,13 +398,34 @@ async function loadCurrentView() {
 }
 
 async function loadFederationBrowser(){
+  if(searchProvider==='openvk')return loadOpenVkBrowser();
   currentQueueRequest='';const root=document.querySelector('#catalog-content');root.innerHTML='<div class="empty">Загружаем поиск…</div>';
   const nodes=await api('/api/v1/federation/nodes');
-  root.innerHTML=`<section class="federation-browser"><div class="federation-search-tools"><div class="search-box">⌕<input class="federation-query" type="search" placeholder="Песня, альбом или исполнитель"></div><select class="federation-kind"><option value="tracks">Песни</option><option value="albums">Альбомы</option><option value="artists">Исполнители</option></select></div><div class="federation-node-list"><button class="secondary ${federationNode?'':'active'}" data-node="">Все серверы</button>${nodes.items.map(node=>`<button class="secondary ${federationNode===node.node_id?'active':''}" data-node="${escapeHtml(node.node_id)}">${escapeHtml(node.label||node.endpoint)} · ${node.track_count}</button>`).join('')}</div><div class="federation-play-actions" ${federationNode?'':'hidden'}><button class="primary federation-play-all">▶ Слушать всё</button><button class="secondary federation-shuffle-all">Перемешать</button></div><div class="federation-browser-results"></div></section>`;
+  root.innerHTML=`<section class="federation-browser"><div class="federation-node-list search-provider-list"><button class="secondary active" data-provider="federation">Другие серверы</button><button class="secondary" data-provider="openvk">OpenVK</button></div><div class="federation-search-tools"><div class="search-box">⌕<input class="federation-query" type="search" placeholder="Песня, альбом или исполнитель"></div><select class="federation-kind"><option value="tracks">Песни</option><option value="albums">Альбомы</option><option value="artists">Исполнители</option></select></div><div class="federation-node-list federation-nodes"><button class="secondary ${federationNode?'':'active'}" data-node="">Все серверы</button>${nodes.items.map(node=>`<button class="secondary ${federationNode===node.node_id?'active':''}" data-node="${escapeHtml(node.node_id)}">${escapeHtml(node.label||node.endpoint)} · ${node.track_count}</button>`).join('')}</div><div class="federation-play-actions" ${federationNode?'':'hidden'}><button class="primary federation-play-all">▶ Слушать всё</button><button class="secondary federation-shuffle-all">Перемешать</button></div><div class="federation-browser-results"></div></section>`;
   const query=root.querySelector('.federation-query'),kind=root.querySelector('.federation-kind'),results=root.querySelector('.federation-browser-results');let timer;query.value=searchQuery;kind.value=federationKind;
   const load=async()=>{const q=query.value.trim();if(!federationNode&&q.length<2){results.innerHTML='<div class="empty">Выберите сервер, чтобы открыть всю его музыку, или введите запрос.</div>';return;}const data=await api(`/api/v1/federation/search?q=${encodeURIComponent(q)}&node_id=${encodeURIComponent(federationNode)}&limit=100&offset=${federationPage*100}`);if(kind.value==='tracks'){renderFederationTracks(results,data.items);const pager=document.createElement('div');pager.className='catalog-pager';pager.innerHTML=`<button class="secondary prev" ${federationPage?'':'disabled'}>‹ Назад</button><span>${data.offset+1}–${data.offset+data.items.length} из ${data.total}</span><button class="secondary next" ${data.has_more?'':'disabled'}>Далее ›</button>`;results.append(pager);pager.querySelector('.prev').onclick=()=>{federationPage--;load();};pager.querySelector('.next').onclick=()=>{federationPage++;load();};return;}const items=kind.value==='albums'?data.albums:data.artists;results.innerHTML=items.length?`<div class="catalog-grid">${items.map(item=>`<button class="catalog-card federation-collection" data-name="${escapeHtml(item.name)}"><div class="catalog-cover">♫</div><div class="catalog-name">${escapeHtml(item.name)}</div><div class="catalog-meta">${kind.value==='albums'?escapeHtml(item.artist)+' · ':''}${item.track_count} треков</div></button>`).join('')}</div>`:'<div class="empty">Ничего не найдено.</div>';results.querySelectorAll('.federation-collection').forEach(button=>button.onclick=()=>{query.value=button.dataset.name;kind.value='tracks';federationPage=0;load();});};
-  root.querySelectorAll('.federation-node-list button').forEach(button=>button.onclick=()=>{federationNode=button.dataset.node;federationPage=0;syncBrowserRoute();loadFederationBrowser();});query.oninput=()=>{searchQuery=query.value.trim();federationPage=0;clearTimeout(timer);timer=setTimeout(()=>{syncBrowserRoute('replace');load();},180);};kind.onchange=()=>{federationKind=kind.value;federationPage=0;syncBrowserRoute('replace');load();};load();
+  root.querySelectorAll('.federation-nodes button').forEach(button=>button.onclick=()=>{federationNode=button.dataset.node;federationPage=0;syncBrowserRoute();loadFederationBrowser();});query.oninput=()=>{searchQuery=query.value.trim();federationPage=0;clearTimeout(timer);timer=setTimeout(()=>{syncBrowserRoute('replace');load();},180);};kind.onchange=()=>{federationKind=kind.value;federationPage=0;syncBrowserRoute('replace');load();};load();
+  root.querySelector('[data-provider="openvk"]').onclick=()=>{searchProvider='openvk';localStorage.setItem('music-search-provider',searchProvider);loadFederationBrowser();};
   const playAll=async shuffle=>{const button=shuffle?root.querySelector('.federation-shuffle-all'):root.querySelector('.federation-play-all'),label=button.textContent;button.disabled=true;button.textContent='Собираем очередь…';try{const data=await api(`/api/v1/federation/search?q=${encodeURIComponent(query.value.trim())}&node_id=${encodeURIComponent(federationNode)}&queue=1&limit=10000`);playbackFailures.clear();queue=shuffle?[...data.items].sort(()=>Math.random()-.5):data.items;if(queue.length){shuffleEnabled=shuffle;document.querySelector('#shuffle').classList.toggle('active',shuffle);playTrack(0);}}finally{button.disabled=false;button.textContent=label;}};root.querySelector('.federation-play-all')?.addEventListener('click',()=>playAll(false));root.querySelector('.federation-shuffle-all')?.addEventListener('click',()=>playAll(true));
+}
+
+async function loadOpenVkBrowser(){
+  currentQueueRequest='';const root=document.querySelector('#catalog-content');root.innerHTML=`<section class="federation-browser"><div class="federation-node-list search-provider-list"><button class="secondary" data-provider="federation">Другие серверы</button><button class="secondary active" data-provider="openvk">OpenVK</button></div><div class="federation-search-tools"><div class="search-box">⌕<input class="openvk-query" type="search" placeholder="Песня или исполнитель"></div></div><div class="settings-hint">Найденные треки добавляются в локальную библиотеку и после импорта больше не зависят от OpenVK.</div><div class="openvk-results"></div></section>`;
+  root.querySelector('[data-provider="federation"]').onclick=()=>{searchProvider='federation';localStorage.setItem('music-search-provider',searchProvider);loadFederationBrowser();};
+  const query=root.querySelector('.openvk-query'),results=root.querySelector('.openvk-results');query.value=searchQuery;let timer;
+  const load=async()=>{const q=query.value.trim();if(q.length<2){results.innerHTML='<div class="empty">Введите хотя бы два символа.</div>';return;}results.innerHTML='<div class="empty">Ищем в OpenVK…</div>';try{const data=await api(`/api/v1/openvk/search?q=${encodeURIComponent(q)}&limit=50`);renderOpenVkTracks(results,data.items);}catch(error){results.innerHTML=`<div class="empty">${escapeHtml(error.message)}</div>`;}};
+  query.oninput=()=>{searchQuery=query.value.trim();clearTimeout(timer);timer=setTimeout(()=>{syncBrowserRoute('replace');load();},250);};load();
+}
+
+function renderOpenVkTracks(root,items){
+  root.innerHTML=items.length?`<div class="tracks">${items.map(track=>`<article class="track openvk-track" data-source="${escapeHtml(track.source_id)}"><button class="play artwork no-cover" title="Предпрослушать"><span>▶</span></button><div><div class="title">${escapeHtml(track.title)}</div><div class="meta">${escapeHtml(track.artist)}${track.album?` · ${escapeHtml(track.album)}`:''} · OpenVK</div></div><button class="secondary openvk-import" ${track.local_track_id?'disabled':''}>${track.local_track_id?'Добавлено':'Добавить'}</button><div class="muted">${duration(track.duration_seconds)}</div><span></span></article>`).join('')}</div>`:'<div class="empty">Ничего не найдено.</div>';
+  root.querySelectorAll('.openvk-track .play').forEach((button,index)=>button.onclick=()=>{const source=items[index];playbackFailures.clear();queue=[{...source,id:`openvk:${source.source_id}`,external_preview:true,stream_url:`/api/v1/openvk/stream?source_id=${encodeURIComponent(source.source_id)}`,cover_url:null,liked:false,stream_available:true}];shuffleEnabled=false;document.querySelector('#shuffle').classList.remove('active');playTrack(0);});
+  root.querySelectorAll('.openvk-import:not([disabled])').forEach(button=>button.onclick=async()=>{const row=button.closest('.openvk-track'),label=button.textContent;button.disabled=true;button.textContent='Скачиваем…';try{const result=await api('/api/v1/openvk/import',{method:'POST',body:JSON.stringify({source_id:row.dataset.source})});if(result.track_id){button.textContent='Добавлено';return;}button.textContent='Обрабатываем…';const trackId=await waitForOpenVkUpload(result.upload_id);button.textContent=trackId?'Добавлено':'В очереди';}catch(error){button.disabled=false;button.textContent=label;alert(error.message);}});
+}
+
+async function waitForOpenVkUpload(uploadId){
+  for(let attempt=0;attempt<60;attempt++){await new Promise(resolve=>setTimeout(resolve,1500));const state=await api(`/api/v1/uploads/${uploadId}`);if(state.status==='ready'||state.status==='duplicate')return state.track_id;if(state.status==='failed')throw new Error(state.error||'Не удалось обработать трек');}
+  return null;
 }
 
 function renderFederationTracks(root,items){const holder=document.querySelector('#catalog-content'),old=holder.querySelector('#tracks');old?.remove();const container=document.createElement('div');container.id='tracks';container.className='tracks';root.replaceChildren(container);displayedTracks=items;container.innerHTML=items.length?items.map(track=>`<article class="track" data-id="${track.id}"><button class="play artwork no-cover"><span>▶</span></button><div><div class="title">${escapeHtml(track.title)}</div><div class="meta">${escapeHtml(track.artist)}${track.album?` · ${escapeHtml(track.album)}`:''} · ${escapeHtml(track.source_label)}</div></div><button class="like ${track.liked?'liked':''}">${track.liked?'♥':'♡'}</button><div class="muted">${duration(track.duration_seconds)}</div><button class="edit-track">•••</button></article>`).join(''):'<div class="empty">Ничего не найдено.</div>';container.querySelectorAll('.play').forEach((button,index)=>button.onclick=()=>prepareRemotePlayback(items[index]));container.querySelectorAll('.like').forEach((button,index)=>button.onclick=async()=>{const track=items[index],next=!track.liked;await api(`/api/v1/federation/like?ref=${encodeURIComponent(track.remote_ref)}`,{method:next?'PUT':'DELETE'});track.liked=next;button.classList.toggle('liked',next);button.textContent=next?'♥':'♡';});container.querySelectorAll('.edit-track').forEach((button,index)=>button.onclick=()=>showRemoteTrack(items[index].remote_ref));}
@@ -471,7 +501,7 @@ function setupPlayer() {
   player.onpause=()=>{ toggle.textContent='▶'; toggle.title='Воспроизвести'; if('mediaSession' in navigator)navigator.mediaSession.playbackState='paused'; updatePlayingState();cancelAudioPrefetch(); };
   player.onended=()=>{playbackFailures.delete(queue[currentIndex]?.id);if(repeatMode==='one')playTrack(currentIndex);else advanceTrack(1,true);};
   player.onerror=()=>{const failed=queue[currentIndex];if(!failed)return;if(activeBlobUrl&&blobFallbackTrackId!==failed.id){activeBlobUrl='';blobFallbackTrackId=failed.id;player.src=streamUrl(failed);audioCache.delete(failed.id);safePlay(player);return;}playbackFailures.add(failed.id);clearTimeout(playbackErrorTimer);playbackErrorTimer=setTimeout(()=>{if(queue[currentIndex]?.id===failed.id)advanceTrack(1,true);},250);};
-  player.ontimeupdate=()=>{ if(!player.duration)return; seek.value=String(Math.round(player.currentTime/player.duration*1000)); document.querySelector('#elapsed').textContent=duration(player.currentTime);if(Date.now()-lastPositionSave>3000){lastPositionSave=Date.now();localStorage.setItem('music-position',String(player.currentTime));updateMediaPosition();scheduleStateSave();} };
+  player.ontimeupdate=()=>{ if(!player.duration)return; seek.value=String(Math.round(player.currentTime/player.duration*1000)); document.querySelector('#elapsed').textContent=duration(player.currentTime);if(Date.now()-lastPositionSave>3000){lastPositionSave=Date.now();if(!queue[currentIndex]?.external_preview)localStorage.setItem('music-position',String(player.currentTime));updateMediaPosition();scheduleStateSave();} };
   player.onloadedmetadata=()=>{ document.querySelector('#total').textContent=duration(player.duration); };
   seek.oninput=()=>{ if(player.duration) player.currentTime=Number(seek.value)/1000*player.duration; };
   volume.oninput=()=>{localStorage.setItem('music-volume',volume.value);if(audioGain)applyWebGain();else player.volume=Number(volume.value);};
@@ -486,7 +516,7 @@ function advanceTrack(direction,automatic=false){
   for(let step=1;step<=queue.length;step++){const candidate=currentIndex+direction*step;if(!wrap&&(candidate<0||candidate>=queue.length))break;const index=(candidate%queue.length+queue.length)%queue.length;if(playable(queue[index],index))return playTrack(index);}
 }
 
-const streamUrl=track=>track.remote?track.stream_url:`/api/v1/tracks/${track.id}/stream`;
+const streamUrl=track=>track.external_preview?track.stream_url:track.remote?track.stream_url:`/api/v1/tracks/${track.id}/stream`;
 function safePlay(player){const attempt=player.play();if(attempt?.catch)attempt.catch(error=>{if(error?.name!=='AbortError')console.warn('Не удалось запустить воспроизведение',error);});return attempt;}
 function cancelAudioPrefetch(){clearTimeout(preloadTimer);preloadTimer=null;preloadAbort?.abort();preloadAbort=null;}
 function upcomingTracks(){
@@ -499,6 +529,7 @@ function upcomingTracks(){
 }
 function scheduleAudioPrefetch(){
   cancelAudioPrefetch();
+  if(queue[currentIndex]?.external_preview)return;
   if(navigator.connection?.saveData||/^(slow-2g|2g)$/.test(navigator.connection?.effectiveType||''))return;
   preloadTimer=setTimeout(async()=>{
     const player=document.querySelector('#player');if(!player||player.paused||currentIndex<0)return;
@@ -514,9 +545,9 @@ function scheduleAudioPrefetch(){
   },1200);
 }
 
-function selectAudioSource(track){activeBlobUrl=audioCache.get(track.id)||'';audioCache.pin(track.id);return activeBlobUrl||streamUrl(track);}
+function selectAudioSource(track){if(track.external_preview){activeBlobUrl='';return streamUrl(track);}activeBlobUrl=audioCache.get(track.id)||'';audioCache.pin(track.id);return activeBlobUrl||streamUrl(track);}
 
-function scheduleStateSave(){clearTimeout(stateSaveTimer);stateSaveTimer=setTimeout(()=>{const player=document.querySelector('#player'),track=queue[currentIndex];api('/api/v1/playback-state',{method:'PUT',body:JSON.stringify({track_id:track?.id??null,position_seconds:player?.currentTime??0,queue:queue.map(item=>item.id),shuffle:shuffleEnabled,repeat_mode:repeatMode})}).catch(()=>{});},500);}
+function scheduleStateSave(){clearTimeout(stateSaveTimer);if(queue[currentIndex]?.external_preview)return;stateSaveTimer=setTimeout(()=>{const player=document.querySelector('#player'),track=queue[currentIndex];api('/api/v1/playback-state',{method:'PUT',body:JSON.stringify({track_id:track?.id??null,position_seconds:player?.currentTime??0,queue:queue.map(item=>item.id),shuffle:shuffleEnabled,repeat_mode:repeatMode})}).catch(()=>{});},500);}
 
 function playTrack(index,shuffleNavigation=false) {
   if(!queue.length || index<0) return;
@@ -533,8 +564,8 @@ function playTrack(index,shuffleNavigation=false) {
   document.querySelector('#player-bar').classList.add('active');
   blobFallbackTrackId='';player.src=selectAudioSource(track);audioCache.evict();
   applyWebGain();
-  localStorage.setItem('music-track-id',track.id);localStorage.setItem('music-position','0');
-  if(!track.remote)api('/api/v1/history',{method:'POST',body:JSON.stringify({track_id:track.id})}).catch(()=>{});
+  if(!track.external_preview){localStorage.setItem('music-track-id',track.id);localStorage.setItem('music-position','0');}
+  if(!track.remote&&!track.external_preview)api('/api/v1/history',{method:'POST',body:JSON.stringify({track_id:track.id})}).catch(()=>{});
   scheduleStateSave();
   safePlay(player);
   scheduleAudioPrefetch();
@@ -558,11 +589,12 @@ async function restorePlayer(){
 
 function updatePlayerLike(track){
   const button=document.querySelector('#player-like');if(!button)return;
-  button.classList.toggle('liked',Boolean(track?.liked));button.textContent=track?.liked?'♥':'♡';button.disabled=!track;button.title='Мне нравится';
+  button.classList.toggle('liked',Boolean(track?.liked));button.textContent=track?.liked?'♥':'♡';button.disabled=!track||Boolean(track.external_preview);button.title=track?.external_preview?'Сначала добавьте трек':'Мне нравится';
 }
 
 async function toggleCurrentLike(){
   const track=queue[currentIndex];if(!track)return;
+  if(track.external_preview)return alert('Сначала добавьте трек в свою библиотеку.');
   const next=!track.liked;
   try{
     await api(track.remote?`/api/v1/federation/like?ref=${encodeURIComponent(track.remote_ref)}`:`/api/v1/tracks/${track.id}/like`,{method:next?'PUT':'DELETE'});
