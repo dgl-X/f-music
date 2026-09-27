@@ -2,7 +2,7 @@
 import crypto from 'node:crypto';
 import { openDatabase } from '../src/db.js';
 import { applyFederationDeltaPage, catalogEvent, encodeCatalogCursor } from '../src/federation-catalog.js';
-import { FEDERATION_QUEUE_ONLINE_SQL } from '../src/federation-availability.js';
+import { createFederationAvailabilityService, FEDERATION_QUEUE_ONLINE_SQL } from '../src/federation-availability.js';
 
 const sourceUrl = process.env.FEDERATION_SOURCE_DATABASE_URL;
 const targetUrl = process.env.FEDERATION_TARGET_DATABASE_URL;
@@ -47,12 +47,34 @@ try {
   const localStillExists = await target.prepare('SELECT title FROM tracks WHERE id=?').get(targetTrack);
   if (localStillExists?.title !== 'Локальная песня второй ноды') throw new Error('Синхронизация затронула локальную библиотеку');
   const queueCount = async () => Number((await target.prepare(`SELECT count(*) count FROM federation_remote_tracks remote JOIN federation_peers peer ON peer.node_id=remote.origin_node_id WHERE ${FEDERATION_QUEUE_ONLINE_SQL}`).get()).count);
+  const localQueueCount = async () => Number((await target.prepare('SELECT count(*) count FROM tracks').get()).count);
+  const savedRemoteCount = async () => Number((await target.prepare('SELECT count(*) count FROM federation_remote_tracks WHERE origin_node_id=?').get(sourceNode)).count);
   if ((await queueCount()) !== 1) throw new Error('Свежая online-нода исключена из автоматической очереди');
-  await target.prepare("UPDATE federation_peers SET stream_unavailable_until=CURRENT_TIMESTAMP+INTERVAL '5 minutes' WHERE node_id=?").run(sourceNode);
+  if ((await localQueueCount()) + (await queueCount()) !== 2) throw new Error('Смешанная очередь не содержит локальный и online remote-трек');
+
+  const availability = createFederationAvailabilityService({ db:target });
+  if (await availability.recordFailure(sourceNode,'CI stream reset') !== 0) throw new Error('Первая ошибка потока преждевременно открыла circuit breaker');
+  if ((await queueCount()) !== 1) throw new Error('Одиночная ошибка потока исключила доступную ноду');
+  if (await availability.recordFailure(sourceNode,'CI stream reset again') !== 30) throw new Error('Вторая ошибка потока не открыла ожидаемый circuit breaker');
   if ((await queueCount()) !== 0) throw new Error('Открытый stream circuit не исключил ноду из автоматической очереди');
+  if ((await localQueueCount()) !== 1) throw new Error('Ошибка удалённого потока затронула локальную очередь');
+  if ((await savedRemoteCount()) !== 1) throw new Error('Offline remote-трек исчез из явного просмотра библиотеки');
+
+  await target.prepare('UPDATE federation_peers SET next_health_at=CURRENT_TIMESTAMP WHERE node_id=?').run(sourceNode);
+  let probes = 0;
+  await availability.check(async endpoint => {
+    probes += 1;
+    if (endpoint !== 'https://source.invalid') throw new Error('Health-check получил неверный endpoint');
+    return { node_id:sourceNode };
+  });
+  if (probes !== 1) throw new Error('Circuit breaker не запустил отдельный health-check');
+  if ((await queueCount()) !== 1) throw new Error('Нода не вернулась в новую очередь после успешного health-check');
+
   await target.prepare("UPDATE federation_peers SET stream_unavailable_until=NULL,last_synced_at=CURRENT_TIMESTAMP-INTERVAL '20 minutes' WHERE node_id=?").run(sourceNode);
   if ((await queueCount()) !== 0) throw new Error('Устаревшая нода попала в автоматическую очередь');
+  if ((await savedRemoteCount()) !== 1) throw new Error('Устаревший remote-трек исчез из явного просмотра');
   await target.prepare('UPDATE federation_peers SET last_synced_at=CURRENT_TIMESTAMP WHERE node_id=?').run(sourceNode);
+  if ((await queueCount()) !== 1) throw new Error('Трек не вернулся в очередь после обновления каталога');
 
   let rejected = false;
   try {
@@ -70,7 +92,7 @@ try {
   if (await target.prepare('SELECT 1 FROM federation_remote_tracks WHERE origin_node_id=? AND object_id=?').get(sourceNode,sourceTrack)) throw new Error('Вторая нода не применила track.delete.v1');
   if (!(await target.prepare('SELECT 1 FROM tracks WHERE id=?').get(targetTrack))) throw new Error('Удаление remote-трека затронуло локальный трек');
 
-  console.log(JSON.stringify({ok:true,nodes:2,upsert:true,optional_forward_compatibility:true,critical_event_rejected:true,transaction_rollback:true,delete:true,local_library_isolated:true,target_node:targetNode}));
+  console.log(JSON.stringify({ok:true,nodes:2,upsert:true,optional_forward_compatibility:true,critical_event_rejected:true,transaction_rollback:true,delete:true,local_library_isolated:true,mixed_queue:true,online_offline_online:true,stream_breaker_recovery:true,offline_item_visible:true,target_node:targetNode}));
 } finally {
   await Promise.allSettled([source.close(),target.close()]);
 }

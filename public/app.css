@@ -95,6 +95,8 @@ select { min-width:170px; padding:0 13px; color:inherit; background:#17191d; bor
 .recommendation-card:hover .recommendation-cover span,.recommendation-card:focus-visible .recommendation-cover span { opacity:1; }
 .tracks { display:grid; gap:8px; }
 .track { display:grid; grid-template-columns:54px 1fr 38px auto 38px; align-items:center; gap:12px; padding:10px; border-radius:14px; }
+.track.openvk-track { grid-template-columns:54px minmax(0,1fr) auto auto 0; }
+.openvk-import { min-width:96px; }
 .track.unavailable { opacity:.62; }.track.unavailable .artwork { filter:grayscale(1); cursor:not-allowed; }
 .track:hover,.track.playing { background:var(--panel); }
 .track.playing .title { color:var(--accent); }
