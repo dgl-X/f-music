@@ -38,10 +38,16 @@ export function createAdminObservabilityService({ db, storageDir, processStarted
         SELECT 'Загрузка' AS kind, uploads.filename AS item, COALESCE(processing_jobs.last_error,uploads.error) AS error,
           GREATEST(uploads.updated_at,processing_jobs.updated_at) AS updated_at
           FROM uploads LEFT JOIN processing_jobs ON processing_jobs.upload_id=uploads.id
-          WHERE uploads.status='failed' OR processing_jobs.status='failed'
+          WHERE (uploads.status='failed' OR processing_jobs.status='failed')
+            AND GREATEST(uploads.updated_at,processing_jobs.updated_at)>COALESCE(
+              (SELECT NULLIF(value,'')::timestamptz FROM app_settings WHERE key='admin_recent_errors_cleared_at'),
+              '-infinity'::timestamptz)
         UNION ALL
         SELECT 'AAC' AS kind, tracks.artist || ' — ' || tracks.title AS item, track_files.error,
-          track_files.updated_at FROM track_files JOIN tracks ON tracks.id=track_files.track_id WHERE track_files.status='failed'
+          track_files.updated_at FROM track_files JOIN tracks ON tracks.id=track_files.track_id
+          WHERE track_files.status='failed' AND track_files.updated_at>COALESCE(
+            (SELECT NULLIF(value,'')::timestamptz FROM app_settings WHERE key='admin_recent_errors_cleared_at'),
+            '-infinity'::timestamptz)
         ) errors ORDER BY updated_at DESC LIMIT 10`).all(),
       db.prepare('SELECT id, storage_key, cover_key FROM tracks').all(),
       db.prepare("SELECT track_id,variant,storage_key FROM track_files WHERE status='ready'").all(),
@@ -72,5 +78,12 @@ export function createAdminObservabilityService({ db, storageDir, processStarted
     return {generated_at:new Date().toISOString(),status:workerAge!==null&&workerAge<=45?'ok':'degraded',api:{uptime_seconds:Math.floor(uptime()),started_at:processStartedAt.toISOString(),...httpMetricSnapshot(httpMetrics),memory_rss_bytes:memoryUsage().rss},worker:{status:workerAge!==null&&workerAge<=45?'ok':'stale',last_seen_at:heartbeat?.last_seen_at??null,age_seconds:workerAge},queues:{uploads:queue(uploads),transcodes:queue(transcodes),recognition:queue(recognition),loudness:queue(loudness),federation_replicas:queue(replicas)},operations:operationMetricSnapshot(operations),summary:numericRecord(summary),federation:{...Object.fromEntries(Object.entries(federation).map(([key,value])=>[key,Number(value||0)])),...federationStats()}};
   }
 
-  return { stats,metrics };
+  async function clearRecentErrors() {
+    const clearedAt=new Date().toISOString();
+    await db.prepare(`INSERT INTO app_settings(key,value,updated_at) VALUES('admin_recent_errors_cleared_at',?,CURRENT_TIMESTAMP)
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP`).run(clearedAt);
+    return {cleared_at:clearedAt};
+  }
+
+  return { stats,metrics,clearRecentErrors };
 }

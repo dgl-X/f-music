@@ -68,3 +68,14 @@ export class ShuffleNavigator {
     return result;
   }
 }
+
+export function nextPlayableIndex(size, currentIndex, direction, playable, wrap = true) {
+  if (size < 2 || currentIndex < 0 || currentIndex >= size || (direction !== 1 && direction !== -1)) return -1;
+  for (let step = 1; step <= size; step++) {
+    const candidate = currentIndex + direction * step;
+    if (!wrap && (candidate < 0 || candidate >= size)) break;
+    const index = (candidate % size + size) % size;
+    if (index !== currentIndex && playable(index)) return index;
+  }
+  return -1;
+}

@@ -37,6 +37,39 @@ test('track catalog keeps pagination envelope and user-scoped filters', async ()
   assert.match(calls[1].sql, /ORDER BY title COLLATE NOCASE ASC,id/);
 });
 
+test('artist card queue is filtered by stable artist id before its name is loaded', async () => {
+  const calls=[];
+  const db={prepare(sql){return {
+    async get(params){calls.push({type:'get',sql,params});return {count:2};},
+    async all(params){calls.push({type:'all',sql,params});return [{id:'track-1',cover_key:'covers/1.jpg'}];},
+  };}};
+  const catalog=createCatalogService({db,apiPrefix:'/api/v1'});
+  const result=await catalog.listTracks({userId:7,searchParams:new URLSearchParams('artist_id=42&queue=1&limit=10000&sort=title'),responsePrefix:'/api/v1'});
+  assert.equal(result.total,2);
+  assert.equal(result.items[0].cover_url,'/api/v1/tracks/track-1/cover');
+  assert.match(calls[0].sql,/track_artists\.artist_id=@artist_id/);
+  assert.equal(calls[0].params.artist_id,42);
+  assert.doesNotMatch(calls[0].sql,/artists\.name=@artist/);
+});
+
+test('track and collection artwork retain the request API version prefix', async () => {
+  const trackDb={prepare(sql){return {
+    async get(){return {count:1};},
+    async all(){return [{id:'track-1',cover_key:'covers/1.jpg'}];},
+  };}};
+  const tracks=createCatalogService({db:trackDb,apiPrefix:'/api'});
+  const trackResult=await tracks.listTracks({userId:1,searchParams:new URLSearchParams(),responsePrefix:'/api/v1'});
+  assert.equal(trackResult.items[0].cover_url,'/api/v1/tracks/track-1/cover');
+
+  const collectionDb={prepare(sql){return {
+    async get(){return {count:1};},
+    async all(){return sql.includes('FROM artists')?[{id:3,name:'Artist',image_key:'artists/3.jpg'}]:[];},
+  };}};
+  const collections=createCatalogService({db:collectionDb,apiPrefix:'/api'});
+  const collectionResult=await collections.listCollections({searchParams:new URLSearchParams('view=artists'),responsePrefix:'/api/v1'});
+  assert.equal(collectionResult.items[0].image_url,'/api/v1/artists/3/image');
+});
+
 test('legacy album and artist pair resolves to the album card id', async () => {
   const calls = [];
   const db = { prepare(sql) { return {
