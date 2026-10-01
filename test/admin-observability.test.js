@@ -32,7 +32,7 @@ test('admin stats preserve response shape and report missing media', async () =>
         if(sql.includes('FROM processing_jobs GROUP'))return [{status:'queued',count:'2'}];
         if(sql.includes('FROM track_files GROUP BY status'))return [{status:'ready',count:'1'}];
         if(sql.includes('SELECT variant, status'))return [{variant:'aac_192',status:'ready',files:'1',bytes:'4'}];
-        if(sql.includes('SELECT kind, item'))return [];
+        if(sql.includes('SELECT kind, item')){assert.match(sql,/admin_recent_errors_cleared_at/);return [];}
         if(sql.includes('SELECT id, storage_key'))return [{id:'ready',storage_key:'originals/ready.mp3',cover_key:null},{id:'missing',storage_key:'originals/missing.mp3',cover_key:'covers/missing.jpg'}];
         if(sql.includes('SELECT track_id,variant'))return [{track_id:'missing',variant:'aac_192',storage_key:'derived/missing.m4a'}];
         throw new Error(`Unexpected all: ${sql}`);
@@ -46,6 +46,19 @@ test('admin stats preserve response shape and report missing media', async () =>
     assert.deepEqual(result.integrity.missing_covers,['missing']);
     assert.deepEqual(result.integrity.missing_variants,[{track_id:'missing',variant:'aac_192'}]);
   } finally { fs.rmSync(root,{recursive:true,force:true}); }
+});
+
+test('clearing recent errors stores a visibility cutoff without deleting failed jobs', async () => {
+  const calls=[];
+  const db={prepare(sql){return {async run(value){calls.push({sql,value});}};}};
+  const service=createAdminObservabilityService({db,storageDir:'/unused',processStartedAt:new Date(0),httpMetrics:{}});
+  const result=await service.clearRecentErrors();
+  assert.match(result.cleared_at,/^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(calls.length,1);
+  assert.match(calls[0].sql,/INSERT INTO app_settings/);
+  assert.match(calls[0].sql,/ON CONFLICT\(key\) DO UPDATE/);
+  assert.doesNotMatch(calls[0].sql,/DELETE FROM (uploads|processing_jobs|track_files)/);
+  assert.equal(calls[0].value,result.cleared_at);
 });
 
 test('admin metrics combine worker, queues, HTTP and federation snapshots', async () => {

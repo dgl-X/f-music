@@ -657,6 +657,10 @@ async function api(req, res, url, apiPrefix = '/api') {
     if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
     return sendJson(res, 200, await adminObservability.stats());
   }
+  if (url.pathname === '/api/admin/stats/recent-errors' && req.method === 'DELETE') {
+    if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
+    return sendJson(res, 200, { ok:true,...await adminObservability.clearRecentErrors() });
+  }
   if (url.pathname === '/api/admin/metrics' && req.method === 'GET') {
     if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
     return sendJson(res, 200, await adminObservability.metrics());
@@ -1121,7 +1125,7 @@ async function api(req, res, url, apiPrefix = '/api') {
     return sendJson(res, 200, { ok: true });
   }
   if (url.pathname === '/api/tracks' && req.method === 'GET') {
-    return sendJson(res, 200, await catalog.listTracks({ searchParams: url.searchParams, userId: user.id }));
+    return sendJson(res, 200, await catalog.listTracks({ searchParams: url.searchParams, userId: user.id, responsePrefix:apiPrefix }));
   }
   if (url.pathname === '/api/recommendations' && req.method === 'GET') {
     const tracks = (await db.prepare(`SELECT tracks.id,tracks.title,tracks.artist,tracks.album,tracks.filename,tracks.mime_type,
@@ -1163,7 +1167,7 @@ async function api(req, res, url, apiPrefix = '/api') {
     return sendJson(res, 200, { items: requested.map(id => byId.get(id)).filter(Boolean) });
   }
   if (url.pathname === '/api/catalog' && req.method === 'GET') {
-    return sendJson(res, 200, await catalog.listCollections({ searchParams: url.searchParams }));
+    return sendJson(res, 200, await catalog.listCollections({ searchParams: url.searchParams, responsePrefix:apiPrefix }));
   }
   if (url.pathname === '/api/playlists' && req.method === 'GET') {
     return sendJson(res,200,await catalog.listPlaylists({searchParams:url.searchParams,userId:user.id}));

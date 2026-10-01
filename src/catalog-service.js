@@ -16,6 +16,7 @@ export function parseTrackListRequest(searchParams) {
   return {
     query: String(searchParams.get('q') ?? '').trim().slice(0, 120),
     artist: String(searchParams.get('artist') ?? '').trim().slice(0, 240),
+    artistId: Number(searchParams.get('artist_id')),
     album: String(searchParams.get('album') ?? '').trim().slice(0, 240),
     albumId: Number(searchParams.get('album_id')),
     liked: searchParams.get('liked') === '1',
@@ -68,7 +69,7 @@ function normalizePlaylistInput(input) {
 }
 
 export function createCatalogService({ db, apiPrefix }) {
-  async function listTracks({ searchParams, userId }) {
+  async function listTracks({ searchParams, userId, responsePrefix = apiPrefix }) {
     const request = parseTrackListRequest(searchParams);
     const where = [];
     const params = { current_user: userId, limit: request.limit, offset: request.offset, seed: request.seed };
@@ -86,7 +87,11 @@ export function createCatalogService({ db, apiPrefix }) {
       where.push('album_id = @album_id');
       params.album_id = request.albumId;
     } else {
-      if (request.artist) {
+      if (Number.isSafeInteger(request.artistId) && request.artistId > 0) {
+        where.push(`EXISTS(SELECT 1 FROM track_artists
+          WHERE track_artists.track_id=tracks.id AND track_artists.artist_id=@artist_id)`);
+        params.artist_id = request.artistId;
+      } else if (request.artist) {
         where.push(`EXISTS(SELECT 1 FROM track_artists JOIN artists ON artists.id=track_artists.artist_id
           WHERE track_artists.track_id=tracks.id AND artists.name=@artist COLLATE NOCASE)`);
         params.artist = request.artist;
@@ -112,13 +117,13 @@ export function createCatalogService({ db, apiPrefix }) {
       FROM tracks ${filter} ORDER BY ${request.order},id LIMIT @limit OFFSET @offset`;
     const items = (await db.prepare(sql).all(params)).map(track => ({
       ...track,
-      cover_url: track.cover_key ? `${apiPrefix}/tracks/${track.id}/cover` : null,
+      cover_url: track.cover_key ? `${responsePrefix}/tracks/${track.id}/cover` : null,
       cover_key: undefined,
     }));
     return { items, total, offset: request.offset, limit: request.limit, has_more: request.offset + items.length < total };
   }
 
-  async function listCollections({ searchParams }) {
+  async function listCollections({ searchParams, responsePrefix = apiPrefix }) {
     const request = parseCollectionListRequest(searchParams);
     const pageSql = request.view ? ' LIMIT @limit OFFSET @offset' : '';
     const params = { limit: request.limit, offset: request.offset, query: `%${request.query}%` };
@@ -132,7 +137,7 @@ export function createCatalogService({ db, apiPrefix }) {
       FROM artists JOIN track_artists ON track_artists.artist_id=artists.id JOIN tracks ON tracks.id=track_artists.track_id WHERE TRUE ${artistWhere}
       GROUP BY artists.id,artists.name,artists.bio,artists.image_key ORDER BY artists.name COLLATE NOCASE${request.view === 'artists' ? pageSql : ''}`).all(params);
     for (const artist of artists) {
-      artist.image_url = artist.image_key ? `${apiPrefix}/artists/${artist.id}/image` : null;
+      artist.image_url = artist.image_key ? `${responsePrefix}/artists/${artist.id}/image` : null;
       delete artist.image_key;
     }
     if (request.view === 'artists') return {
@@ -147,7 +152,7 @@ export function createCatalogService({ db, apiPrefix }) {
     const albums = await db.prepare(`SELECT albums.id,albums.name,albums.artist,albums.bio,COALESCE(albums.year,max(tracks.year)) AS year,
       count(tracks.id) AS track_count,
       min(tracks.id) FILTER (WHERE tracks.cover_key IS NOT NULL) AS cover_track_id,
-      CASE WHEN albums.image_key IS NOT NULL THEN '${apiPrefix}/albums/'||albums.id||'/image' ELSE NULL END AS image_url
+      CASE WHEN albums.image_key IS NOT NULL THEN '${responsePrefix}/albums/'||albums.id||'/image' ELSE NULL END AS image_url
       FROM albums JOIN tracks ON tracks.album_id=albums.id WHERE TRUE ${albumFilter}
       GROUP BY albums.id ORDER BY albums.name COLLATE NOCASE${request.view === 'albums' ? pageSql : ''}`).all(params);
     if (request.view === 'albums') return {
