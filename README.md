@@ -110,15 +110,20 @@ npm start
 | `MUSIC_HOST` | `127.0.0.1` | Адрес прослушивания |
 | `MUSIC_PORT` | `8095` | Порт API/web |
 | `DATABASE_URL` | — | Строка подключения к PostgreSQL |
+| `MUSIC_DATA_DIR` | `./data` | Локальные служебные данные |
 | `MUSIC_STORAGE_DIR` | `./storage` | Музыкальные файлы |
 | `MUSIC_SECURE_COOKIES` | `false` | Cookie только по HTTPS |
 | `MUSIC_MAX_UPLOAD_BYTES` | 1 ГиБ | Максимальный размер одного файла |
 | `MUSIC_SESSION_DAYS` | `30` | Срок жизни сеанса |
 | `MUSIC_ABANDONED_UPLOAD_HOURS` | `24` | Когда незавершённая загрузка считается брошенной |
 | `MUSIC_UPLOAD_CLEANUP_MINUTES` | `60` | Интервал автоматической очистки |
+| `MUSIC_DIAGNOSTIC_RETENTION_DAYS` | `90` | Срок хранения открытых диагностических отчётов |
+| `MUSIC_DIAGNOSTIC_FIXED_RETENTION_DAYS` | `30` | Срок хранения закрытых диагностических отчётов |
 | `MUSIC_WORKER_POLL_MS` | `1500` | Интервал проверки очереди обработки |
+| `MUSIC_X_ACCEL_REDIRECT` | `false` | Передавать авторизованные медиа внутреннему nginx |
 | `MUSIC_RECOGNITION_ENABLED` | `false` | Фоновое распознавание файлов без тегов |
 | `MUSIC_REGISTRATION_ENABLED` | `false` | Начальное состояние самостоятельной регистрации; затем управляется администратором в WEB |
+| `MUSIC_METRICS_TOKEN` | — | Отдельный Bearer-токен метрик Zabbix |
 | `ACOUSTID_CLIENT_KEY` | — | Client key приложения AcoustID |
 
 За HTTPS необходимо установить `MUSIC_SECURE_COOKIES=true`.
