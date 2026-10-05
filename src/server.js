@@ -36,6 +36,7 @@ import { createOperationMetrics } from './operation-metrics.js';
 import { createOpenVkProvider } from './openvk-provider.js';
 import { createOpenVkHttpController } from './openvk-http.js';
 import { createAdminObservabilityService } from './admin-observability.js';
+import { createConnectService } from './connect-service.js';
 
 const config = loadConfig();
 const db = await openDatabase(config.databaseUrl);
@@ -61,6 +62,7 @@ const registrationLimiter = new RegistrationLimiter();
 const authentication = createAuthenticationService({ db, sessionDays: config.sessionDays, secureCookies: config.secureCookies });
 const catalog = createCatalogService({ db, apiPrefix: '/api' });
 const uploadJobs = createUploadJobService({ db });
+const connect = createConnectService({ db, enabled:config.connectEnabled });
 const federation = createFederationService({ db });
 const federationAvailability = createFederationAvailabilityService({ db });
 const operationMetrics = createOperationMetrics({ db });
@@ -609,6 +611,57 @@ async function api(req, res, url, apiPrefix = '/api') {
   }
   const user = await requireUser(req, res);
   if (!user) return;
+  if (url.pathname === '/api/connect/status' && req.method === 'GET') {
+    return sendJson(res,200,{enabled:connect.enabled,transport:'polling',poll_interval_ms:1500});
+  }
+  if (url.pathname.startsWith('/api/connect/') && !connect.enabled) return sendJson(res,404,{error:'Family Music Connect выключен',error_code:'connect_disabled'});
+  if (url.pathname === '/api/connect/devices' && req.method === 'POST') {
+    const result=await connect.registerDevice(user.id,await readJson(req,64*1024));
+    if(result.status==='invalid')return sendJson(res,400,{error:result.error});
+    if(result.status==='conflict')return sendJson(res,409,{error:result.error});
+    return sendJson(res,200,result);
+  }
+  if (url.pathname === '/api/connect/devices' && req.method === 'GET') {
+    return sendJson(res,200,{items:await connect.listDevices(user.id),state:await connect.getState(user.id)});
+  }
+  const connectDeviceDelete=/^\/api\/connect\/devices\/([a-zA-Z0-9_-]{16,96})$/.exec(url.pathname);
+  if(connectDeviceDelete&&req.method==='DELETE'){
+    if(!await connect.revokeDevice(user.id,connectDeviceDelete[1]))return sendJson(res,404,{error:'Connect-устройство не найдено'});
+    return sendJson(res,200,{ok:true});
+  }
+  if(url.pathname==='/api/connect/state'&&req.method==='GET')return sendJson(res,200,await connect.getState(user.id));
+  if(url.pathname==='/api/connect/state'&&req.method==='PUT'){
+    const body=await readJson(req,1024*1024),result=await connect.updateState(user.id,String(body.device_id||''),body);
+    if(result.status==='missing_device')return sendJson(res,404,{error:'Connect-устройство не зарегистрировано'});
+    if(result.status==='not_active')return sendJson(res,409,{error:'Состояние может менять только активное устройство',state:result.state});
+    if(result.status==='stale_epoch')return sendJson(res,409,{error:'Устаревшая эпоха Connect-плеера',error_code:'connect_stale_epoch',state:result.state});
+    return sendJson(res,200,result.state);
+  }
+  if(url.pathname==='/api/connect/transfer'&&req.method==='POST'){
+    const body=await readJson(req,1024*1024),result=await connect.requestTransfer(user.id,String(body.source_device_id||''),String(body.target_device_id||''),body.state||{});
+    if(result.status==='invalid')return sendJson(res,400,{error:result.error});
+    if(result.status==='missing_device')return sendJson(res,404,{error:'Устройство не найдено или недоступно'});
+    return sendJson(res,202,result);
+  }
+  if(url.pathname==='/api/connect/commands'&&req.method==='POST'){
+    const body=await readJson(req,64*1024),result=await connect.sendCommand(user.id,String(body.source_device_id||''),String(body.action||''),body.payload||{});
+    if(result.status==='invalid')return sendJson(res,400,{error:result.error});
+    if(result.status==='missing_device')return sendJson(res,404,{error:'Управляющее устройство не зарегистрировано'});
+    if(result.status==='no_active_device')return sendJson(res,409,{error:'Активное устройство не выбрано'});
+    if(result.status==='target_offline')return sendJson(res,409,{error:'Активное устройство недоступно'});
+    return sendJson(res,202,result);
+  }
+  if(url.pathname==='/api/connect/commands'&&req.method==='GET'){
+    const items=await connect.pollCommands(user.id,String(url.searchParams.get('device_id')||''),url.searchParams.get('after'));
+    if(!items)return sendJson(res,404,{error:'Connect-устройство не зарегистрировано'});
+    return sendJson(res,200,{items,state:await connect.getState(user.id)});
+  }
+  const connectAck=/^\/api\/connect\/commands\/(\d+)\/ack$/.exec(url.pathname);
+  if(connectAck&&req.method==='POST'){
+    const body=await readJson(req,64*1024),result=await connect.acknowledge(user.id,String(body.device_id||''),Number(connectAck[1]),body);
+    if(result.status==='missing')return sendJson(res,404,{error:'Connect-команда не найдена или уже завершена'});
+    return sendJson(res,200,result);
+  }
   if (url.pathname === '/api/me') return sendJson(res, 200, user);
   if (url.pathname === '/api/sessions' && req.method === 'GET') {
     return sendJson(res, 200, { items: await authentication.listSessions(user) });

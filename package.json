@@ -1,6 +1,6 @@
 {
   "name": "family-music",
-  "version": "0.1.19",
+  "version": "0.1.23",
   "private": true,
   "license": "AGPL-3.0-only",
   "type": "module",
@@ -12,6 +12,8 @@
     "test:federation:two-node": "node scripts/federation-two-node-ci.mjs",
     "test:federation:baseline": "node scripts/check-federation-baseline.mjs",
     "test:federation:reconnect": "node scripts/federation-reconnect-smoke.mjs",
+    "test:connect:smoke": "node scripts/connect-smoke.mjs",
+    "test:connect:integration": "node scripts/connect-integration-ci.mjs",
     "import:openvk:dry": "node scripts/import-openvk.js --dry-run",
     "import:openvk": "node scripts/import-openvk.js --skip-export",
     "migrate:postgres": "node scripts/migrate-sqlite-to-postgres.js"
