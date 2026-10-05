@@ -179,6 +179,12 @@ input[type=range]::-webkit-slider-thumb { appearance:none; width:13px; height:13
 .queue-actions button { width:27px; height:30px; padding:0; border:0; border-radius:7px; color:var(--muted); background:transparent; }
 .queue-actions button:hover:not(:disabled) { color:var(--accent); background:#303238; }
 .queue-actions button:disabled { opacity:.25; cursor:default; }
+.connect-toggle.active { color:#17130a; background:var(--accent); }
+.connect-dialog { width:min(520px,calc(100% - 28px)); }
+.connect-devices { display:grid; gap:8px; }
+.connect-device { display:flex; align-items:center; justify-content:space-between; gap:16px; width:100%; padding:14px 16px; color:#f6f4ef; text-align:left; border:1px solid #303238; border-radius:14px; background:#202228; }
+.connect-device span { min-width:0; display:grid; gap:4px; }.connect-device small { color:var(--muted); }.connect-device em { color:var(--muted); font-style:normal; }
+.connect-device.active { border-color:var(--accent); }.connect-device.active em { color:var(--accent); }.connect-device:disabled { opacity:.55; cursor:not-allowed; }
 audio { display:none; }
 dialog { width:min(520px,calc(100% - 28px)); color:inherit; background:var(--panel); border:1px solid #3b3d44; border-radius:20px; padding:0; box-shadow:0 30px 100px #000c; }
 dialog::backdrop { background:#0009; backdrop-filter:blur(4px); }

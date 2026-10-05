@@ -117,3 +117,35 @@ jobs:
         run: npm ci
       - name: Проверить загрузку, worker и HTTP Range
         run: npm run test:media:integration
+
+  connect-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: family_music_connect_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d family_music_connect_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CONNECT_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/family_music_connect_test
+    steps:
+      - name: Получить исходный код
+        uses: actions/checkout@v5
+      - name: Установить Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - name: Установить зависимости
+        run: npm ci
+      - name: Проверить гонки Family Music Connect
+        run: npm run test:connect:integration

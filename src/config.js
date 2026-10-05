@@ -21,5 +21,6 @@ export function loadConfig(env = process.env) {
     acoustIdClientKey: String(env.ACOUSTID_CLIENT_KEY ?? ''),
     metricsToken: String(env.MUSIC_METRICS_TOKEN ?? ''),
     registrationEnabled: env.MUSIC_REGISTRATION_ENABLED === 'true',
+    connectEnabled: env.MUSIC_CONNECT_ENABLED === 'true',
   };
 }
