@@ -42,7 +42,8 @@ jobs:
         run: |
           version="${RELEASE_TAG#v}"
           ./packaging/build-deb.sh "$version" amd64
-          sha256sum dist/family-music-server_*.deb > dist/SHA256SUMS
+          cd dist
+          sha256sum family-music-server_*.deb > SHA256SUMS
 
       - name: Создать GitHub Release
         env:
