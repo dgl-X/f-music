@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { ConnectClient, availableConnectDevices } from '../public/connect-client.js';
+import { ConnectClient, availableConnectDevices, remotePlaybackActive } from '../public/connect-client.js';
 
 const storage=()=>{const values=new Map();return{getItem:key=>values.get(key)||null,setItem:(key,value)=>values.set(key,String(value))};};
 const cryptoObject={randomUUID:()=> '01234567-89ab-cdef-0123-456789abcdef'};
@@ -13,6 +13,13 @@ test('WEB Connect switcher shows only online playback-ready devices', () => {
     {id:'legacy-ready',online:true,capabilities:{}},
   ]);
   assert.deepEqual(devices.map(device=>device.id),['current','legacy-ready']);
+});
+
+test('local media events yield the timeline while Connect plays remotely', () => {
+  const client={enabled:true,deviceId:'web-here'};
+  assert.equal(remotePlaybackActive(client,{active_device_id:'android-phone'}),true);
+  assert.equal(remotePlaybackActive(client,{active_device_id:'web-here'}),false);
+  assert.equal(remotePlaybackActive({...client,enabled:false},{active_device_id:'android-phone'}),false);
 });
 
 test('WEB Connect client keeps a stable per-tab opaque device id', () => {

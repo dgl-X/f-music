@@ -4,6 +4,10 @@ export const availableConnectDevices = devices => (Array.isArray(devices) ? devi
   device?.online && device.capabilities?.playback_ready !== false
 );
 
+export const remotePlaybackActive = (client, state) => Boolean(
+  client?.enabled && state?.active_device_id && state.active_device_id !== client.deviceId
+);
+
 export class ConnectClient {
   constructor({ api, storage = globalThis.sessionStorage, cryptoObject = globalThis.crypto, onCommand = async () => ({ success:false }), onState = () => {}, pollIntervalMs = 1500 }) {
     this.api=api;this.storage=storage;this.cryptoObject=cryptoObject;this.onCommand=onCommand;this.onState=onState;this.pollIntervalMs=pollIntervalMs;
