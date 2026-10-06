@@ -91,6 +91,21 @@ export function createConnectService({ db, enabled = false, commandTtlSeconds = 
     return stateDto(await dbLike.prepare('SELECT * FROM connect_state WHERE user_id=?').get(userId));
   }
 
+  async function releaseOfflineActiveDevice(userId) {
+    return db.transaction(async tx => {
+      const active=await tx.prepare(`SELECT state.active_device_id,
+          (device.id IS NOT NULL AND device.revoked_at IS NULL AND device.last_seen_at>CURRENT_TIMESTAMP-(? * INTERVAL '1 second')) AS online
+        FROM connect_state state LEFT JOIN connect_devices device ON device.id=state.active_device_id AND device.user_id=state.user_id
+        WHERE state.user_id=? FOR UPDATE OF state`).get(onlineSeconds,userId);
+      if(!active?.active_device_id||active.online)return false;
+      await tx.prepare(`UPDATE connect_state SET active_device_id=NULL,playing=0,revision=revision+1,updated_at=CURRENT_TIMESTAMP
+        WHERE user_id=? AND active_device_id=?`).run(userId,active.active_device_id);
+      await tx.prepare(`UPDATE connect_commands SET status='cancelled',acknowledged_at=CURRENT_TIMESTAMP
+        WHERE user_id=? AND target_device_id=? AND status='pending'`).run(userId,active.active_device_id);
+      return true;
+    });
+  }
+
   async function updateState(userId, deviceId, input = {}) {
     if(!await ownDevice(db,userId,deviceId))return { status:'missing_device' };
     const current=await getState(userId);
@@ -138,6 +153,7 @@ export function createConnectService({ db, enabled = false, commandTtlSeconds = 
   async function pollCommands(userId, deviceId, after = 0) {
     if(!await ownDevice(db,userId,deviceId))return null;
     await db.prepare('UPDATE connect_devices SET last_seen_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?').run(deviceId,userId);
+    await releaseOfflineActiveDevice(userId);
     const rows=await db.prepare(`SELECT id,source_device_id,action,payload_json,created_at FROM connect_commands
       WHERE user_id=? AND target_device_id=? AND status='pending' AND expires_at>CURRENT_TIMESTAMP AND id>? ORDER BY id LIMIT 1`).all(userId,deviceId,Math.max(0,Number(after)||0));
     return rows.map(row=>({id:Number(row.id),source_device_id:row.source_device_id,action:row.action,payload:parseJson(row.payload_json,{}),created_at:row.created_at}));
@@ -169,5 +185,5 @@ export function createConnectService({ db, enabled = false, commandTtlSeconds = 
     });
   }
 
-  return { enabled:Boolean(enabled),registerDevice,listDevices,revokeDevice,getState,updateState,requestTransfer,sendCommand,pollCommands,acknowledge };
+  return { enabled:Boolean(enabled),registerDevice,listDevices,revokeDevice,getState,updateState,requestTransfer,sendCommand,pollCommands,acknowledge,releaseOfflineActiveDevice };
 }

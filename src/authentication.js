@@ -106,10 +106,11 @@ export function createAuthenticationService({ db, sessionDays, secureCookies }) 
         const device = String(deviceName ?? '').trim().slice(0, 120);
         const client = String(clientName ?? '').trim().slice(0, 120);
         await db.prepare(`UPDATE sessions SET last_seen_at=CURRENT_TIMESTAMP, ip_address=?,
+          expires_at=CURRENT_TIMESTAMP+(? * INTERVAL '1 day'),
           device_name=CASE WHEN ?='' THEN device_name ELSE ? END,
           client_name=CASE WHEN ?='' THEN client_name ELSE ? END
           WHERE id=? AND (last_seen_at < CURRENT_TIMESTAMP - INTERVAL '1 minute' OR device_name='' OR device_name='Неизвестное устройство')`)
-          .run(ip, device, device, client, client, user.session_id);
+          .run(ip, sessionDays, device, device, client, client, user.session_id);
       }
       return user;
     },

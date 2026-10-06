@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { clearSessionCookie, hasValidSessionOrigin, LoginAttemptLimiter, requestOriginMatches, sessionCookie, validateInitialSetup, validateNewPassword } from '../src/authentication.js';
+import { clearSessionCookie, createAuthenticationService, hasValidSessionOrigin, LoginAttemptLimiter, requestOriginMatches, sessionCookie, validateInitialSetup, validateNewPassword } from '../src/authentication.js';
 
 const request = ({ method='POST', origin, host='music.example', protocol='https', cookie='' }={}) => ({
   method, headers:{ origin, host, cookie, 'x-forwarded-proto':protocol }, socket:{ remoteAddress:'127.0.0.1' },
@@ -25,6 +25,19 @@ test('login limiter resets after success or expiry', () => {
 test('session cookies keep security attributes', () => {
   assert.match(sessionCookie('a b',30,true),/^music_session=a%20b; Path=\/; HttpOnly; SameSite=Strict; Max-Age=2592000; Secure$/);
   assert.equal(clearSessionCookie(),'music_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0');
+});
+
+test('active sessions extend their expiry from the latest use', async () => {
+  const calls=[];
+  const db={prepare(sql){return{
+    async get(){if(sql.startsWith('SELECT users.id'))return{id:7,username:'user',session_id:41};},
+    async run(...params){calls.push({sql,params});return{changes:1};},
+  };}};
+  const authentication=createAuthenticationService({db,sessionDays:30,secureCookies:true});
+  const user=await authentication.currentUser({cookieHeader:'music_session=token',deviceName:'Pixel',clientName:'Android',ip:'127.0.0.1'});
+  assert.equal(user.id,7);
+  assert.match(calls[0].sql,/expires_at=CURRENT_TIMESTAMP\+\(\? \* INTERVAL '1 day'\)/);
+  assert.deepEqual(calls[0].params,['127.0.0.1',30,'Pixel','Pixel','Android','Android',41]);
 });
 
 test('initial setup and password changes share strict validation',()=>{

@@ -3,7 +3,6 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
 import { loadConfig } from './config.js';
 import { openDatabase } from './db.js';
 import { ensureFederationIdentity, loadFederationIdentity, publicNodeDescriptor } from './federation-identity.js';
@@ -11,12 +10,12 @@ import { decodeRemoteReference, encodeRemoteReference, federationTrackVisible } 
 import { openFederationStream, probeFederationEndpoint } from './federation-endpoints.js';
 import { signFederationRequest, verifyFederationRequest } from './federation-signatures.js';
 import { resolveApiRoute } from './routing.js';
-import { hashPassword, randomToken, tokenHash } from './security.js';
+import { hashPassword, parseCookies, randomToken, tokenHash } from './security.js';
 import { normalizeHybridFlac } from './audio-normalization.js';
 import { audioCodec, playbackVariant, requiresCompatibilityVariant } from './audio-compatibility.js';
 import { serveStoredMedia } from './media-stream.js';
 import { RegistrationLimiter, validateRegistration } from './registration.js';
-import { clearSessionCookie, createAuthenticationService, hasValidSessionOrigin, requestIp, requestOriginMatches } from './authentication.js';
+import { clearSessionCookie, createAuthenticationService, hasValidSessionOrigin, requestIp, requestOriginMatches, sessionCookie } from './authentication.js';
 import { validateAudioDecode } from './audio-validation.js';
 import { createCatalogService } from './catalog-service.js';
 import { savePlaybackState } from './playback-state.js';
@@ -36,6 +35,12 @@ import { createOperationMetrics } from './operation-metrics.js';
 import { createOpenVkProvider } from './openvk-provider.js';
 import { createOpenVkHttpController } from './openvk-http.js';
 import { createAdminObservabilityService } from './admin-observability.js';
+import { createDiagnosticReportsHttpController, createDiagnosticReportsService } from './diagnostic-reports.js';
+import { createLoudnessHttpController, createLoudnessService } from './loudness-service.js';
+import { createRecognitionService } from './recognition-service.js';
+import { createRecognitionHttpController } from './recognition-http.js';
+import { createTranscodeService } from './transcode-service.js';
+import { createWorkerMaintenance } from './worker-maintenance.js';
 import { createConnectService } from './connect-service.js';
 
 const config = loadConfig();
@@ -47,14 +52,12 @@ const originalDir = path.join(config.storageDir, 'originals');
 const coverDir = path.join(config.storageDir, 'covers');
 const artistDir = path.join(config.storageDir, 'artists');
 const albumDir = path.join(config.storageDir, 'albums');
-const derivedDir = path.join(config.storageDir, 'derived');
 const federationReplicaDir = path.join(config.storageDir, 'federation', 'replicas');
 fs.mkdirSync(uploadDir, { recursive: true, mode: 0o750 });
 fs.mkdirSync(originalDir, { recursive: true, mode: 0o750 });
 fs.mkdirSync(coverDir, { recursive: true, mode: 0o750 });
 fs.mkdirSync(artistDir, { recursive: true, mode: 0o750 });
 fs.mkdirSync(albumDir, { recursive: true, mode: 0o750 });
-fs.mkdirSync(derivedDir, { recursive: true, mode: 0o750 });
 fs.mkdirSync(federationReplicaDir, { recursive: true, mode: 0o750 });
 
 const jsonHeaders = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' };
@@ -82,10 +85,11 @@ const federationSync = createFederationSyncService({
 const uploads = createUploadService({ db, uploadDir, maxUploadBytes:config.maxUploadBytes, uploadJobs });
 const openVk = createOpenVkProvider({ db, uploadDir, maxUploadBytes:config.maxUploadBytes });
 const extractCover = createCoverExtractor({ coverDir, storageDir:config.storageDir });
+const recognition = createRecognitionService({ db, storageDir:config.storageDir, uploadDir, extractCover, defaultEnabled:config.recognitionEnabled, defaultClientKey:config.acoustIdClientKey });
 const uploadProcessor = createUploadProcessor({
   db, uploadDir, originalDir, storageDir:config.storageDir, inspectAudio, sha256File,
   validateAudioDecode, extractCover, normalizeHybridFlac, normalizedTags, audioCodec,
-  recognitionSettings, requiresCompatibilityVariant,
+  recognitionSettings:recognition.settings, requiresCompatibilityVariant,
 });
 const workerMode = process.argv.includes('--worker');
 const processStartedAt = new Date();
@@ -107,6 +111,24 @@ const federationMedia = createFederationMediaService({
 const adminObservability = createAdminObservabilityService({
   db, storageDir:config.storageDir, processStartedAt, httpMetrics,
   federationStats:() => federationMedia.stats(),
+});
+const diagnosticReports = createDiagnosticReportsService({
+  db,
+  retentionDays:config.diagnosticRetentionDays,
+  fixedRetentionDays:config.diagnosticFixedRetentionDays,
+});
+const diagnosticReportsHttp = createDiagnosticReportsHttpController({ reports:diagnosticReports, readJson, sendJson });
+const loudness = createLoudnessService({
+  db,
+  storageDir:config.storageDir,
+  startOperation:operationMetrics.start,
+});
+const loudnessHttp = createLoudnessHttpController({ loudness, sendJson });
+const recognitionHttp = createRecognitionHttpController({ db, recognition, readJson, sendJson });
+const transcoding = createTranscodeService({ db, storageDir:config.storageDir, execute:runProcess, startOperation:operationMetrics.start });
+const maintenance = createWorkerMaintenance({
+  db,storageDir:config.storageDir,uploadDir,abandonedUploadHours:config.abandonedUploadHours,
+  diagnosticReports,inspectAudio,sha256File,extractCover,normalizedTags,
 });
 const federationImport = createFederationImportService({
   db,
@@ -258,6 +280,10 @@ async function currentUser(req) {
 async function requireUser(req, res) {
   const user = await currentUser(req);
   if (!user) sendJson(res, 401, { error: 'Требуется авторизация' });
+  else {
+    const token=parseCookies(req.headers.cookie).music_session;
+    if(token)res.setHeader('Set-Cookie',sessionCookie(token,config.sessionDays,config.secureCookies));
+  }
   return user;
 }
 
@@ -267,155 +293,9 @@ function storedFileExists(storageKey) {
   return file.startsWith(config.storageDir + path.sep) && fs.existsSync(file) && fs.statSync(file).isFile();
 }
 
-function captureProcess(command, args) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn(command, args); let output = '', errors = '';
-    proc.stdout.on('data', chunk => { output += chunk; }); proc.stderr.on('data', chunk => { errors += chunk; });
-    proc.on('close', code => code === 0 ? resolve(output) : reject(new Error(errors.trim() || `${command}: код ${code}`)));
-    proc.on('error', reject);
-  });
-}
-
-function captureProcessOutput(command, args) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn(command, args); let output = '';
-    proc.stdout.on('data', chunk => { output += chunk; }); proc.stderr.on('data', chunk => { output += chunk; });
-    proc.on('close', code => code === 0 ? resolve(output) : reject(new Error(output.trim() || `${command}: код ${code}`)));
-    proc.on('error', reject);
-  });
-}
-
-function parseLoudness(output) {
-  const blocks = [...String(output).matchAll(/\{[\s\S]*?"input_i"[\s\S]*?\}/g)];
-  if (!blocks.length) throw new Error('ffmpeg не вернул измерение loudnorm');
-  const measured = JSON.parse(blocks.at(-1)[0]);
-  const integrated = Number(measured.input_i), peak = Number(measured.input_tp), range = Number(measured.input_lra);
-  if (![integrated, peak, range].every(Number.isFinite)) throw new Error('Некорректное измерение громкости');
-  const gain = Math.max(-12, Math.min(12, -14 - integrated, -1 - peak));
-  return { integrated, peak, range, gain: Math.round(gain * 100) / 100 };
-}
-
-const loudnessConcurrency = 2;
-let loudnessActive = 0;
-async function processNextLoudness() {
-  if (loudnessActive >= loudnessConcurrency) return;
-  loudnessActive++; let job, finish; let succeeded = false;
-  try {
-    const result = await db.prepare(`UPDATE loudness_jobs SET status='processing',attempts=attempts+1,updated_at=CURRENT_TIMESTAMP
-      WHERE id=(SELECT id FROM loudness_jobs WHERE status IN ('queued','retry') AND available_at<=CURRENT_TIMESTAMP ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *`).run();
-    job = result.rows[0]; if (!job) return;
-    finish = operationMetrics.start('audio.loudness');
-    const track = await db.prepare('SELECT storage_key FROM tracks WHERE id=?').get(job.track_id);
-    if (!track || !storedFileExists(track.storage_key)) throw new Error('Исходный файл не найден');
-    const output = await captureProcessOutput('ffmpeg', ['-hide_banner','-nostats','-i',path.join(config.storageDir,track.storage_key),'-map','0:a:0','-af','loudnorm=I=-14:TP=-1:LRA=11:print_format=json','-f','null','-']);
-    const value = parseLoudness(output);
-    await db.prepare(`UPDATE loudness_jobs SET status='ready',integrated_lufs=?,true_peak_db=?,loudness_range_lu=?,recommended_gain_db=?,error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?`)
-      .run(value.integrated,value.peak,value.range,value.gain,job.id);
-    succeeded = true;
-  } catch (error) {
-    const message = String(error.message || error).slice(-2000), attempts = Number(job?.attempts || 0);
-    if (job) await db.prepare(`UPDATE loudness_jobs SET status=?,available_at=CURRENT_TIMESTAMP + (? * INTERVAL '1 second'),error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`)
-      .run(attempts >= 3 ? 'failed' : 'retry', Math.min(900, 30 * (2 ** Math.max(0,attempts-1))), message, job.id).catch(()=>{});
-    console.error('Ошибка анализа громкости:', message);
-  } finally { await finish?.(succeeded); loudnessActive--; }
-}
-
-function pumpLoudness() {
-  for (let slot=0;slot<loudnessConcurrency;slot++) processNextLoudness().catch(error=>console.error('Ошибка loudness worker:',error));
-}
-
-let recognitionBusy = false;
-async function processNextRecognition() {
-  if (recognitionBusy) return;
-  const settings = await recognitionSettings();
-  if (!settings.enabled || !settings.clientKey) return;
-  recognitionBusy = true; let job;
-  try {
-    const result = await db.prepare(`UPDATE recognition_jobs SET status='processing',attempts=attempts+1,updated_at=CURRENT_TIMESTAMP
-      WHERE id=(SELECT id FROM recognition_jobs WHERE status IN ('queued','retry') AND available_at<=CURRENT_TIMESTAMP ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *`).run();
-    job = result.rows[0]; if (!job) return;
-    const track = await db.prepare('SELECT * FROM tracks WHERE id=?').get(job.track_id);
-    if (!track || !storedFileExists(track.storage_key)) throw new Error('Исходный файл не найден');
-    const fingerprint = JSON.parse(await captureProcess('fpcalc', ['-json', path.join(config.storageDir, track.storage_key)]));
-    const body = new URLSearchParams({ client: settings.clientKey, duration: String(Math.round(fingerprint.duration)), fingerprint: fingerprint.fingerprint, meta: 'recordings releases releasegroups' });
-    const response = await fetch('https://api.acoustid.org/v2/lookup', { method:'POST', body, signal:AbortSignal.timeout(30000) });
-    if (!response.ok) throw new Error(`AcoustID: HTTP ${response.status}`);
-    const lookup = await response.json(); if (lookup.status !== 'ok') throw new Error(`AcoustID: ${lookup.error?.message || 'ошибка'}`);
-    const candidates = [];
-    for (const result of lookup.results || []) for (const recording of result.recordings || []) {
-      const artist = (recording.artists || []).map(item => item.name).filter(Boolean).join(', '), title = String(recording.title || '').trim();
-      if (!artist || !title) continue;
-      const difference = recording.duration == null ? 999 : Math.abs(Number(recording.duration) - Number(track.duration_seconds || fingerprint.duration));
-      const releaseGroups = (recording.releasegroups || []).filter(group => {
-        const secondary = (group.secondarytypes || []).map(value => String(value).toLowerCase());
-        return !secondary.some(value => ['compilation','dj-mix','remix','live'].includes(value)) && !(group.artists || []).some(item => item.name === 'Various Artists');
-      }).map(group => {
-        const years = (group.releases || []).map(release => Number(release.date?.year)).filter(Number.isFinite);
-        return { album:group.title || '', year:years.length ? Math.min(...years) : null, release_group_id:group.id, type:String(group.type || '').toLowerCase() };
-      }).sort((a,b) => ({album:0,ep:1,single:2}[a.type] ?? 3)-({album:0,ep:1,single:2}[b.type] ?? 3) || (a.year || 9999)-(b.year || 9999));
-      const release = releaseGroups[0] || {};
-      const confidence = Math.min(1, Number(result.score || 0) * (difference <= 3 ? 1 : difference <= 10 ? .9 : difference <= 20 ? .7 : .45) * (release.release_group_id ? 1.01 : 1));
-      if (!candidates.some(item => item.artist === artist && item.title === title)) candidates.push({ artist, title, album:release.album || '', year:release.year || null, release_group_id:release.release_group_id || null, duration_seconds: recording.duration ?? null, confidence, recording_id: recording.id });
-    }
-    candidates.sort((a,b) => b.confidence-a.confidence); const best = candidates[0];
-    if (!best) await db.prepare("UPDATE recognition_jobs SET status='unmatched',candidates_json='[]',error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(job.id);
-    else if (best.confidence >= .8) await db.transaction(async tx => {
-      await tx.prepare("UPDATE tracks SET title=?,artist=?,album=CASE WHEN album='' THEN ? ELSE album END,year=COALESCE(year,?) WHERE id=?").run(best.title,best.artist,best.album || '',best.year,job.track_id);
-      await tx.prepare("UPDATE recognition_jobs SET status='applied',confidence=?,suggested_title=?,suggested_artist=?,candidates_json=?,error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?")
-        .run(best.confidence,best.title,best.artist,JSON.stringify(candidates.slice(0,5)),job.id);
-    });
-    else await db.prepare("UPDATE recognition_jobs SET status='review',confidence=?,suggested_title=?,suggested_artist=?,candidates_json=?,error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?")
-      .run(best.confidence, best.title, best.artist, JSON.stringify(candidates.slice(0,5)), job.id);
-    if (best && best.confidence >= .8 && best.release_group_id) await addExternalCover(job.track_id,best.release_group_id).catch(error => console.error('Не удалось загрузить обложку:', error.message));
-  } catch (error) {
-    const message = String(error.message || error).slice(0,1000), attempts = Number(job?.attempts || 0);
-    if (job) await db.prepare(`UPDATE recognition_jobs SET status=?,available_at=CURRENT_TIMESTAMP + (? * INTERVAL '1 second'),error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`)
-      .run(attempts >= 5 ? 'failed' : 'retry', Math.min(3600, 30 * (2 ** Math.max(0,attempts-1))), message, job.id).catch(()=>{});
-    console.error('Ошибка распознавания:', message);
-  } finally { recognitionBusy = false; }
-}
-
-async function recognitionSettings() {
-  const rows = await db.prepare("SELECT key,value FROM app_settings WHERE key IN ('recognition_enabled','acoustid_client_key')").all();
-  const values = Object.fromEntries(rows.map(row => [row.key,row.value]));
-  return {
-    enabled: values.recognition_enabled === undefined ? config.recognitionEnabled : values.recognition_enabled === 'true',
-    clientKey: values.acoustid_client_key === undefined ? config.acoustIdClientKey : values.acoustid_client_key,
-  };
-}
-
 async function registrationEnabled() {
   const row=await db.prepare("SELECT value FROM app_settings WHERE key='registration_enabled'").get();
   return row===undefined?config.registrationEnabled:row.value==='true';
-}
-
-let transcodeActive = 0;
-async function processNextTranscode() {
-  if (transcodeActive >= 2) return;
-  transcodeActive++;
-  let job, finish; let succeeded = false;
-  try {
-    const result = await db.prepare(`UPDATE track_files SET status='processing',updated_at=CURRENT_TIMESTAMP
-      WHERE id=(SELECT id FROM track_files WHERE status IN ('queued','retry') ORDER BY priority DESC,updated_at,id FOR UPDATE SKIP LOCKED LIMIT 1)
-      RETURNING *`).run();
-    job = result.rows[0]; if (!job) return;
-    finish = operationMetrics.start('audio.transcode');
-    const track = await db.prepare('SELECT storage_key FROM tracks WHERE id=?').get(job.track_id);
-    if (!track) return await db.prepare("UPDATE track_files SET status='failed',error='Трек удалён',updated_at=CURRENT_TIMESTAMP WHERE id=?").run(job.id);
-    const source = path.resolve(config.storageDir, track.storage_key), shard = job.track_id.slice(0, 2);
-    const targetDir = path.join(derivedDir, job.variant, shard); fs.mkdirSync(targetDir, { recursive: true, mode: 0o750 });
-    const storageKey = path.join('derived', job.variant, shard, `${job.track_id}.m4a`), target = path.join(config.storageDir, storageKey), temporary = `${target}.part`;
-    const bitrate = job.variant === 'aac_96' ? '96k' : '192k';
-    const ok = await runProcess('ffmpeg', ['-loglevel','error','-y','-i',source,'-map','0:a:0','-vn','-c:a','aac','-b:a',bitrate,'-movflags','+faststart','-f','mp4',temporary]);
-    if (!ok || !fs.existsSync(temporary)) throw new Error('ffmpeg не создал AAC');
-    fs.renameSync(temporary, target); const size = fs.statSync(target).size;
-    await db.prepare("UPDATE track_files SET status='ready',mime_type='audio/mp4',codec='aac',bitrate=?,size_bytes=?,storage_key=?,error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(job.variant === 'aac_96' ? 96000 : 192000, size, storageKey, job.id);
-    succeeded = true;
-  } catch (error) {
-    console.error('Ошибка транскодирования:', error);
-    if (job) await db.prepare("UPDATE track_files SET status='failed',error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(String(error.message || error).slice(0,1000), job.id).catch(() => {});
-  }
-  finally { await finish?.(succeeded); transcodeActive--; }
 }
 
 function normalizedTags(format) {
@@ -427,17 +307,6 @@ function normalizedTags(format) {
     album: tags.album || '', genre: tags.genre || '', year: number(tags.date || tags.year),
     trackNumber: number(tags.track || tags.tracknumber), discNumber: number(tags.disc || tags.discnumber),
   };
-}
-
-async function addExternalCover(trackId, releaseGroupId) {
-  const track = await db.prepare('SELECT cover_key FROM tracks WHERE id=?').get(trackId);
-  if (!track || track.cover_key) return;
-  const response = await fetch(`https://coverartarchive.org/release-group/${encodeURIComponent(releaseGroupId)}/front-500`, { headers:{ 'User-Agent':'FamilyMusic/1.0' }, signal:AbortSignal.timeout(30000) });
-  if (!response.ok) return;
-  const bytes = Buffer.from(await response.arrayBuffer()); if (!bytes.length || bytes.length > 12*1024*1024) return;
-  const temporary = path.join(uploadDir, `cover-${crypto.randomUUID()}.image`); fs.writeFileSync(temporary,bytes,{ mode:0o640 });
-  try { const coverKey = await extractCover(temporary,trackId); if (coverKey) await db.prepare('UPDATE tracks SET cover_key=?,cover_checked=1 WHERE id=? AND cover_key IS NULL').run(coverKey,trackId); }
-  finally { fs.rmSync(temporary,{ force:true }); }
 }
 
 let workerBusy = false;
@@ -475,63 +344,6 @@ async function processNextJob() {
       console.error(`Ошибка обработки загрузки ${job.upload_id}:`, result.message);
     }
   } finally { await finish?.(succeeded); workerBusy = false; }
-}
-
-async function cleanupAbandonedUploads() {
-  const result = await db.prepare(`DELETE FROM uploads WHERE status='uploading'
-    AND updated_at < CURRENT_TIMESTAMP - (? * INTERVAL '1 hour') RETURNING id`).run(config.abandonedUploadHours);
-  for (const upload of result.rows) fs.rmSync(path.join(uploadDir, `${upload.id}.part`), { force: true });
-  const active = new Set((await db.prepare("SELECT id FROM uploads WHERE status IN ('uploading','processing')").all()).map(row => `${row.id}.part`));
-  const cutoff = Date.now() - config.abandonedUploadHours * 3600000;
-  for (const name of fs.readdirSync(uploadDir)) {
-    if (!name.endsWith('.part') || active.has(name)) continue;
-    const file = path.join(uploadDir, name);
-    if (fs.statSync(file).mtimeMs < cutoff) fs.rmSync(file, { force: true });
-  }
-  await db.prepare("DELETE FROM processing_jobs WHERE status IN ('complete','failed') AND updated_at < CURRENT_TIMESTAMP - INTERVAL '30 days'").run();
-  if (result.rows.length) console.log(`Удалено брошенных загрузок: ${result.rows.length}`);
-}
-
-async function cleanupDiagnosticReports() {
-  const allDays = Math.max(1, Math.floor(config.diagnosticRetentionDays));
-  const fixedDays = Math.max(1, Math.floor(config.diagnosticFixedRetentionDays));
-  const result = await db.prepare(`DELETE FROM diagnostic_reports
-    WHERE created_at < CURRENT_TIMESTAMP - (? * INTERVAL '1 day')
-       OR (status='fixed' AND updated_at < CURRENT_TIMESTAMP - (? * INTERVAL '1 day'))`).run(allDays, fixedDays);
-  if (result.changes) console.log(`Удалено старых диагностических отчётов: ${result.changes}`);
-}
-
-async function updateWorkerHeartbeat() {
-  const details = JSON.stringify({ pid: process.pid, version: process.version });
-  await db.prepare(`INSERT INTO service_heartbeats(service,started_at,last_seen_at,details_json)
-    VALUES('worker',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,?) ON CONFLICT(service) DO UPDATE
-    SET last_seen_at=CURRENT_TIMESTAMP,details_json=excluded.details_json`).run(details);
-}
-
-async function cleanupFederationData(){
-  await db.prepare('DELETE FROM federation_nonces WHERE expires_at<CURRENT_TIMESTAMP').run();
-  await db.prepare("DELETE FROM federation_invitations WHERE (expires_at<CURRENT_TIMESTAMP OR revoked_at IS NOT NULL) AND created_at<CURRENT_TIMESTAMP-INTERVAL '30 days'").run();
-}
-
-async function enrichExistingTracks() {
-  const tracks = await db.prepare('SELECT * FROM tracks WHERE sha256 IS NULL OR cover_checked=0').all();
-  for (const track of tracks) {
-    const file = path.resolve(config.storageDir, track.storage_key);
-    if (!file.startsWith(config.storageDir + path.sep) || !fs.existsSync(file)) continue;
-    try {
-      const [metadata, sha256] = await Promise.all([inspectAudio(file), sha256File(file)]);
-      if (!metadata) continue;
-      const tags = normalizedTags(metadata);
-      let coverKey = track.cover_key;
-      if (!coverKey) coverKey = await extractCover(file, track.id);
-      const duplicate = await db.prepare('SELECT id FROM tracks WHERE sha256=? AND id<>?').get(sha256, track.id);
-      await db.prepare(`UPDATE tracks SET sha256=?, cover_key=?, cover_checked=1, genre=CASE WHEN genre='' THEN ? ELSE genre END,
-        year=COALESCE(year,?), track_number=COALESCE(track_number,?), disc_number=COALESCE(disc_number,?) WHERE id=?`).run(
-        duplicate ? null : sha256, coverKey, tags.genre, tags.year, tags.trackNumber, tags.discNumber, track.id
-      );
-    } catch (error) { console.error(`Не удалось дополнить трек ${track.id}:`, error.message); }
-  }
-  if (tracks.length) console.log(`Проверены метаданные существующих треков: ${tracks.length}`);
 }
 
 async function api(req, res, url, apiPrefix = '/api') {
@@ -718,12 +530,10 @@ async function api(req, res, url, apiPrefix = '/api') {
     if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
     return sendJson(res, 200, await adminObservability.metrics());
   }
-  if (url.pathname === '/api/admin/recognition-settings' && req.method === 'GET') {
-    if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
-    const settings = await recognitionSettings();
-    return sendJson(res, 200, { enabled:settings.enabled, key_configured:Boolean(settings.clientKey) });
-  }
   if (await openVkHttp.handle(req,res,url,user)) return;
+  if (await diagnosticReportsHttp.handle(req,res,url,user)) return;
+  if (await loudnessHttp.handle(req,res,url,user)) return;
+  if (await recognitionHttp.handle(req,res,url,user,apiPrefix)) return;
   if (url.pathname === '/api/admin/federation' && req.method === 'GET') {
     if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
     const settings = await federation.settings(), identity = loadFederationIdentity(config.storageDir);
@@ -870,146 +680,6 @@ async function api(req, res, url, apiPrefix = '/api') {
     if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
     if (!await federation.revokePeer(peerDelete[1])) return sendJson(res, 404, { error: 'Активная нода не найдена' });
     return sendJson(res, 200, { ok: true });
-  }
-  if (url.pathname === '/api/admin/recognition-settings' && req.method === 'PUT') {
-    if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
-    const body = await readJson(req), enabled=Boolean(body.enabled);
-    const keyProvided=Object.hasOwn(body,'client_key'), clientKey=keyProvided?String(body.client_key||'').trim():null;
-    if (keyProvided && clientKey && !/^[A-Za-z0-9_-]{6,128}$/.test(clientKey)) return sendJson(res,400,{ error:'Некорректный Client API key AcoustID' });
-    await db.transaction(async tx => {
-      await tx.prepare(`INSERT INTO app_settings(key,value,updated_at) VALUES('recognition_enabled',?,CURRENT_TIMESTAMP)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP`).run(enabled?'true':'false');
-      if(keyProvided) await tx.prepare(`INSERT INTO app_settings(key,value,updated_at) VALUES('acoustid_client_key',?,CURRENT_TIMESTAMP)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP`).run(clientKey);
-    });
-    const saved=await recognitionSettings();
-    return sendJson(res,200,{ enabled:saved.enabled,key_configured:Boolean(saved.clientKey) });
-  }
-  if (url.pathname === '/api/admin/loudness' && req.method === 'GET') {
-    if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
-    const [states, values] = await Promise.all([
-      db.prepare('SELECT status,count(*) AS count FROM loudness_jobs GROUP BY status').all(),
-      db.prepare(`SELECT count(*) AS analyzed,round(avg(integrated_lufs)::numeric,2) AS average_lufs,
-        round(min(integrated_lufs)::numeric,2) AS quietest_lufs,round(max(integrated_lufs)::numeric,2) AS loudest_lufs
-        FROM loudness_jobs WHERE status='ready'`).get(),
-    ]);
-    return sendJson(res, 200, { states:Object.fromEntries(states.map(item=>[item.status,Number(item.count)])), values:{ analyzed:Number(values.analyzed), average_lufs:values.average_lufs==null?null:Number(values.average_lufs), quietest_lufs:values.quietest_lufs==null?null:Number(values.quietest_lufs), loudest_lufs:values.loudest_lufs==null?null:Number(values.loudest_lufs) } });
-  }
-  if (url.pathname === '/api/admin/loudness/scan' && req.method === 'POST') {
-    if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
-    const result = await db.prepare(`INSERT INTO loudness_jobs(track_id,status) SELECT id,'queued' FROM tracks ON CONFLICT(track_id) DO NOTHING`).run();
-    pumpLoudness();
-    return sendJson(res, 200, { queued:result.changes });
-  }
-  if (url.pathname === '/api/reports' && req.method === 'POST') {
-    const body = await readJson(req, 48 * 1024);
-    const description = String(body.description ?? '').trim().slice(0, 2000);
-    if (!description) return sendJson(res, 400, { error: 'Опишите, что произошло' });
-    const appVersion = String(body.app_version ?? '').slice(0, 40);
-    const device = String(body.device ?? '').slice(0, 160);
-    const androidVersion = String(body.android_version ?? '').slice(0, 80);
-    const allowed = ['track','player','queue','network','storage','events'];
-    const details = Object.fromEntries(allowed.filter(key => body.details?.[key] !== undefined).map(key => [key, body.details[key]]));
-    let detailsJson = JSON.stringify(details);
-    if (detailsJson.length > 40000) return sendJson(res, 413, { error: 'Диагностический журнал слишком большой' });
-    const result = await db.prepare(`INSERT INTO diagnostic_reports(user_id,description,app_version,device,android_version,details_json)
-      VALUES(?,?,?,?,?,?) RETURNING id,created_at`).run(user.id, description, appVersion, device, androidVersion, detailsJson);
-    return sendJson(res, 201, { id: Number(result.rows[0].id), created_at: result.rows[0].created_at });
-  }
-  if (url.pathname === '/api/admin/reports' && req.method === 'GET') {
-    if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
-    const rows = await db.prepare(`SELECT diagnostic_reports.id,diagnostic_reports.description,diagnostic_reports.app_version,
-      diagnostic_reports.device,diagnostic_reports.android_version,diagnostic_reports.details_json,diagnostic_reports.status,diagnostic_reports.created_at,diagnostic_reports.updated_at,
-      users.username,users.display_name FROM diagnostic_reports JOIN users ON users.id=diagnostic_reports.user_id
-      ORDER BY diagnostic_reports.created_at DESC LIMIT 100`).all();
-    return sendJson(res, 200, { items: rows.map(row => ({ ...row, details: JSON.parse(row.details_json || '{}'), details_json: undefined })) });
-  }
-  const reportMatch = /^\/api\/admin\/reports\/(\d+)$/.exec(url.pathname);
-  if (reportMatch && (req.method === 'PATCH' || req.method === 'DELETE')) {
-    if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
-    const reportId = Number(reportMatch[1]);
-    if (req.method === 'DELETE') {
-      const result = await db.prepare('DELETE FROM diagnostic_reports WHERE id=?').run(reportId);
-      return result.changes ? sendJson(res, 200, { ok: true }) : sendJson(res, 404, { error: 'Отчёт не найден' });
-    }
-    const status = String((await readJson(req)).status || '');
-    if (!['new','viewed','fixed'].includes(status)) return sendJson(res, 400, { error: 'Некорректный статус' });
-    const result = await db.prepare('UPDATE diagnostic_reports SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?').run(status, reportId);
-    return result.changes ? sendJson(res, 200, { ok: true, status }) : sendJson(res, 404, { error: 'Отчёт не найден' });
-  }
-  if (url.pathname === '/api/recognition' && req.method === 'GET') {
-    if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
-    const [items,states] = await Promise.all([db.prepare(`SELECT recognition_jobs.id,recognition_jobs.status,recognition_jobs.confidence,
-      recognition_jobs.suggested_title,recognition_jobs.suggested_artist,recognition_jobs.candidates_json,
-      recognition_jobs.error,recognition_jobs.updated_at,tracks.id AS track_id,tracks.title,tracks.artist,tracks.filename,
-      tracks.duration_seconds,tracks.album,tracks.genre,tracks.year,tracks.cover_key FROM recognition_jobs JOIN tracks ON tracks.id=recognition_jobs.track_id
-      WHERE recognition_jobs.status<>'applied' OR tracks.cover_key IS NULL ORDER BY recognition_jobs.updated_at DESC`).all(),
-      db.prepare('SELECT status,count(*) AS count FROM recognition_jobs GROUP BY status').all()]);
-    const settings = await recognitionSettings();
-    return sendJson(res, 200, { enabled: settings.enabled && Boolean(settings.clientKey), states:Object.fromEntries(states.map(item=>[item.status,Number(item.count)])), items: items.map(item => ({
-      ...item, confidence: item.confidence == null ? null : Number(item.confidence), duration_seconds: Number(item.duration_seconds || 0),
-      candidates: JSON.parse(item.candidates_json || '[]'), cover_url:item.cover_key ? `${apiPrefix}/tracks/${item.track_id}/cover` : null, candidates_json: undefined, cover_key:undefined,
-    })) });
-  }
-  if (url.pathname === '/api/recognition/scan' && req.method === 'POST') {
-    if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
-    const result = await db.prepare(`INSERT INTO recognition_jobs(track_id,status)
-      SELECT id,'queued' FROM tracks WHERE artist='Неизвестный исполнитель'
-      ON CONFLICT(track_id) DO NOTHING`).run();
-    processNextRecognition().catch(error => console.error('Ошибка запуска распознавания:', error));
-    return sendJson(res, 200, { queued: result.changes });
-  }
-  if (url.pathname === '/api/recognition/retry-all' && req.method === 'POST') {
-    if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
-    const result = await db.prepare("UPDATE recognition_jobs SET status='queued',attempts=0,error=NULL,available_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE status IN ('ignored','unmatched','failed')").run();
-    processNextRecognition().catch(()=>{}); return sendJson(res, 200, { queued:result.changes });
-  }
-  if (url.pathname === '/api/recognition/bulk' && req.method === 'POST') {
-    if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
-    const body=await readJson(req),ids=Array.isArray(body.ids)?[...new Set(body.ids.map(Number).filter(Number.isSafeInteger))].slice(0,500):[],action=String(body.action||'');
-    if(!ids.length)return sendJson(res,400,{error:'Не выбраны задания'});
-    if(!['apply','retry','ignore','metadata'].includes(action))return sendJson(res,400,{error:'Некорректное массовое действие'});
-    const jobs=await db.prepare('SELECT * FROM recognition_jobs WHERE id = ANY(@ids)').all({ids});let updated=0;const covers=[];
-    if(action==='metadata'){
-      const fields=body.fields&&typeof body.fields==='object'?body.fields:{},has=key=>Object.hasOwn(fields,key)&&String(fields[key]).trim()!=='';
-      if(!['artist','album','genre','year'].some(has))return sendJson(res,400,{error:'Заполните хотя бы одно поле'});
-      const artist=has('artist')?String(fields.artist).trim().slice(0,240):null,album=has('album')?String(fields.album).trim().slice(0,240):null,genre=has('genre')?String(fields.genre).trim().slice(0,120):null,year=has('year')?Number(fields.year):null;
-      if(year!==null&&(!Number.isInteger(year)||year<1000||year>9999))return sendJson(res,400,{error:'Некорректный год'});
-      await db.transaction(async tx=>{for(const job of jobs){await tx.prepare('UPDATE tracks SET artist=COALESCE(?,artist),album=COALESCE(?,album),genre=COALESCE(?,genre),year=COALESCE(?,year) WHERE id=?').run(artist,album,genre,year,job.track_id);await tx.prepare("UPDATE recognition_jobs SET status='applied',error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(job.id);updated++;}});
-    } else await db.transaction(async tx=>{for(const job of jobs){
-      if(action==='retry'){await tx.prepare("UPDATE recognition_jobs SET status='queued',attempts=0,error=NULL,available_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(job.id);updated++;}
-      else if(action==='ignore'){await tx.prepare("UPDATE recognition_jobs SET status='ignored',updated_at=CURRENT_TIMESTAMP WHERE id=?").run(job.id);updated++;}
-      else {const selected=JSON.parse(job.candidates_json||'[]')[0];if(job.status!=='review'||!selected)continue;await tx.prepare("UPDATE tracks SET title=?,artist=?,album=CASE WHEN album='' THEN ? ELSE album END,year=COALESCE(year,?) WHERE id=?").run(selected.title,selected.artist,selected.album||'',selected.year||null,job.track_id);await tx.prepare("UPDATE recognition_jobs SET status='applied',updated_at=CURRENT_TIMESTAMP WHERE id=?").run(job.id);if(selected.release_group_id)covers.push([job.track_id,selected.release_group_id]);updated++;}
-    }});
-    if(covers.length)Promise.allSettled(covers.map(([trackId,releaseGroupId])=>addExternalCover(trackId,releaseGroupId))).catch(()=>{});
-    if(action==='retry')processNextRecognition().catch(()=>{});
-    return sendJson(res,200,{updated,skipped:ids.length-updated});
-  }
-  const recognitionMatch = /^\/api\/recognition\/(\d+)\/(apply|ignore|retry|manual)$/.exec(url.pathname);
-  if (recognitionMatch && req.method === 'POST') {
-    if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
-    const job = await db.prepare('SELECT * FROM recognition_jobs WHERE id=?').get(Number(recognitionMatch[1]));
-    if (!job) return sendJson(res, 404, { error: 'Задание не найдено' });
-    const action = recognitionMatch[2];
-    if (action === 'ignore') { await db.prepare("UPDATE recognition_jobs SET status='ignored',updated_at=CURRENT_TIMESTAMP WHERE id=?").run(job.id); return sendJson(res, 200, { ok:true }); }
-    if (action === 'retry') { await db.prepare("UPDATE recognition_jobs SET status='queued',attempts=0,error=NULL,available_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(job.id); processNextRecognition().catch(()=>{}); return sendJson(res, 200, { ok:true }); }
-    if (action === 'manual') {
-      const body = await readJson(req), title=String(body.title||'').trim(), artist=String(body.artist||'').trim(), album=String(body.album||'').trim(), genre=String(body.genre||'').trim();
-      const year = body.year === '' || body.year == null ? null : Number(body.year);
-      if (!title || !artist || title.length>240 || artist.length>240 || album.length>240 || genre.length>120) return sendJson(res,400,{ error:'Проверьте название и исполнителя' });
-      if (year!==null && (!Number.isInteger(year) || year<1000 || year>9999)) return sendJson(res,400,{ error:'Некорректный год' });
-      await db.transaction(async tx=>{await tx.prepare('UPDATE tracks SET title=?,artist=?,album=?,genre=?,year=? WHERE id=?').run(title,artist,album,genre,year,job.track_id);await tx.prepare("UPDATE recognition_jobs SET status='applied',updated_at=CURRENT_TIMESTAMP WHERE id=?").run(job.id);});
-      return sendJson(res,200,{ok:true});
-    }
-    if (job.status !== 'review') return sendJson(res, 409, { error: 'Готового варианта пока нет' });
-    const body = await readJson(req), candidates = JSON.parse(job.candidates_json || '[]'), selected = candidates[Math.max(0,Math.min(candidates.length-1,Number(body.candidate)||0))];
-    if (!selected) return sendJson(res, 409, { error: 'Вариант не найден' });
-    await db.transaction(async tx => {
-      await tx.prepare("UPDATE tracks SET title=?,artist=?,album=CASE WHEN album='' THEN ? ELSE album END,year=COALESCE(year,?) WHERE id=?").run(selected.title,selected.artist,selected.album || '',selected.year || null,job.track_id);
-      await tx.prepare("UPDATE recognition_jobs SET status='applied',updated_at=CURRENT_TIMESTAMP WHERE id=?").run(job.id);
-    });
-    if (selected.release_group_id) await addExternalCover(job.track_id,selected.release_group_id).catch(()=>{});
-    return sendJson(res, 200, { ok:true, track_id:job.track_id, title:selected.title, artist:selected.artist });
   }
   if (url.pathname === '/api/me/password' && req.method === 'PUT') {
     const body = await readJson(req);
@@ -1620,29 +1290,27 @@ const server = http.createServer(async (req, res) => {
 });
 
 function startWorkers() {
-  updateWorkerHeartbeat().catch(error => console.error('Ошибка heartbeat worker:', error));
-  setInterval(() => updateWorkerHeartbeat().catch(error => console.error('Ошибка heartbeat worker:', error)), 15000);
-  enrichExistingTracks().catch(error => console.error('Ошибка фоновой индексации:', error));
+  maintenance.heartbeat().catch(error => console.error('Ошибка heartbeat worker:', error));
+  setInterval(() => maintenance.heartbeat().catch(error => console.error('Ошибка heartbeat worker:', error)), 15000);
+  maintenance.enrichTracks().catch(error => console.error('Ошибка фоновой индексации:', error));
   uploadJobs.recover()
     .then(() => processNextJob())
     .catch(error => console.error('Ошибка восстановления очереди:', error));
   setInterval(() => processNextJob().catch(error => console.error('Ошибка worker:', error)), Math.max(250, config.workerPollMs));
-  processNextTranscode().catch(error => console.error('Ошибка transcode worker:', error));
-  setInterval(() => processNextTranscode().catch(error => console.error('Ошибка transcode worker:', error)), 2000);
-  db.prepare("UPDATE recognition_jobs SET status='retry',available_at=CURRENT_TIMESTAMP WHERE status='processing'").run()
-    .then(() => processNextRecognition()).catch(error => console.error('Ошибка восстановления распознавания:', error));
-  setInterval(() => processNextRecognition().catch(error => console.error('Ошибка recognition worker:', error)), 5000);
-  db.prepare("UPDATE loudness_jobs SET status='retry',available_at=CURRENT_TIMESTAMP WHERE status='processing'").run()
-    .then(() => pumpLoudness()).catch(error => console.error('Ошибка восстановления анализа громкости:', error));
-  setInterval(pumpLoudness, 3000);
+  transcoding.recover().catch(error => console.error('Ошибка восстановления транскодирования:', error));
+  setInterval(() => transcoding.processNext().catch(error => console.error('Ошибка transcode worker:', error)), 2000);
+  recognition.recover().catch(error => console.error('Ошибка восстановления распознавания:', error));
+  setInterval(() => recognition.processNext().catch(error => console.error('Ошибка recognition worker:', error)), 5000);
+  loudness.recover().catch(error => console.error('Ошибка восстановления анализа громкости:', error));
+  setInterval(loudness.pump, 3000);
   federationImport.recover().then(()=>federationImport.processNext()).catch(error=>console.error('Ошибка восстановления реплик:',error));
   setInterval(()=>federationImport.processNext().catch(error=>console.error('Ошибка worker реплик:',error)),2000);
-  cleanupAbandonedUploads().catch(error => console.error('Ошибка очистки загрузок:', error));
-  setInterval(() => cleanupAbandonedUploads().catch(error => console.error('Ошибка очистки загрузок:', error)), Math.max(1, config.uploadCleanupMinutes) * 60000);
-  cleanupDiagnosticReports().catch(error => console.error('Ошибка ротации отчётов:', error));
-  setInterval(() => cleanupDiagnosticReports().catch(error => console.error('Ошибка ротации отчётов:', error)), 6 * 60 * 60 * 1000);
-  cleanupFederationData().catch(error=>console.error('Ошибка очистки федерации:',error));
-  setInterval(()=>cleanupFederationData().catch(error=>console.error('Ошибка очистки федерации:',error)),6*60*60*1000);
+  maintenance.cleanupUploads().catch(error => console.error('Ошибка очистки загрузок:', error));
+  setInterval(() => maintenance.cleanupUploads().catch(error => console.error('Ошибка очистки загрузок:', error)), Math.max(1, config.uploadCleanupMinutes) * 60000);
+  maintenance.cleanupReports().catch(error => console.error('Ошибка ротации отчётов:', error));
+  setInterval(() => maintenance.cleanupReports().catch(error => console.error('Ошибка ротации отчётов:', error)), 6 * 60 * 60 * 1000);
+  maintenance.cleanupFederation().catch(error=>console.error('Ошибка очистки федерации:',error));
+  setInterval(()=>maintenance.cleanupFederation().catch(error=>console.error('Ошибка очистки федерации:',error)),6*60*60*1000);
   syncFederationCatalogs().catch(error => console.error('Ошибка federation sync:', error));
   setInterval(() => syncFederationCatalogs().catch(error => console.error('Ошибка federation sync:', error)), 5000);
   notifyFederationPeers().catch(error => console.error('Ошибка federation notify:', error));

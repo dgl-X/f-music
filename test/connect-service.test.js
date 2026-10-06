@@ -132,3 +132,29 @@ test('Connect command is bound to the active playback epoch', async () => {
   await createConnectService({db,enabled:true}).sendCommand(7,'web_0123456789abcdef','next',{});
   assert.equal(commandPayload.playback_epoch,14);
 });
+
+test('offline active Connect device releases ownership and pending commands', async () => {
+  const calls=[];
+  const tx={prepare(sql){return{
+    async get(...params){calls.push({sql,params});if(sql.startsWith('SELECT state.active_device_id'))return{active_device_id:'android_0123456789',online:false};},
+    async run(...params){calls.push({sql,params});return{changes:1};},
+  };}};
+  const db={async transaction(callback){return callback(tx);}};
+  const released=await createConnectService({db,enabled:true,onlineSeconds:35}).releaseOfflineActiveDevice(7);
+  assert.equal(released,true);
+  assert.match(calls[1].sql,/active_device_id=NULL,playing=0,revision=revision\+1/);
+  assert.deepEqual(calls[0].params,[35,7]);
+  assert.match(calls[2].sql,/status='cancelled'/);
+  assert.deepEqual(calls[2].params,[7,'android_0123456789']);
+});
+
+test('online active Connect device keeps ownership', async () => {
+  let cancelled=false;
+  const tx={prepare(sql){return{
+    async get(){if(sql.startsWith('SELECT state.active_device_id'))return{active_device_id:'android_0123456789',online:true};},
+    async run(){cancelled=true;return{changes:1};},
+  };}};
+  const db={async transaction(callback){return callback(tx);}};
+  assert.equal(await createConnectService({db,enabled:true}).releaseOfflineActiveDevice(7),false);
+  assert.equal(cancelled,false);
+});

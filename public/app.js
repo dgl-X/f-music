@@ -1,7 +1,7 @@
 import { ShuffleNavigator, nextPlayableIndex } from './shuffle-navigator.js';
 import { AudioMemoryCache } from './audio-cache.js';
 import { parseWebRoute, webRouteForState } from './web-router.js';
-import { ConnectClient, availableConnectDevices } from './connect-client.js';
+import { ConnectClient, availableConnectDevices, remotePlaybackActive } from './connect-client.js';
 
 const app = document.querySelector('#app');
 const api = async (url, options = {}) => {
@@ -58,7 +58,7 @@ let unknownRoutePath='';
 let openingSettingsSection='';
 let connectClient=null,connectState=null,handlingConnectCommand=false,connectRemoteTrack=null,connectRemoteTrackId='',connectStateReceivedAt=0,connectUiTimer=null;
 
-const connectRemoteActive=()=>Boolean(connectClient?.enabled&&connectState?.active_device_id&&connectState.active_device_id!==connectClient.deviceId);
+const connectRemoteActive=()=>remotePlaybackActive(connectClient,connectState);
 const connectPlaybackState=(index=currentIndex)=>{const player=document.querySelector('#player'),track=queue[index];return{track_id:track?.id||null,position_seconds:index===currentIndex?Number(player?.currentTime||0):0,duration_seconds:index===currentIndex&&Number.isFinite(player?.duration)?player.duration:Number(track?.duration_seconds||0),queue:queue.map(item=>item.id),playing:index===currentIndex?!player?.paused:true,shuffle:shuffleEnabled,repeat_mode:repeatMode,volume:Number(localStorage.getItem('music-volume')??.8)};};
 
 function updateConnectIndicator(state=connectState){
@@ -514,7 +514,8 @@ function renderConnectRemoteState(){
 }
 
 function applyConnectState(state){
-  connectStateReceivedAt=Date.now();updateConnectIndicator(state);if(!connectRemoteActive()){connectRemoteTrack=null;connectRemoteTrackId='';return;}
+  const remoteBefore=connectRemoteActive();
+  connectStateReceivedAt=Date.now();updateConnectIndicator(state);if(!connectRemoteActive()){connectRemoteTrack=null;connectRemoteTrackId='';if(remoteBefore)renderLocalPlaybackState();return;}
   const toggle=document.querySelector('#toggle');if(toggle){toggle.textContent=state?.playing?'❚❚':'▶';toggle.title=state?.playing?'Пауза':'Воспроизвести';}
   shuffleEnabled=Boolean(state?.shuffle);repeatMode=state?.repeat_mode||'off';
   document.querySelector('#shuffle')?.classList.toggle('active',shuffleEnabled);
@@ -524,6 +525,17 @@ function applyConnectState(state){
   if(trackId===connectRemoteTrackId){renderConnectRemoteState();return;}
   connectRemoteTrackId=trackId;connectRemoteTrack=queue.find(track=>track.id===trackId)||displayedTracks.find(track=>track.id===trackId)||null;renderConnectRemoteState();
   if(!connectRemoteTrack)api('/api/v1/tracks/resolve',{method:'POST',body:JSON.stringify({ids:[trackId]})}).then(data=>{if(connectRemoteActive()&&connectRemoteTrackId===trackId){connectRemoteTrack=data.items?.[0]||null;renderConnectRemoteState();}}).catch(()=>{});
+}
+
+function renderLocalPlaybackState(){
+  const player=document.querySelector('#player'),track=queue[currentIndex];if(!player||!track)return;
+  const title=document.querySelector('#now-title'),artist=document.querySelector('#now-artist'),cover=document.querySelector('#now-cover'),seek=document.querySelector('#seek');
+  if(title)title.textContent=track.title;if(artist)artist.textContent=track.artist||'Неизвестный исполнитель';
+  if(cover){cover.style.backgroundImage=track.cover_url?`url("${track.cover_url}")`:'';cover.textContent=track.cover_url?'':'♫';}
+  if(seek)seek.value=String(player.duration>0?Math.min(1000,Math.round(player.currentTime/player.duration*1000)):0);
+  const elapsed=document.querySelector('#elapsed'),total=document.querySelector('#total'),toggle=document.querySelector('#toggle');
+  if(elapsed)elapsed.textContent=duration(player.currentTime);if(total)total.textContent=duration(player.duration);if(toggle){toggle.textContent=player.paused?'▶':'❚❚';toggle.title=player.paused?'Воспроизвести':'Пауза';}
+  updatePlayerLike(track);updatePlayingState();
 }
 
 async function handleConnectCommand(command){
@@ -579,8 +591,8 @@ function setupPlayer() {
   player.onpause=()=>{ toggle.textContent='▶'; toggle.title='Воспроизвести'; if('mediaSession' in navigator)navigator.mediaSession.playbackState='paused'; updatePlayingState();cancelAudioPrefetch();scheduleStateSave(); };
   player.onended=()=>{playbackFailures.delete(queue[currentIndex]?.id);if(repeatMode==='one')playTrack(currentIndex);else advanceTrack(1,true);};
   player.onerror=()=>{const failed=queue[currentIndex];if(!failed)return;if(activeBlobUrl&&blobFallbackTrackId!==failed.id){activeBlobUrl='';blobFallbackTrackId=failed.id;player.src=streamUrl(failed);audioCache.delete(failed.id);safePlay(player);return;}playbackFailures.add(failed.id);clearTimeout(playbackErrorTimer);playbackErrorTimer=setTimeout(()=>{if(queue[currentIndex]?.id===failed.id)advanceTrack(1,true);},250);};
-  player.ontimeupdate=()=>{ if(!player.duration)return; seek.value=String(Math.round(player.currentTime/player.duration*1000)); document.querySelector('#elapsed').textContent=duration(player.currentTime);if(Date.now()-lastPositionSave>3000){lastPositionSave=Date.now();if(!queue[currentIndex]?.external_preview)localStorage.setItem('music-position',String(player.currentTime));updateMediaPosition();scheduleStateSave();} };
-  player.onloadedmetadata=()=>{ document.querySelector('#total').textContent=duration(player.duration); };
+  player.ontimeupdate=()=>{ if(connectRemoteActive()||!player.duration)return; seek.value=String(Math.round(player.currentTime/player.duration*1000)); document.querySelector('#elapsed').textContent=duration(player.currentTime);if(Date.now()-lastPositionSave>3000){lastPositionSave=Date.now();if(!queue[currentIndex]?.external_preview)localStorage.setItem('music-position',String(player.currentTime));updateMediaPosition();scheduleStateSave();} };
+  player.onloadedmetadata=()=>{ if(!connectRemoteActive())document.querySelector('#total').textContent=duration(player.duration); };
   seek.oninput=()=>{const position=Number(seek.value)/1000*(connectRemoteActive()?Number(connectState?.duration_seconds||0):player.duration);if(connectRemoteActive())connectClient.command('seek',{position_seconds:position}).catch(()=>{});else if(player.duration)player.currentTime=position;};
   volume.oninput=()=>{localStorage.setItem('music-volume',volume.value);if(connectRemoteActive())connectClient.command('set_volume',{volume:Number(volume.value)}).catch(()=>{});else if(audioGain)applyWebGain();else player.volume=Number(volume.value);};
   setupMediaSession();
