@@ -20,14 +20,8 @@ export function createOpenVkHttpController({ db, provider, readJson, sendJson, r
     }
     if (url.pathname === '/api/admin/openvk-settings' && req.method === 'PUT') {
       if (!user.is_admin) return reply(res,403,{error:'Доступно только администратору'});
-      const body=await readJson(req),enabled=Boolean(body.enabled),token=typeof body.access_token==='string'?body.access_token.trim().replace(/^access_token=/,'').slice(0,1024):null;
-      await db.transaction(async tx=>{
-        await tx.prepare(`INSERT INTO app_settings(key,value,updated_at) VALUES('openvk_enabled',?,CURRENT_TIMESTAMP)
-          ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP`).run(enabled?'true':'false');
-        if(token!==null)await tx.prepare(`INSERT INTO app_settings(key,value,updated_at) VALUES('openvk_access_token',?,CURRENT_TIMESTAMP)
-          ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP`).run(token);
-      });
-      const state=await provider.settings();
+      const body=await readJson(req);
+      const state=await provider.updateSettings({enabled:Boolean(body.enabled),accessToken:body.access_token});
       return reply(res,200,{enabled:state.enabled,token_configured:Boolean(state.token)});
     }
     if (url.pathname === '/api/openvk/search' && req.method === 'GET') {

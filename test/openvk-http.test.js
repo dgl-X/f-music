@@ -33,6 +33,16 @@ test('OpenVK settings remain admin-only and never expose the token', async () =>
   assert.equal(JSON.stringify(allowed.responses).includes('private-token'),false);
 });
 
+test('OpenVK settings update is delegated without exposing the token', async () => {
+  let received;
+  const provider={async updateSettings(value){received=value;return {enabled:value.enabled,token:'stored-token'};}};
+  const {controller,responses}=setup({provider});
+  await controller.handle({method:'PUT',headers:{},body:{enabled:true,access_token:'access_token=new-token'}},{},new URL('http://local/api/admin/openvk-settings'),{id:1,is_admin:1});
+  assert.deepEqual(received,{enabled:true,accessToken:'access_token=new-token'});
+  assert.deepEqual(responses[0],{status:200,value:{enabled:true,token_configured:true}});
+  assert.equal(JSON.stringify(responses).includes('stored-token'),false);
+});
+
 test('OpenVK search decorates only previously imported tracks', async () => {
   const provider={async search(){return {items:[{source_id:'1_2',title:'One'},{source_id:'3_4',title:'Two'}],count:2,offset:0,limit:30};}};
   const {controller,responses}=setup({provider,imported:[{source_id:'3_4',track_id:'local-track'}]});
