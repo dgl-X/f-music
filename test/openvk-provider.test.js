@@ -1,6 +1,22 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { normalizeOpenVkRange, normalizeOpenVkSourceId, sanitizeOpenVkTrack, validateOpenVkMediaUrl } from '../src/openvk-provider.js';
+import { createOpenVkProvider, normalizeOpenVkRange, normalizeOpenVkSourceId, sanitizeOpenVkTrack, validateOpenVkMediaUrl } from '../src/openvk-provider.js';
+
+test('OpenVK settings are stored transactionally and normalize copied tokens', async () => {
+  const values=new Map([['openvk_enabled','false'],['openvk_access_token','old-token']]);
+  const connection={
+    prepare(sql){
+      if(sql.startsWith('SELECT key,value'))return{async all(){return [...values].map(([key,value])=>({key,value}));}};
+      return{async run(value){values.set(sql.includes("'openvk_enabled'")?'openvk_enabled':'openvk_access_token',value);}};
+    },
+  };
+  const db={...connection,async transaction(callback){await callback(connection);}};
+  const provider=createOpenVkProvider({db,uploadDir:'/tmp',maxUploadBytes:1024,fetchImpl:async()=>{throw new Error('unexpected fetch');}});
+  const state=await provider.updateSettings({enabled:true,accessToken:'  access_token=new-token  '});
+  assert.deepEqual(state,{enabled:true,token:'new-token'});
+  assert.equal(values.get('openvk_enabled'),'true');
+  assert.equal(values.get('openvk_access_token'),'new-token');
+});
 
 test('OpenVK source IDs are strict owner and audio pairs', () => {
   assert.equal(normalizeOpenVkSourceId('27717_5'),'27717_5');

@@ -45,6 +45,21 @@ export function createOpenVkProvider({ db, uploadDir, maxUploadBytes, fetchImpl 
     return { enabled: values.openvk_enabled === 'true', token: String(values.openvk_access_token || '') };
   }
 
+  async function updateSettings({ enabled, accessToken }) {
+    const token = typeof accessToken === 'string'
+      ? accessToken.trim().replace(/^access_token=/, '').slice(0, 1024)
+      : null;
+    await db.transaction(async tx => {
+      await tx.prepare(`INSERT INTO app_settings(key,value,updated_at) VALUES('openvk_enabled',?,CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP`).run(enabled ? 'true' : 'false');
+      if (token !== null) {
+        await tx.prepare(`INSERT INTO app_settings(key,value,updated_at) VALUES('openvk_access_token',?,CURRENT_TIMESTAMP)
+          ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP`).run(token);
+      }
+    });
+    return settings();
+  }
+
   async function api(method, parameters, token) {
     const url = new URL(`/method/${method}`, API_ORIGIN);
     url.search = new URLSearchParams({ ...parameters, v: '5.131' });
@@ -162,5 +177,5 @@ export function createOpenVkProvider({ db, uploadDir, maxUploadBytes, fetchImpl 
     } finally { fs.rmSync(staging,{ force:true }); }
   }
 
-  return { settings, search, preview, importTrack };
+  return { settings, updateSettings, search, preview, importTrack };
 }
