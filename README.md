@@ -20,12 +20,12 @@
 
 ### Android
 
-<img src="android/docs/images/android-library.png" alt="Android-клиент Family Music" width="320">
+<img src="docs/images/android-library.png" alt="Android-клиент Family Music" width="320">
 
 ## Текущее состояние
 
-Текущая стабилизационная версия сервера — **0.1.25**, Android-клиента —
-**1.0.46**. Работают:
+Текущая тестовая версия сервера — **0.1.26**, Android-клиента —
+**1.0.48**. Работают:
 
 - первичное создание администратора и опциональная самостоятельная регистрация,
   выключенная по умолчанию;

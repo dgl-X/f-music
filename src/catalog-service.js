@@ -6,6 +6,7 @@ const TRACK_ORDERS = Object.freeze({
   title: 'title COLLATE NOCASE ASC',
   artist: 'artist COLLATE NOCASE ASC, album COLLATE NOCASE ASC',
   album: 'album COLLATE NOCASE ASC, disc_number ASC NULLS LAST, track_number ASC NULLS LAST, title COLLATE NOCASE ASC',
+  popular: '(SELECT COALESCE(sum(play_count),0) FROM play_history WHERE play_history.track_id=tracks.id) DESC, title COLLATE NOCASE ASC',
   year: 'year DESC, album COLLATE NOCASE ASC',
   random: 'md5(id || @seed)',
 });
@@ -186,7 +187,7 @@ export function createCatalogService({ db, apiPrefix }) {
       LEFT JOIN (SELECT track_id,sum(play_count) plays FROM play_history GROUP BY track_id) history ON history.track_id=tracks.id
       WHERE artists.id=? GROUP BY artists.id`).get(artistId);
     if (!artist) return null;
-    const albums = await db.prepare(`SELECT albums.id,albums.name,count(*) AS track_count,albums.year,
+    const albums = await db.prepare(`SELECT albums.id,albums.name,albums.image_key,count(*) AS track_count,albums.year,
       min(tracks.id) FILTER(WHERE tracks.cover_key IS NOT NULL) AS cover_track_id
       FROM albums JOIN tracks ON tracks.album_id=albums.id JOIN track_artists ON track_artists.track_id=tracks.id
       WHERE track_artists.artist_id=? GROUP BY albums.id ORDER BY albums.name COLLATE NOCASE`).all(artist.id);
@@ -194,12 +195,20 @@ export function createCatalogService({ db, apiPrefix }) {
       ...artist,
       image_url: artist.image_key ? `${responsePrefix}/artists/${artist.id}/image` : null,
       image_key: undefined,
-      albums,
+      albums: albums.map(album => ({
+        ...album,
+        image_url: album.image_key ? `${responsePrefix}/albums/${album.id}/image` : null,
+        image_key: undefined,
+      })),
     };
   }
 
   async function getAlbum({ albumId, userId, isAdmin, responsePrefix = apiPrefix }) {
-    const album = await db.prepare('SELECT id,name,artist,bio,image_key,year FROM albums WHERE id=?').get(albumId);
+    const album = await db.prepare(`SELECT albums.id,albums.name,albums.artist,albums.bio,albums.image_key,albums.year,
+      (SELECT track_artists.artist_id FROM tracks JOIN track_artists ON track_artists.track_id=tracks.id
+        WHERE tracks.album_id=albums.id AND track_artists.role='primary'
+        ORDER BY tracks.disc_number NULLS LAST,tracks.track_number NULLS LAST,track_artists.position LIMIT 1) AS artist_id
+      FROM albums WHERE albums.id=?`).get(albumId);
     if (!album) return null;
     return {
       ...album,
