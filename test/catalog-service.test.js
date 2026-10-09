@@ -13,6 +13,9 @@ test('track catalog parameters have stable bounds and safe sorting', () => {
   const queue = parseTrackListRequest(new URLSearchParams('queue=1&limit=999999&sort=random'));
   assert.equal(queue.limit, 10000);
   assert.equal(queue.order, 'md5(id || @seed)');
+
+  const popular = parseTrackListRequest(new URLSearchParams('sort=popular'));
+  assert.match(popular.order, /sum\(play_count\).*DESC/);
 });
 
 test('track catalog keeps pagination envelope and user-scoped filters', async () => {
@@ -138,14 +141,17 @@ test('artist card hides its storage key and includes related albums', async () =
   const calls = [];
   const db = { prepare(sql) { return {
     async get(id) { calls.push({ type: 'get', sql, id }); return { id: 4, name: 'Artist', image_key: 'artists/4.jpg', track_count: 2 }; },
-    async all(id) { calls.push({ type: 'all', sql, id }); return [{ id: 9, name: 'Album', track_count: 2 }]; },
+    async all(id) { calls.push({ type: 'all', sql, id }); return [{ id: 9, name: 'Album', image_key: 'albums/9.jpg', track_count: 2 }]; },
   }; } };
   const catalog = createCatalogService({ db, apiPrefix: '/api' });
   assert.deepEqual(await catalog.getArtist({ artistId: 4 }), {
     id: 4, name: 'Artist', image_key: undefined, track_count: 2,
-    image_url: '/api/artists/4/image', albums: [{ id: 9, name: 'Album', track_count: 2 }],
+    image_url: '/api/artists/4/image', albums: [{
+      id: 9, name: 'Album', image_key: undefined, track_count: 2, image_url: '/api/albums/9/image',
+    }],
   });
   assert.equal(calls[0].id, 4);
+  assert.match(calls[1].sql, /albums\.image_key/);
   assert.match(calls[1].sql, /ORDER BY albums\.name COLLATE NOCASE/);
 });
 
@@ -172,12 +178,12 @@ test('album card exposes public image URL and computed edit permission', async (
   const calls = [];
   const db = { prepare(sql) { return { async get(...params) {
     calls.push({ sql, params });
-    if (sql.startsWith('SELECT id,name')) return { id: 8, name: 'Album', image_key: 'albums/8.jpg', year: 2024 };
+    if (sql.includes('FROM albums WHERE')) return { id: 8, name: 'Album', image_key: 'albums/8.jpg', year: 2024, artist_id: 12 };
     return { total: 3, mine: 3 };
   } }; } };
   const catalog = createCatalogService({ db, apiPrefix: '/api/v1' });
   assert.deepEqual(await catalog.getAlbum({ albumId: 8, userId: 3, isAdmin: false }), {
-    id: 8, name: 'Album', image_key: undefined, year: 2024,
+    id: 8, name: 'Album', image_key: undefined, year: 2024, artist_id: 12,
     image_url: '/api/v1/albums/8/image', can_edit: true,
   });
   assert.deepEqual(calls[1].params, [3, 8]);
@@ -188,7 +194,7 @@ test('card image URLs retain the requested API version prefix', async () => {
   const db = { prepare() { return {
     async get() {
       if (artistLookup) return { id: 4, name: 'Artist', image_key: 'artists/4.jpg' };
-      return { id: 8, name: 'Album', image_key: 'albums/8.jpg' };
+      return { id: 8, name: 'Album', image_key: 'albums/8.jpg', artist_id: 4 };
     },
     async all() { artistLookup = false; return []; },
   }; } };
