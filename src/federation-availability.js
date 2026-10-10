@@ -22,6 +22,33 @@ export function federationPeerAvailability(peer, now = Date.now()) {
 export function createFederationAvailabilityService({ db }) {
   let healthBusy = false;
 
+  async function markHealthy(peer) {
+    await db.prepare(`UPDATE federation_peers SET health_failures=0,last_health_at=CURRENT_TIMESTAMP,
+      next_health_at=CURRENT_TIMESTAMP+INTERVAL '5 minutes',stream_failures=0,stream_unavailable_until=NULL,
+      last_stream_error=NULL,last_stream_success_at=CURRENT_TIMESTAMP,next_sync_at=LEAST(next_sync_at,CURRENT_TIMESTAMP)
+      WHERE node_id=?`).run(peer.node_id);
+  }
+
+  async function markUnhealthy(peer, error) {
+    const failures = Number(peer.health_failures || 0) + 1;
+    await db.prepare(`UPDATE federation_peers SET health_failures=?,last_health_at=CURRENT_TIMESTAMP,
+      next_health_at=CURRENT_TIMESTAMP+(? * INTERVAL '1 second'),last_stream_error=? WHERE node_id=?`)
+      .run(failures, federationHealthDelay(failures), String(error.message || error).slice(0, 1000), peer.node_id);
+  }
+
+  async function probePeer(peer, probe) {
+    const started = Date.now();
+    try {
+      const result = await probe(peer.endpoint, 'public', { timeoutMs:5000 });
+      if (result.node_id !== peer.node_id) throw new Error('Endpoint ответил identity другой ноды');
+      await markHealthy(peer);
+      return { ok:true, node_id:peer.node_id, latency_ms:Math.max(0, Date.now() - started), sync_queued:true };
+    } catch (error) {
+      await markUnhealthy(peer, error);
+      throw error;
+    }
+  }
+
   async function recordSuccess(nodeId) {
     await db.prepare(`UPDATE federation_peers SET stream_failures=0,stream_unavailable_until=NULL,
       last_stream_error=NULL,last_stream_success_at=CURRENT_TIMESTAMP WHERE node_id=?`).run(nodeId);
@@ -46,22 +73,16 @@ export function createFederationAvailabilityService({ db }) {
         AND next_health_at<=CURRENT_TIMESTAMP AND (sync_error IS NOT NULL OR last_synced_at IS NULL
           OR last_synced_at<CURRENT_TIMESTAMP-INTERVAL '10 minutes' OR stream_unavailable_until>CURRENT_TIMESTAMP)
         ORDER BY next_health_at LIMIT 4`).all();
-      for (const peer of peers) try {
-        const result = await probe(peer.endpoint, 'public', { timeoutMs:5000 });
-        if (result.node_id !== peer.node_id) throw new Error('Endpoint ответил identity другой ноды');
-        await db.prepare(`UPDATE federation_peers SET health_failures=0,last_health_at=CURRENT_TIMESTAMP,
-          next_health_at=CURRENT_TIMESTAMP+INTERVAL '5 minutes',stream_failures=0,stream_unavailable_until=NULL,
-          last_stream_error=NULL,last_stream_success_at=CURRENT_TIMESTAMP,next_sync_at=LEAST(next_sync_at,CURRENT_TIMESTAMP)
-          WHERE node_id=?`).run(peer.node_id);
-      } catch (error) {
-        const failures = Number(peer.health_failures || 0) + 1;
-        await db.prepare(`UPDATE federation_peers SET health_failures=?,last_health_at=CURRENT_TIMESTAMP,
-          next_health_at=CURRENT_TIMESTAMP+(? * INTERVAL '1 second'),last_stream_error=? WHERE node_id=?`)
-          .run(failures, federationHealthDelay(failures), String(error.message || error).slice(0, 1000), peer.node_id);
-      }
+      for (const peer of peers) try { await probePeer(peer, probe); } catch {}
       return true;
     } finally { healthBusy = false; }
   }
 
-  return { recordSuccess, recordFailure, check };
+  async function checkPeer(nodeId, probe) {
+    const peer = await db.prepare("SELECT * FROM federation_peers WHERE node_id=? AND status IN ('compatible','limited') AND revoked_at IS NULL").get(nodeId);
+    if (!peer) return null;
+    return probePeer(peer, probe);
+  }
+
+  return { recordSuccess, recordFailure, check, checkPeer };
 }

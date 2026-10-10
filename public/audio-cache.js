@@ -1,5 +1,12 @@
 const MiB = 1024 * 1024;
 
+export function audioRecoveryDecision({ usingCache = false, cachedCopy = false, attempted = false } = {}) {
+  if (attempted) return 'skip';
+  if (!usingCache && cachedCopy) return 'cache';
+  if (usingCache) return 'network';
+  return 'skip';
+}
+
 // Session-only cache. Object URLs are private to the tab and never reach HTTP caches.
 export class AudioMemoryCache {
   constructor({ fetcher = fetch, createUrl = URL.createObjectURL, revokeUrl = URL.revokeObjectURL, maxTrackBytes = 64 * MiB, maxBytes = 128 * MiB } = {}) {
@@ -25,7 +32,8 @@ export class AudioMemoryCache {
   pin(trackId) { this.pinned = trackId; }
 
   async load(trackId, source, signal) {
-    if (this.get(trackId)) return this.get(trackId);
+    const ready = this.get(trackId);
+    if (ready) return ready;
     if (this.pending.has(trackId)) return this.pending.get(trackId);
     const job = this.download(trackId, source, signal);
     this.pending.set(trackId, job);

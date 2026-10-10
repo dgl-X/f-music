@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { AudioMemoryCache } from '../public/audio-cache.js';
+import { AudioMemoryCache, audioRecoveryDecision } from '../public/audio-cache.js';
 
 function fixture({ maxBytes = 12, maxTrackBytes = 8 } = {}) {
   const requests = [], revoked = [];
@@ -41,4 +41,17 @@ test('audio cache skips oversized tracks', async () => {
   assert.equal(await cache.load('a', '/a'), null);
   assert.equal(cache.entries.size, 0);
   assert.deepEqual(revoked, []);
+});
+
+test('audio recovery switches failed network stream to completed memory copy', () => {
+  assert.equal(audioRecoveryDecision({ usingCache: false, cachedCopy: true }), 'cache');
+});
+
+test('audio recovery retries network once when cached blob fails', () => {
+  assert.equal(audioRecoveryDecision({ usingCache: true, cachedCopy: true }), 'network');
+});
+
+test('audio recovery never oscillates after one fallback attempt', () => {
+  assert.equal(audioRecoveryDecision({ usingCache: false, cachedCopy: true, attempted: true }), 'skip');
+  assert.equal(audioRecoveryDecision({ usingCache: false, cachedCopy: false }), 'skip');
 });
