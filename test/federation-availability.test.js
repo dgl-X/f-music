@@ -33,6 +33,27 @@ test('health check restores only the expected peer identity', async () => {
   assert.equal(updates[1].params.at(-1), 'fm:other');
 });
 
+test('manual peer check validates identity and queues catalog sync', async () => {
+  const updates = [];
+  const peer = { node_id:'fm:expected-node-1234', endpoint:'https://peer.example', health_failures:1 };
+  const db = { prepare(sql) { return {
+    get: async () => peer,
+    run: async (...params) => { updates.push({ sql, params }); return { changes:1 }; },
+  }; } };
+  const service = createFederationAvailabilityService({ db });
+  const result = await service.checkPeer(peer.node_id, async () => ({ node_id:peer.node_id }));
+  assert.equal(result.ok, true);
+  assert.equal(result.node_id, peer.node_id);
+  assert.equal(result.sync_queued, true);
+  assert.match(updates[0].sql, /next_sync_at=LEAST/);
+});
+
+test('manual peer check rejects an unknown peer', async () => {
+  const db = { prepare() { return { get: async () => undefined }; } };
+  const service = createFederationAvailabilityService({ db });
+  assert.equal(await service.checkPeer('fm:missing-node-1234', async () => ({})), null);
+});
+
 test('queue availability requires fresh sync and a closed stream circuit', () => {
   assert.match(FEDERATION_QUEUE_ONLINE_SQL, /last_synced_at>=CURRENT_TIMESTAMP/);
   assert.match(FEDERATION_QUEUE_ONLINE_SQL, /stream_unavailable_until/);

@@ -650,6 +650,17 @@ async function api(req, res, url, apiPrefix = '/api') {
     if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
     return sendJson(res, 200, { items: await federation.listPeers() });
   }
+  const peerCheckMatch = /^\/api\/admin\/federation\/peers\/(fm:[A-Za-z0-9_-]{16,128})\/check$/.exec(url.pathname);
+  if (peerCheckMatch && req.method === 'POST') {
+    if (!user.is_admin) return sendJson(res, 403, { error: 'Доступно только администратору' });
+    try {
+      const result = await federationAvailability.checkPeer(peerCheckMatch[1], probeFederationEndpoint);
+      if (!result) return sendJson(res, 404, { error: 'Активная нода не найдена' });
+      return sendJson(res, 200, result);
+    } catch (error) {
+      return sendJson(res, 422, { error:error.message || 'Нода недоступна', code:error.code || 'peer_check_failed' });
+    }
+  }
   const peerPolicyMatch=/^\/api\/admin\/federation\/peers\/(fm:[A-Za-z0-9_-]{16,128})\/export-policy$/.exec(url.pathname);
   if(peerPolicyMatch&&req.method==='PUT'){
     if(!user.is_admin)return sendJson(res,403,{error:'Доступно только администратору'});
