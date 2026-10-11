@@ -44,15 +44,17 @@ test('artist card queue is filtered by stable artist id before its name is loade
   const calls=[];
   const db={prepare(sql){return {
     async get(params){calls.push({type:'get',sql,params});return {count:2};},
-    async all(params){calls.push({type:'all',sql,params});return [{id:'track-1',cover_key:'covers/1.jpg'}];},
+    async all(params){calls.push({type:'all',sql,params});return [{id:'track-1',cover_key:'covers/1.jpg',artist_role:'featured'}];},
   };}};
   const catalog=createCatalogService({db,apiPrefix:'/api/v1'});
   const result=await catalog.listTracks({userId:7,searchParams:new URLSearchParams('artist_id=42&queue=1&limit=10000&sort=title'),responsePrefix:'/api/v1'});
   assert.equal(result.total,2);
   assert.equal(result.items[0].cover_url,'/api/v1/tracks/track-1/cover');
+  assert.equal(result.items[0].artist_role,'featured');
   assert.match(calls[0].sql,/track_artists\.artist_id=@artist_id/);
   assert.equal(calls[0].params.artist_id,42);
   assert.doesNotMatch(calls[0].sql,/artists\.name=@artist/);
+  assert.match(calls[1].sql,/artist_role\.role/);
 });
 
 test('track and collection artwork retain the request API version prefix', async () => {
@@ -152,7 +154,11 @@ test('artist card hides its storage key and includes related albums', async () =
   });
   assert.equal(calls[0].id, 4);
   assert.match(calls[1].sql, /albums\.image_key/);
-  assert.match(calls[1].sql, /ORDER BY albums\.name COLLATE NOCASE/);
+  assert.match(calls[1].sql, /COALESCE\(albums\.year,max\(tracks\.year\)\) AS year/);
+  assert.match(calls[1].sql, /WITH related AS/);
+  assert.match(calls[1].sql, /count\(\*\) AS credited_track_count/);
+  assert.match(calls[1].sql, /JOIN tracks ON tracks\.album_id=albums\.id/);
+  assert.match(calls[1].sql, /COALESCE\(albums\.year,max\(tracks\.year\)\) DESC NULLS LAST,albums\.name COLLATE NOCASE,albums\.id/);
 });
 
 test('missing artist and album cards return null', async () => {
