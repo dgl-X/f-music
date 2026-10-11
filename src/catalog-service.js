@@ -108,9 +108,14 @@ export function createCatalogService({ db, apiPrefix }) {
       params.playlist_id = request.playlistId;
     }
     const filter = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const artistRoleSql = Number.isSafeInteger(request.artistId) && request.artistId > 0
+      ? `(SELECT artist_role.role FROM track_artists artist_role
+          WHERE artist_role.track_id=tracks.id AND artist_role.artist_id=@artist_id
+          ORDER BY artist_role.position LIMIT 1) AS artist_role,`
+      : 'NULL::text AS artist_role,';
     const total = Number((await db.prepare(`SELECT count(*) count FROM tracks ${filter}`).get(params)).count);
     const sql = `SELECT id, title, artist, album, album_id, filename, mime_type, size_bytes, duration_seconds, created_at,
-      cover_key, genre, year, track_number, disc_number,
+      cover_key, genre, year, track_number, disc_number, ${artistRoleSql}
       (SELECT recommended_gain_db FROM loudness_jobs WHERE loudness_jobs.track_id=tracks.id AND status='ready') AS replay_gain_db,
       EXISTS(SELECT 1 FROM track_files ready192 WHERE ready192.track_id=tracks.id AND ready192.variant='aac_192' AND ready192.status='ready') AS aac_192_ready,
       EXISTS(SELECT 1 FROM track_files ready96 WHERE ready96.track_id=tracks.id AND ready96.variant='aac_96' AND ready96.status='ready') AS aac_96_ready,
@@ -187,10 +192,18 @@ export function createCatalogService({ db, apiPrefix }) {
       LEFT JOIN (SELECT track_id,sum(play_count) plays FROM play_history GROUP BY track_id) history ON history.track_id=tracks.id
       WHERE artists.id=? GROUP BY artists.id`).get(artistId);
     if (!artist) return null;
-    const albums = await db.prepare(`SELECT albums.id,albums.name,albums.image_key,count(*) AS track_count,albums.year,
+    const albums = await db.prepare(`WITH related AS (
+      SELECT tracks.album_id,count(*) AS credited_track_count,
+        CASE WHEN bool_or(track_artists.role='primary') THEN 'primary' ELSE 'featured' END AS artist_role
+      FROM tracks JOIN track_artists ON track_artists.track_id=tracks.id
+      WHERE track_artists.artist_id=? AND tracks.album_id IS NOT NULL GROUP BY tracks.album_id
+    ) SELECT albums.id,albums.name,albums.image_key,count(*) AS track_count,related.credited_track_count,
+      COALESCE(albums.year,max(tracks.year)) AS year,related.artist_role,
       min(tracks.id) FILTER(WHERE tracks.cover_key IS NOT NULL) AS cover_track_id
-      FROM albums JOIN tracks ON tracks.album_id=albums.id JOIN track_artists ON track_artists.track_id=tracks.id
-      WHERE track_artists.artist_id=? GROUP BY albums.id ORDER BY albums.name COLLATE NOCASE`).all(artist.id);
+      FROM related JOIN albums ON albums.id=related.album_id JOIN tracks ON tracks.album_id=albums.id
+      GROUP BY albums.id,related.credited_track_count,related.artist_role
+      ORDER BY CASE WHEN related.artist_role='primary' THEN 0 ELSE 1 END,
+        COALESCE(albums.year,max(tracks.year)) DESC NULLS LAST,albums.name COLLATE NOCASE,albums.id`).all(artist.id);
     return {
       ...artist,
       image_url: artist.image_key ? `${responsePrefix}/artists/${artist.id}/image` : null,

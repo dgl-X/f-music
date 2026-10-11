@@ -133,6 +133,7 @@ select { min-width:170px; padding:0 13px; color:inherit; background:#17191d; bor
 .artist-bio { max-width:760px; margin:8px 0 2px; color:#c9cbd2; line-height:1.5; white-space:pre-line; }
 .collection-section-head { display:flex; align-items:center; justify-content:space-between; margin:28px 0 13px; }
 .collection-section-head h3 { margin:0; font-size:1.55rem; }
+.tracks > .artist-featured-head { margin:24px 0 5px; }
 .artist-tracks-collapsed .track:nth-child(n+6) { display:none; }
 .artist-show-all { margin:12px 0 30px; }
 .artist-albums-section { min-width:0; margin:8px 0 20px; }
