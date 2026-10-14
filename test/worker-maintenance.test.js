@@ -59,7 +59,7 @@ test('track enrichment stays inside storage and preserves duplicate hashes',asyn
     });
     assert.equal(await maintenance.enrichTracks(),2);
     assert.equal(updates.length,1);
-    assert.deepEqual(updates[0].params,[null,'covers/track.jpg','Rock',2020,2,1,'track']);
+    assert.deepEqual(updates[0].params,[null,'covers/track.jpg','Rock',2020,2,1,null,'track']);
   }finally{fs.rmSync(root,{recursive:true,force:true});}
 });
 
@@ -75,4 +75,20 @@ test('maintenance delegates report and federation retention',async()=>{
     assert.match(calls[0],/federation_nonces/);
     assert.match(calls[1],/federation_invitations/);
   }finally{fs.rmSync(root,{recursive:true,force:true});}
+});
+
+test('legacy codec backfill does not rehash files or re-extract checked artwork',async t=>{
+  const {root,uploadDir}=temporaryStorage();t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  fs.writeFileSync(path.join(root,'audio.mp3'),'unchanged');
+  let updated;
+  const db={prepare(sql){return{
+    async all(){assert.match(sql,/source_codec IS NULL/);return[{id:'track',storage_key:'audio.mp3',sha256:'known',cover_checked:1,cover_key:null}];},
+    async get(){assert.fail('Known SHA was checked again');},
+    async run(...params){updated=params;},
+  };}};
+  const maintenance=createWorkerMaintenance({db,storageDir:root,uploadDir,inspectAudio:async()=>({streams:[{codec_type:'audio',codec_name:'mp3'}]}),
+    sha256File:async()=>assert.fail('Known file was rehashed'),extractCover:async()=>assert.fail('Checked artwork was extracted again'),normalizedTags:()=>({}),log(){}});
+  await maintenance.enrichTracks();
+  assert.equal(updated[0],'known');assert.equal(updated[6],'mp3');
+  assert.equal(fs.readFileSync(path.join(root,'audio.mp3'),'utf8'),'unchanged');
 });

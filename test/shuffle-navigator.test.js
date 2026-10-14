@@ -2,6 +2,24 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ShuffleNavigator, nextPlayableIndex } from '../public/shuffle-navigator.js';
 
+test('Connect round trip preserves next track and actual previous history', () => {
+  const ids=['a','b','c','d'],source=new ShuffleNavigator(()=>0.25);
+  source.reset(4,0);const current=source.next(4,0);
+  const snapshot=source.snapshot(ids,current),target=new ShuffleNavigator(()=>0.9);
+  target.restore(ids,ids[current],snapshot);
+  assert.deepEqual(target.order,source.order);
+  assert.equal(target.peekNext(4,current,()=>true,false),source.peekNext(4,current,()=>true,false));
+  assert.equal(target.previous(4,current),0);
+});
+
+test('Connect navigation filters unavailable IDs without reordering remaining tracks', () => {
+  const target=new ShuffleNavigator();
+  target.restore(['a','c','d'],'c',{shuffle_order:['d','a','missing','c'],playback_history:['a','missing']});
+  assert.deepEqual(target.order,[2,0,1]);
+  assert.equal(target.next(3,1,()=>true,false),-1);
+  assert.equal(target.previous(3,1),0);
+});
+
 test('shuffle previous returns the track that actually played before', () => {
   const navigator = new ShuffleNavigator(() => 0.25);
   navigator.reset(5, 2);

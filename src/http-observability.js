@@ -8,6 +8,7 @@ export function requestIdFrom(headers = {}) {
 }
 
 export function requestKind(pathname) {
+  if(/^\/api\/(v1\/)?connect\/events$/.test(pathname))return 'connect_events';
   if (pathname.startsWith('/federation/')) return 'federation';
   if (pathname.startsWith('/api/')) return 'api';
   return 'static';
@@ -26,9 +27,13 @@ export function createHttpObserver({ metrics, write = line => console.log(line),
       completed = true;
       const durationMs = Number(process.hrtime.bigint() - started) / 1e6;
       metrics.requests++;
-      metrics.duration_ms_total += durationMs;
-      metrics.duration_ms_max = Math.max(metrics.duration_ms_max, durationMs);
-      if (durationMs >= slowMs) metrics.slow_requests++;
+      const eventStream=String(res.getHeader?.('content-type')||'').startsWith('text/event-stream');
+      if(eventStream)metrics.event_streams=(metrics.event_streams||0)+1;
+      else{
+        metrics.duration_ms_total += durationMs;
+        metrics.duration_ms_max = Math.max(metrics.duration_ms_max, durationMs);
+        if (durationMs >= slowMs) metrics.slow_requests++;
+      }
       if (res.statusCode >= 500) metrics.errors5xx++;
       write(JSON.stringify({ time:new Date().toISOString(), level:res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info', event:'http_request', request_id:requestId, method:req.method, path:url.pathname, kind, status:res.statusCode, duration_ms:Number(durationMs.toFixed(1)), completed:event === 'finish' }));
     };
@@ -39,10 +44,11 @@ export function createHttpObserver({ metrics, write = line => console.log(line),
 }
 
 export function httpMetricSnapshot(metrics) {
+  const timedRequests=metrics.requests-(metrics.event_streams||0);
   return {
     requests:metrics.requests,
     errors_5xx:metrics.errors5xx,
-    duration_ms_average:metrics.requests ? Number((metrics.duration_ms_total / metrics.requests).toFixed(1)) : 0,
+    duration_ms_average:timedRequests ? Number((metrics.duration_ms_total / timedRequests).toFixed(1)) : 0,
     duration_ms_max:Number(metrics.duration_ms_max.toFixed(1)),
     slow_requests:metrics.slow_requests,
   };

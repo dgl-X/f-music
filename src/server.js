@@ -42,6 +42,7 @@ import { createTranscodeService } from './transcode-service.js';
 import { createWorkerMaintenance } from './worker-maintenance.js';
 import { createConnectService } from './connect-service.js';
 import { createConnectHttpController } from './connect-http.js';
+import { createConnectEvents } from './connect-events.js';
 import { createAccountHttpController } from './account-http.js';
 import { createAuthenticationHttpController } from './authentication-http.js';
 import { createOperationalHttpController } from './operational-http.js';
@@ -82,7 +83,8 @@ const jsonHeaders = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-
 const authentication = createAuthenticationService({ db, sessionDays: config.sessionDays, secureCookies: config.secureCookies });
 const catalog = createCatalogService({ db, apiPrefix: '/api' });
 const uploadJobs = createUploadJobService({ db });
-const connect = createConnectService({ db, enabled:config.connectEnabled });
+const connect = createConnectService({ db, enabled:config.connectEnabled, onChange:userId=>connectEvents.notify(userId) });
+const connectEvents=createConnectEvents({enabled:config.connectEnabled&&config.connectEventsEnabled,authorize:input=>connect.authorizeEvents(input)});
 const federation = createFederationService({ db });
 const federationAvailability = createFederationAvailabilityService({ db });
 const operationMetrics = createOperationMetrics({ db });
@@ -127,7 +129,7 @@ const userAccess = createUserAccess({
 });
 const staticFile = createStaticFileHandler(publicDir);
 const federationCatalogEvents = createFederationCatalogEvents({ db, federationTrackVisible });
-const connectHttp = createConnectHttpController({ connect, readJson, sendJson });
+const connectHttp = createConnectHttpController({ connect, readJson, sendJson, events:connectEvents });
 const accountHttp = createAccountHttpController({ db, authentication, registrationEnabled, readJson, sendJson });
 const authenticationHttp = createAuthenticationHttpController({ db, authentication, registrationEnabled, readJson, sendJson });
 const uploadHttp = createUploadHttpController({ uploads, readJson, sendJson });
@@ -380,6 +382,8 @@ const server = http.createServer(async (req, res) => {
     else res.destroy();
   }
 });
+
+server.on('close',()=>connectEvents.close());
 
 if (workerMode) {
   console.log('Family Music worker запущен');

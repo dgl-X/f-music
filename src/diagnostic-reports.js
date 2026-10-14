@@ -15,8 +15,35 @@ export function normalizeDiagnosticReport(body = {}) {
   const details = Object.fromEntries(DETAIL_FIELDS
     .filter(key => body.details?.[key] !== undefined)
     .map(key => [key, body.details[key]]));
+  const safeSection=(value,booleans,numbers)=>{
+    const result={};if(!value||typeof value!=='object')return result;
+    for(const key of booleans)if(typeof value[key]==='boolean')result[key]=value[key];
+    for(const key of numbers)if(Number.isFinite(value[key]))result[key]=Math.max(-1,Math.min(Number.MAX_SAFE_INTEGER,value[key]));
+    return result;
+  };
+  if(body.details?.session){
+    const value=body.details.session;
+    details.session=safeSection(value,[],['started_at_ms','age_ms','event_count','log_bytes','dropped_events']);
+    if(typeof value.id==='string'&&/^[0-9a-f-]{36}$/i.test(value.id))details.session.id=value.id;
+    if(value.scope==='process')details.session.scope='process';
+  }
+  if(body.details?.smart_cache)details.smart_cache=safeSection(body.details.smart_cache,['enabled','wifi_only','current_fully_cached'],['depth','limit_bytes','used_bytes','complete_versions','catalog_available','meaningful_listens','cache_hits','offline_skips','offline_stops']);
+  if(body.details?.media){
+    const value=body.details.media;
+    details.media=safeSection(value,['seekable','fully_cached'],['local_state','local_position_ms','local_duration_ms','cache_content_length','cache_cached_bytes','sample_rate','channels','pcm_encoding','bitrate']);
+    if(['original','normalized_flac','aac_96','aac_192'].includes(value.selected_variant))details.media.selected_variant=value.selected_variant;
+    if(['local','federation','offline','other','unknown'].includes(value.source_kind))details.media.source_kind=value.source_kind;
+    for(const key of ['audio_mime','container_mime'])if(typeof value[key]==='string'&&value[key].length<=64&&/^[a-zA-Z0-9.+_-]+\/[a-zA-Z0-9.+_-]+$/.test(value[key]))details.media[key]=value[key];
+  }
+  const connect=body.details?.connect;
+  if(connect&&typeof connect==='object'){
+    details.connect={};
+    for(const key of ['enabled','remote','command_pending'])if(typeof connect[key]==='boolean')details.connect[key]=connect[key];
+    for(const key of ['playback_epoch','last_command_id','last_command_latency_ms','last_contact_age_ms'])if(Number.isFinite(connect[key]))details.connect[key]=Math.max(-1,Math.min(Number.MAX_SAFE_INTEGER,connect[key]));
+    if(['connected','reconnecting','error'].includes(connect.connection))details.connect.connection=connect.connection;
+  }
   const detailsJson = JSON.stringify(details);
-  if (detailsJson.length > 40000) throw reportError('Диагностический журнал слишком большой', 'report_too_large');
+  if (detailsJson.length > 96000) throw reportError('Диагностический журнал слишком большой', 'report_too_large');
   return {
     description,
     appVersion:String(body.app_version ?? '').slice(0, 40),
@@ -69,7 +96,7 @@ export function createDiagnosticReportsHttpController({ reports, readJson, sendJ
 
   async function handle(req, res, url, user) {
     if (url.pathname === '/api/reports' && req.method === 'POST') {
-      try { return reply(res, 201, await reports.create({ userId:user.id, body:await readJson(req, 48 * 1024) })); }
+      try { return reply(res, 201, await reports.create({ userId:user.id, body:await readJson(req, 128 * 1024) })); }
       catch (error) {
         if (error.code === 'invalid_report') return reply(res, 400, { error:error.message });
         if (error.code === 'report_too_large') return reply(res, 413, { error:error.message });

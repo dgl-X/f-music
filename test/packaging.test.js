@@ -32,4 +32,5 @@ test('LXC smoke test covers reboot and persistent state', () => {
 test('backup includes originals and non-reproducible artwork', () => {
   assert.match(backupScript, /for directory in originals covers albums federation/);
   assert.match(backupScript, /media=originals,covers,albums,federation/);
+  assert.match(backupScript, /for directory in originals covers albums federation derived\/normalized_flac/);
 });

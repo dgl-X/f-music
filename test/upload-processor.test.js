@@ -74,3 +74,35 @@ test('processor stores the original and creates secondary jobs atomically', asyn
   assert.ok(setup.calls.some(call => call.sql.includes('INSERT INTO loudness_jobs')));
   assert.ok(setup.calls.some(call => call.sql.includes('INSERT INTO track_files')));
 });
+
+test('hybrid repair preserves uploaded bytes and hash while probing the derivative again',async t=>{
+  const inspected=[],validated=[];
+  const setup=fixture(t,{
+    async inspectAudio(file){inspected.push(file);return{format_name:'flac',duration:file.endsWith('.repaired')?8:5,tags:{title:'Song',artist:'Artist'}};},
+    async normalizeHybridFlac(file){const output=file+'.repaired';fs.writeFileSync(output,'repaired-audio');return{normalized:true,output};},
+    audioCodec(){return 'flac';},
+    async sha256File(file){assert.equal(fs.readFileSync(file,'utf8'),'uploaded-hybrid');return 'original-hash';},
+    async validateAudioDecode(file,duration){validated.push({file,duration});return{valid:true};},
+  });
+  const source=path.join(setup.uploadDir,'upload-1.part');fs.writeFileSync(source,'uploaded-hybrid');
+  await setup.processor.process({id:'upload-1',user_id:2,filename:'song.flac',mime_type:'audio/flac'});
+  const track=setup.calls.find(call=>call.sql.startsWith('INSERT INTO tracks'));
+  assert.equal(track.params[8],8);
+  assert.equal(track.params[10],'original-hash');
+  assert.equal(fs.readFileSync(path.join(setup.storageDir,track.params[9]),'utf8'),'uploaded-hybrid');
+  const derivative=setup.calls.find(call=>call.sql.includes("'normalized_flac'"));
+  assert.equal(fs.readFileSync(path.join(setup.storageDir,derivative.params[2]),'utf8'),'repaired-audio');
+  assert.equal(inspected.length,2);assert.equal(validated[0].duration,8);
+  assert.equal(fs.existsSync(source+'.repaired'),false);
+});
+
+test('a rejected repaired file leaves no temporary derivative',async t=>{
+  const setup=fixture(t,{
+    async normalizeHybridFlac(file){fs.writeFileSync(file+'.repaired','bad');return{normalized:true,output:file+'.repaired'};},
+    audioCodec(){return 'flac';},async validateAudioDecode(){return{valid:false};},
+  });
+  const source=path.join(setup.uploadDir,'upload-1.part');fs.writeFileSync(source,'original');
+  assert.equal((await setup.processor.process({id:'upload-1',user_id:2,filename:'song.flac'})).status,'rejected');
+  assert.equal(fs.existsSync(source+'.repaired'),false);
+  assert.equal(setup.calls.some(call=>call.sql.startsWith('INSERT INTO tracks')),false);
+});

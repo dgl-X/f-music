@@ -10,7 +10,26 @@ test('diagnostic report accepts only bounded safe detail sections', () => {
   assert.equal(report.description,'Переключение зависло');
   assert.deepEqual(JSON.parse(report.detailsJson),{track:{id:'one'},network:{type:'wifi'}});
   assert.throws(()=>normalizeDiagnosticReport({description:' '}),error=>error.code==='invalid_report');
-  assert.throws(()=>normalizeDiagnosticReport({description:'x',details:{events:'x'.repeat(40001)}}),error=>error.code==='report_too_large');
+  assert.throws(()=>normalizeDiagnosticReport({description:'x',details:{events:'x'.repeat(96001)}}),error=>error.code==='report_too_large');
+});
+
+test('Connect diagnostics keep only safe scalar fields, never raw payloads or credentials',()=>{
+  const result=normalizeDiagnosticReport({description:'test',details:{connect:{enabled:true,remote:false,connection:'reconnecting',last_command_latency_ms:250,token:'secret',queue:['private-track'],payload:{password:'secret'}}}});
+  assert.deepEqual(JSON.parse(result.detailsJson).connect,{enabled:true,remote:false,last_command_latency_ms:250,connection:'reconnecting'});
+});
+
+test('session and expanded playback diagnostics preserve only known scalar fields',()=>{
+  const result=normalizeDiagnosticReport({description:'test',details:{
+    session:{scope:'process',id:'00000000-0000-4000-8000-000000000000',age_ms:10,event_count:600,token:'secret'},
+    media:{seekable:false,cache_content_length:-1,selected_variant:'original',audio_mime:'audio/flac',url:'https://private.invalid/secret',headers:{cookie:'secret'}},
+    smart_cache:{enabled:true,current_fully_cached:false,used_bytes:100,cookie:'secret'},
+    events:Array.from({length:600},()=> 'safe event '.repeat(5)),
+  }});
+  const details=JSON.parse(result.detailsJson);
+  assert.equal(details.session.scope,'process');assert.equal(details.session.token,undefined);
+  assert.deepEqual(details.media,{seekable:false,cache_content_length:-1,selected_variant:'original',audio_mime:'audio/flac'});
+  assert.deepEqual(details.smart_cache,{enabled:true,current_fully_cached:false,used_bytes:100});
+  assert.equal(details.events.length,600);
 });
 
 test('diagnostic report service preserves response shape and tolerates legacy malformed details', async () => {

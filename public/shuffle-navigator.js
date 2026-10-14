@@ -8,6 +8,7 @@ export class ShuffleNavigator {
     this.order = [];
     this.position = -1;
     this.size = 0;
+    this.history = [];
   }
 
   reset(size, currentIndex) {
@@ -20,17 +21,33 @@ export class ShuffleNavigator {
     }
     this.order = [currentIndex, ...rest];
     this.position = 0;
+    this.history = [];
   }
 
   ensure(size, currentIndex) {
     if (this.size !== size || this.order[this.position] !== currentIndex) this.reset(size, currentIndex);
   }
 
+  snapshot(ids,currentIndex) {
+    this.ensure(ids.length,currentIndex);
+    return{shuffle_order:this.order.map(index=>ids[index]),playback_history:this.history.map(index=>ids[index])};
+  }
+
+  restore(ids,currentId,snapshot={}) {
+    const positions=new Map(ids.map((id,index)=>[id,index]));
+    const supplied=Array.isArray(snapshot.shuffle_order)?snapshot.shuffle_order:[];
+    const indexes=[...new Set(supplied.filter(id=>positions.has(id)).map(id=>positions.get(id)))];
+    const seen=new Set(indexes);
+    for(let i=0;i<ids.length;i++)if(!seen.has(i)){seen.add(i);indexes.push(i);}
+    this.order=indexes;this.size=ids.length;this.position=indexes.indexOf(positions.get(currentId));
+    this.history=(Array.isArray(snapshot.playback_history)?snapshot.playback_history:[]).filter(id=>positions.has(id)).map(id=>positions.get(id));
+  }
+
   next(size, currentIndex, playable = () => true, wrap = true) {
     this.ensure(size, currentIndex);
     for (let position = this.position + 1; position < this.order.length; position++) {
       const index = this.order[position];
-      if (playable(index)) { this.position = position; return index; }
+      if (playable(index)) { this.history.push(currentIndex);if(this.history.length>10000)this.history.shift();this.position = position; return index; }
     }
     if (!wrap || size < 2) return -1;
     this.reset(size, currentIndex);
@@ -39,10 +56,7 @@ export class ShuffleNavigator {
 
   previous(size, currentIndex, playable = () => true) {
     this.ensure(size, currentIndex);
-    for (let position = this.position - 1; position >= 0; position--) {
-      const index = this.order[position];
-      if (playable(index)) { this.position = position; return index; }
-    }
+    while(this.history.length){const index=this.history.pop();if(playable(index)){this.position=this.order.indexOf(index);return index;}}
     return -1;
   }
 
