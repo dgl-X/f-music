@@ -2,7 +2,10 @@ import { ShuffleNavigator, nextPlayableIndex } from './shuffle-navigator.js';
 import { AudioMemoryCache, audioRecoveryDecision } from './audio-cache.js';
 import { parseWebRoute, webRouteForState } from './web-router.js';
 import { ConnectClient, availableConnectDevices, remotePlaybackActive } from './connect-client.js';
+import { connectStatusLabel } from './connect-status.js';
+import { waitForPlayback, webConnectPlaybackStatus, connectPositionAdvances } from './connect-playback.js';
 import { artistAlbumMeta, groupArtistAlbums, groupArtistTracks } from './artist-tracks.js';
+import { browserPlaybackCodecs, MediaPlaybackClient, mediaCacheKey, mediaPlaybackLabel, PlaybackRequestGate } from './media-playback-client.js';
 
 const app = document.querySelector('#app');
 const api = async (url, options = {}) => {
@@ -45,6 +48,13 @@ let preloadTimer = null;
 let preloadAbort = null;
 let activeBlobUrl = '';
 let blobFallbackTrackId = '';
+const mediaRequestGate=new PlaybackRequestGate();
+const mediaSelections=new Map();
+let mediaPlaybackClient=null,webMediaPreparing=false,webMediaPlayIntent=false;
+const selectedMedia=track=>mediaSelections.get(track?.id);
+const audioCacheKey=track=>selectedMedia(track)?.cache_key||mediaCacheKey(track,'legacy');
+function setMediaStatus(text=''){const node=document.querySelector('#media-status');if(node)node.textContent=text;}
+function cancelMediaPreparation(){const waiting=webMediaPreparing;mediaRequestGate.cancel();webMediaPreparing=false;webMediaPlayIntent=false;setMediaStatus();if(waiting){const button=document.querySelector('#toggle');if(button){button.textContent='▶';button.title='Воспроизвести';}}}
 let repeatMode = 'off';
 let stateSaveTimer;
 let sessionUser=null;
@@ -57,12 +67,13 @@ let registrationEnabled=false;
 let settingsSection='';
 let unknownRoutePath='';
 let openingSettingsSection='';
-let connectClient=null,connectState=null,handlingConnectCommand=false,connectRemoteTrack=null,connectRemoteTrackId='',connectStateReceivedAt=0,connectUiTimer=null;
+let connectClient=null,connectState=null,handlingConnectCommand=false,connectPreparing=false,connectPreparationGeneration=0,connectRemoteTrack=null,connectRemoteTrackId='',connectStateReceivedAt=0,connectUiTimer=null;
 
 const connectRemoteActive=()=>remotePlaybackActive(connectClient,connectState);
-const connectPlaybackState=(index=currentIndex)=>{const player=document.querySelector('#player'),track=queue[index];return{track_id:track?.id||null,position_seconds:index===currentIndex?Number(player?.currentTime||0):0,duration_seconds:index===currentIndex&&Number.isFinite(player?.duration)?player.duration:Number(track?.duration_seconds||0),queue:queue.map(item=>item.id),playing:index===currentIndex?!player?.paused:true,shuffle:shuffleEnabled,repeat_mode:repeatMode,volume:Number(localStorage.getItem('music-volume')??.8)};};
+const connectPlaybackState=(index=currentIndex)=>{const player=document.querySelector('#player'),track=queue[index];return{...(shuffleEnabled?shuffleNavigator.snapshot(queue.map(item=>item.id),index):{}),track_id:track?.id||null,position_seconds:index===currentIndex?Number(player?.currentTime||0):0,duration_seconds:index===currentIndex&&Number.isFinite(player?.duration)?player.duration:Number(track?.duration_seconds||0),queue:queue.map(item=>item.id),playing:index===currentIndex?!player?.paused:true,shuffle:shuffleEnabled,repeat_mode:repeatMode,volume:Number(localStorage.getItem('music-volume')??.8),...(index===currentIndex?webConnectPlaybackStatus(player):{playing:true,is_playing:false,buffering:true,playback_status:'buffering'})};};
 
 function updateConnectIndicator(state=connectState){
+  const status=document.querySelector('#connect-status');if(status)status.textContent=connectStatusLabel({enabled:connectClient?.enabled,connection:connectClient?.connection,pending:connectClient?.pending,state,remote:connectRemoteActive(),preparing:connectPreparing});
   connectState=state||connectState;const button=document.querySelector('#connect-toggle');if(!button||!connectClient?.enabled)return;
   const remote=connectRemoteActive();button.classList.toggle('active',remote||connectState?.active_device_id===connectClient.deviceId);button.textContent=remote?'▣':'▧';button.title=remote?'Музыка играет на другом устройстве':'Слушать на другом устройстве';
 }
@@ -150,7 +161,7 @@ function renderAuth(isSetup) {
   connectClient?.stop();connectClient=null;connectState=null;clearInterval(connectUiTimer);connectUiTimer=null;
   cancelAudioPrefetch();
   const oldPlayer=document.querySelector('#player');if(oldPlayer){oldPlayer.pause();oldPlayer.removeAttribute('src');oldPlayer.load();}
-  audioCache.clear();activeBlobUrl='';sessionUser=null;
+  cancelMediaPreparation();mediaSelections.clear();mediaPlaybackClient=null;audioCache.clear();activeBlobUrl='';sessionUser=null;
   app.innerHTML = `<section class="auth"><div class="card"><div class="brand">◉ ${escapeHtml(instanceName)}</div><p class="subtitle">${isSetup ? 'Создайте первого администратора' : 'Ваша личная музыкальная библиотека'}</p>
     <form id="auth-form">
       ${isSetup ? '<label>Отображаемое имя<input name="display_name" autocomplete="name" required></label>' : ''}
@@ -184,7 +195,7 @@ async function renderLibrary(user) {
     <div class="active-filter" id="active-filter"></div><div id="catalog-content"></div></section></div></section>
     <section class="player-bar" id="player-bar" aria-label="Музыкальный плеер">
       <audio id="player" preload="metadata"></audio>
-      <div class="now-playing"><div class="cover" id="now-cover">♫</div><button class="now-text" id="now-details" title="Открыть трек"><span class="now-title" id="now-title">Выберите трек</span><span class="now-artist" id="now-artist">Family Music</span></button><button class="player-like" id="player-like" title="Мне нравится" aria-label="Добавить во Мне нравится">♡</button></div>
+      <div class="now-playing"><div class="cover" id="now-cover">♫</div><button class="now-text" id="now-details" title="Открыть трек"><span class="now-title" id="now-title">Выберите трек</span><span class="now-artist" id="now-artist">Family Music</span><small id="media-status" role="status" aria-live="polite"></small><small id="connect-status" role="status" aria-live="polite"></small></button><button class="player-like" id="player-like" title="Мне нравится" aria-label="Добавить во Мне нравится">♡</button></div>
       <div class="transport"><div class="transport-buttons"><button class="mode-control" id="shuffle" title="Перемешать">⌘</button><button class="control" id="previous" title="Предыдущий">‹</button><button class="control main-control" id="toggle" title="Воспроизвести">▶</button><button class="control" id="next" title="Следующий">›</button><button class="mode-control" id="repeat" title="Повтор выключен">↻</button></div><div class="timeline"><span id="elapsed">0:00</span><input id="seek" type="range" min="0" max="1000" value="0" aria-label="Позиция воспроизведения"><span id="total">0:00</span></div></div>
       <div class="volume"><button class="mode-control" id="normalization" title="Выравнивание громкости">RG</button><span>♩</span><input id="volume" type="range" min="0" max="1" step="0.01" value="0.8" aria-label="Громкость"><button class="mode-control connect-toggle" id="connect-toggle" title="Слушать на другом устройстве" hidden>▧</button><button class="queue-toggle" id="queue-toggle" title="Очередь">☷</button></div>
     </section><aside class="queue-panel" id="queue-panel"><div class="queue-header"><div><strong>Очередь</strong><span id="queue-count"></span></div><button id="queue-close" aria-label="Закрыть">×</button></div><div class="queue-list" id="queue-list"></div></aside>`;
@@ -217,7 +228,7 @@ function loadSettingsView(){
   const root=document.querySelector('#catalog-content');
   const scopeNames={all:'Общая библиотека',local:'Только этот сервер',remote:'Только федерация'};
   const admin=sessionUser?.is_admin?`<div class="settings-group"><h3>Администрирование</h3><button data-section="statistics"><span>Статистика</span><small>Состояние сервера, очереди и громкость</small></button><button data-section="users"><span>Аккаунты</span><small>Пользователи и сброс паролей</small></button><button data-section="registration"><span>Регистрация</span><small>Разрешить пользователям создавать аккаунты самостоятельно</small></button><button data-section="federation"><span>Федерация</span><small>Identity, адреса и доступность ноды</small></button><button data-section="recognition"><span>Автораспознавание</span><small>AcoustID, включение и Client API key</small></button><button data-section="openvk"><span>OpenVK</span><small>Внешний поиск и импорт музыки в WEB</small></button><button data-section="reports"><span>Отчёты об ошибках</span><small>Диагностика из Android-приложения</small></button><button data-action="recognition-queue"><span>Требуют внимания</span><small>Распознавание и исправление метаданных</small></button></div>`:'';
-  root.innerHTML=`<section class="stats-shell settings-dialog routed-settings"><div class="stats-head"><div><div class="dialog-title">Настройки</div><small>${escapeHtml(sessionUser?.display_name||'')}</small></div><button class="stats-close" aria-label="Закрыть">×</button></div><div class="settings-group"><h3>Аккаунт</h3><button data-section="password"><span>Изменить пароль</span><small>Обновить пароль текущего пользователя</small></button></div><div class="settings-group"><h3>Библиотека</h3><button data-section="library"><span>«Все треки» по умолчанию</span><small>${escapeHtml(scopeNames[searchScope]||scopeNames.all)}</small></button><button data-section="duplicates"><span>Возможные дубликаты</span><small>Совпадения по названию и исполнителю</small></button></div>${admin}</section>`;
+  root.innerHTML=`<section class="stats-shell settings-dialog routed-settings"><div class="stats-head"><div><div class="dialog-title">Настройки</div><small>${escapeHtml(sessionUser?.display_name||'')}</small></div><button class="stats-close" aria-label="Закрыть">×</button></div><div class="settings-group"><h3>Аккаунт</h3><button data-section="connect"><span>Family Music Connect</span><small>Управление музыкой между вашими устройствами</small></button><button data-section="password"><span>Изменить пароль</span><small>Обновить пароль текущего пользователя</small></button></div><div class="settings-group"><h3>Библиотека</h3><button data-section="library"><span>«Все треки» по умолчанию</span><small>${escapeHtml(scopeNames[searchScope]||scopeNames.all)}</small></button><button data-section="duplicates"><span>Возможные дубликаты</span><small>Совпадения по названию и исполнителю</small></button></div>${admin}</section>`;
   root.querySelector('.stats-close').onclick=()=>switchView('liked');
   root.querySelectorAll('[data-section]').forEach(button=>button.onclick=()=>openSettingsSection(button.dataset.section));
   root.querySelector('[data-action="recognition-queue"]')?.addEventListener('click',()=>switchView('recognition'));
@@ -227,7 +238,7 @@ function loadSettingsView(){
 function openSettingsSection(section,push=true){
   const adminOnly=new Set(['statistics','users','registration','federation','recognition','openvk','reports']);
   if(adminOnly.has(section)&&!sessionUser?.is_admin){settingsSection='';syncBrowserRoute('replace');return;}
-  const actions={library:showLibraryDisplaySettings,statistics:showAdminStats,users:manageUsers,registration:showRegistrationSettings,federation:showFederationSettings,recognition:showRecognitionSettings,openvk:showOpenVkSettings,reports:showDiagnosticReports,duplicates:showDuplicates,password:changeOwnPassword};
+  const actions={connect:showConnectSettings,library:showLibraryDisplaySettings,statistics:showAdminStats,users:manageUsers,registration:showRegistrationSettings,federation:showFederationSettings,recognition:showRecognitionSettings,openvk:showOpenVkSettings,reports:showDiagnosticReports,duplicates:showDuplicates,password:changeOwnPassword};
   const action=actions[section];if(!action)return;
   settingsSection=section;openingSettingsSection=section;if(push)syncBrowserRoute();
   Promise.resolve(action()).catch(error=>alert(error.message));
@@ -240,6 +251,29 @@ function showLibraryDisplaySettings(){
   dialog.innerHTML=`<form class="stats-shell recognition-settings-form"><div class="stats-head"><div><div class="dialog-title">Все треки</div><small>Источник библиотеки по умолчанию</small></div><button type="button" class="stats-close" aria-label="Закрыть">×</button></div>${option('all','Общая библиотека','Показывать локальные треки и доступные треки других серверов.')}${option('local','Только этот сервер','Показывать музыку, которая хранится на этой ноде.')}${option('remote','Только федерация','Показывать доступную музыку подключённых серверов.')}<small class="settings-hint">Фильтр можно временно менять и на странице «Все треки».</small><div class="dialog-actions"><button type="button" class="secondary cancel">Отмена</button><button class="primary">Сохранить</button></div></form>`;
   document.body.append(dialog);dialog.showModal();const form=dialog.querySelector('form');const close=value=>dialog.close(value);form.querySelector('.stats-close').onclick=()=>close('');form.querySelector('.cancel').onclick=()=>close('');form.onsubmit=event=>{event.preventDefault();searchScope=String(new FormData(form).get('scope')||'all');localStorage.setItem('music-search-scope',searchScope);close('saved');};
   return new Promise(resolve=>dialog.addEventListener('close',()=>{const changed=dialog.returnValue==='saved';dialog.remove();resolve(changed);},{once:true}));
+}
+
+async function showConnectSettings(){
+  const dialog=document.createElement('dialog');dialog.className='stats-dialog settings-dialog';
+  dialog.innerHTML=`<form class="stats-shell recognition-settings-form"><div class="stats-head"><div><div class="dialog-title">Family Music Connect</div><small>Настройка вашего аккаунта</small></div><button type="button" class="stats-close" aria-label="Закрыть">×</button></div><label class="settings-check"><input type="checkbox" name="enabled" disabled><span><strong>Управлять музыкой между устройствами</strong><small>Одна настройка для ваших WEB- и Android-плееров. Другие аккаунты не затрагиваются.</small></span></label><small class="settings-hint connect-status">Загрузка…</small><small class="settings-hint">При отключении текущая музыка продолжит играть, но управление между устройствами станет недоступно. Повторное включение не запускает музыку автоматически.</small><div class="error"></div><div class="dialog-actions"><button type="button" class="secondary cancel">Отмена</button><button class="primary" disabled>Сохранить</button></div></form>`;
+  document.body.append(dialog);dialog.showModal();
+  const form=dialog.querySelector('form'),error=form.querySelector('.error'),save=form.querySelector('.primary');
+  form.querySelector('.stats-close').onclick=()=>dialog.close('');form.querySelector('.cancel').onclick=()=>dialog.close('');
+  const closed=new Promise(resolve=>dialog.addEventListener('close',()=>{dialog.remove();resolve(dialog.returnValue==='saved');},{once:true}));
+  try{
+    const settings=await api('/api/v1/connect/settings');if(!dialog.isConnected)return closed;
+    form.elements.enabled.checked=settings.user_enabled;form.elements.enabled.disabled=false;save.disabled=false;
+    form.querySelector('.connect-status').textContent=settings.server_enabled?'Применяется ко всем вашим устройствам.':'Connect сейчас недоступен на сервере. Ваш выбор сохранится для дальнейшего включения.';
+  }catch(problem){error.textContent=problem.message;form.querySelector('.connect-status').textContent='Не удалось загрузить настройку.';}
+  form.onsubmit=async event=>{
+    event.preventDefault();save.disabled=true;error.textContent='';
+    try{const settings=await api('/api/v1/connect/settings',{method:'PUT',body:JSON.stringify({enabled:form.elements.enabled.checked})});
+      if(!settings.enabled)connectClient?.suspend();
+      if(connectClient?.running)await connectClient.refreshAvailability();else await setupConnect();
+      dialog.close('saved');
+    }catch(problem){error.textContent=problem.message;save.disabled=false;}
+  };
+  return closed;
 }
 
 async function showRegistrationSettings(){
@@ -509,7 +543,7 @@ function renderConnectRemoteState(){
   if(cover){cover.style.backgroundImage=track?.cover_url?`url("${track.cover_url}")`:'';cover.textContent=track?.cover_url?'':'♫';}
   document.querySelector('#player-bar')?.classList.add('active');
   updatePlayerLike(track);
-  const base=Number(connectState?.position_seconds||0),total=Number(connectState?.duration_seconds||track?.duration_seconds||0),elapsed=Math.min(total||Infinity,base+(connectState?.playing?Math.max(0,Date.now()-connectStateReceivedAt)/1000:0)),seek=document.querySelector('#seek');
+  const base=Number(connectState?.position_seconds||0),total=Number(connectState?.duration_seconds||track?.duration_seconds||0),elapsed=Math.min(total||Infinity,base+(connectPositionAdvances(connectState)?Math.max(0,Date.now()-connectStateReceivedAt)/1000:0)),seek=document.querySelector('#seek');
   if(seek)seek.value=String(total>0?Math.min(1000,Math.round(elapsed/total*1000)):0);
   const elapsedNode=document.querySelector('#elapsed'),totalNode=document.querySelector('#total');if(elapsedNode)elapsedNode.textContent=duration(elapsed);if(totalNode)totalNode.textContent=duration(total);
 }
@@ -517,10 +551,10 @@ function renderConnectRemoteState(){
 function applyConnectState(state){
   const remoteBefore=connectRemoteActive();
   connectStateReceivedAt=Date.now();updateConnectIndicator(state);if(!connectRemoteActive()){connectRemoteTrack=null;connectRemoteTrackId='';if(remoteBefore)renderLocalPlaybackState();return;}
+  if(!handlingConnectCommand)cancelMediaPreparation();
   const toggle=document.querySelector('#toggle');if(toggle){toggle.textContent=state?.playing?'❚❚':'▶';toggle.title=state?.playing?'Пауза':'Воспроизвести';}
-  shuffleEnabled=Boolean(state?.shuffle);repeatMode=state?.repeat_mode||'off';
-  document.querySelector('#shuffle')?.classList.toggle('active',shuffleEnabled);
-  const repeat=document.querySelector('#repeat');if(repeat){repeat.classList.toggle('active',repeatMode!=='off');repeat.textContent=repeatMode==='one'?'↻1':'↻';}
+  document.querySelector('#shuffle')?.classList.toggle('active',Boolean(state?.shuffle));
+  const repeat=document.querySelector('#repeat');if(repeat){repeat.classList.toggle('active',state?.repeat_mode!=='off');repeat.textContent=state?.repeat_mode==='one'?'↻1':'↻';}
   const trackId=String(state?.track_id||'');
   if(!trackId){connectRemoteTrack=null;connectRemoteTrackId='';renderConnectRemoteState();return;}
   if(trackId===connectRemoteTrackId){renderConnectRemoteState();return;}
@@ -536,62 +570,91 @@ function renderLocalPlaybackState(){
   if(seek)seek.value=String(player.duration>0?Math.min(1000,Math.round(player.currentTime/player.duration*1000)):0);
   const elapsed=document.querySelector('#elapsed'),total=document.querySelector('#total'),toggle=document.querySelector('#toggle');
   if(elapsed)elapsed.textContent=duration(player.currentTime);if(total)total.textContent=duration(player.duration);if(toggle){toggle.textContent=player.paused?'▶':'❚❚';toggle.title=player.paused?'Воспроизвести':'Пауза';}
+  document.querySelector('#shuffle')?.classList.toggle('active',shuffleEnabled);
+  const repeat=document.querySelector('#repeat');if(repeat){repeat.classList.toggle('active',repeatMode!=='off');repeat.textContent=repeatMode==='one'?'↻1':'↻';}
   updatePlayerLike(track);updatePlayingState();
 }
 
 async function handleConnectCommand(command){
   const player=document.querySelector('#player'),payload=command.payload||{};
-  if(command.action==='deactivate'){player?.pause();return{success:true};}
+  if(command.action==='deactivate'){cancelMediaPreparation();player?.pause();return{success:true,result:{state:connectPlaybackState()}};}
+  if(command.action==='activate'){
+    try{
+      if(payload.position_seconds!=null){const position=Math.max(0,Math.min(player.duration||Infinity,Number(payload.position_seconds)||0));player.currentTime=position;await waitForPlayback(()=>!player.seeking&&Math.abs(player.currentTime-position)<1);}
+      if(payload.playing)await player.play();else player.pause();
+      return{success:true,result:{state:connectPlaybackState()}};
+    }catch(error){player.pause();throw error;}finally{connectPreparing=false;}
+  }
   if(command.action==='transfer'){
     if(!payload.track_id||!Array.isArray(payload.queue))return{success:false,result:{error:'Пустая очередь'}};
     const resolved=(await api('/api/v1/tracks/resolve',{method:'POST',body:JSON.stringify({ids:payload.queue})})).items||[];
     const byId=new Map(resolved.map(track=>[track.id,track]));queue=payload.queue.map(id=>byId.get(id)).filter(Boolean);
     const index=queue.findIndex(track=>track.id===payload.track_id);if(index<0)return{success:false,result:{error:'Текущий трек недоступен'}};
     shuffleEnabled=Boolean(payload.shuffle);repeatMode=['off','all','one'].includes(payload.repeat_mode)?payload.repeat_mode:'off';
-    handlingConnectCommand=true;
+    handlingConnectCommand=true;connectPreparing=true;
+    player.preload='auto';
+    const preparation=++connectPreparationGeneration;
+    setTimeout(()=>{if(connectPreparing&&preparation===connectPreparationGeneration){connectPreparing=false;connectPreparationGeneration++;cancelMediaPreparation();player.pause();}},35000);
     try{
-      playTrack(index);
-      if(Number(payload.position_seconds)>0)player.addEventListener('loadedmetadata',()=>{if(Number(payload.position_seconds)<player.duration)player.currentTime=Number(payload.position_seconds);},{once:true});
-      if(!payload.playing)player.pause();
+      if(!await playTrack(index,false,false,{connect:true}))throw new Error('Не удалось подготовить трек');
+      if(shuffleEnabled)shuffleNavigator.restore(queue.map(track=>track.id),payload.track_id,payload);
+      await waitForPlayback(()=>player.readyState>=1||Boolean(player.error));
+      if(player.error)throw new Error('Не удалось загрузить трек');
+      const position=Math.max(0,Math.min(Number(payload.position_seconds)||0,player.duration||Infinity));
+      player.currentTime=position;
+      await waitForPlayback(()=>!player.seeking&&player.readyState>=3&&Math.abs(player.currentTime-position)<1);
+      if(!payload.transfer_prepare&&payload.playing)await player.play();
+      if(!payload.transfer_prepare)connectPreparing=false;
       if(payload.volume!=null){const volume=Math.min(1,Math.max(0,Number(payload.volume)||0));localStorage.setItem('music-volume',String(volume));document.querySelector('#volume').value=String(volume);applyWebGain();}
-    }finally{handlingConnectCommand=false;}
-    return{success:true};
+      return{success:true,result:{state:connectPlaybackState()}};
+    }catch(error){if(preparation===connectPreparationGeneration){connectPreparing=false;player.pause();}throw error;}finally{handlingConnectCommand=false;}
   }
-  if(command.action==='play'){await safePlay(player);return{success:true};}
-  if(command.action==='pause'){player.pause();return{success:true};}
-  if(command.action==='next'){advanceTrack(1);return{success:true};}
-  if(command.action==='previous'){advanceTrack(-1);return{success:true};}
-  if(command.action==='seek'){if(Number.isFinite(Number(payload.position_seconds)))player.currentTime=Math.max(0,Math.min(player.duration||Infinity,Number(payload.position_seconds)));return{success:true};}
-  if(command.action==='set_shuffle'){shuffleEnabled=Boolean(payload.enabled);if(shuffleEnabled)shuffleNavigator.reset(queue.length,currentIndex);else shuffleNavigator.clear();document.querySelector('#shuffle').classList.toggle('active',shuffleEnabled);scheduleStateSave();return{success:true};}
-  if(command.action==='set_repeat'){repeatMode=['off','all','one'].includes(payload.mode)?payload.mode:'off';const repeat=document.querySelector('#repeat');repeat.classList.toggle('active',repeatMode!=='off');repeat.textContent=repeatMode==='one'?'↻1':'↻';scheduleStateSave();return{success:true};}
-  if(command.action==='set_volume'){const volume=Math.min(1,Math.max(0,Number(payload.volume)||0));localStorage.setItem('music-volume',String(volume));document.querySelector('#volume').value=String(volume);applyWebGain();scheduleStateSave();return{success:true};}
+  if(command.action==='play'){await player.play();return{success:true,result:{state:connectPlaybackState()}};}
+  if(command.action==='pause'){cancelMediaPreparation();player.pause();return{success:true,result:{state:connectPlaybackState()}};}
+  if(command.action==='next'||command.action==='previous'){
+    handlingConnectCommand=true;
+    try{if(!await advanceTrack(command.action==='next'?1:-1))throw new Error('Не удалось подготовить трек');await waitForPlayback(()=>player.readyState>=2||Boolean(player.error));if(player.error)throw new Error('Не удалось загрузить трек');return{success:true,result:{state:connectPlaybackState()}};}finally{handlingConnectCommand=false;}
+  }
+  if(command.action==='seek'){const position=Math.max(0,Math.min(player.duration||Infinity,Number(payload.position_seconds)||0));player.currentTime=position;await waitForPlayback(()=>!player.seeking&&Math.abs(player.currentTime-position)<1);return{success:true,result:{state:connectPlaybackState()}};}
+  if(command.action==='set_shuffle'){shuffleEnabled=Boolean(payload.enabled);if(shuffleEnabled)shuffleNavigator.reset(queue.length,currentIndex);else shuffleNavigator.clear();document.querySelector('#shuffle').classList.toggle('active',shuffleEnabled);scheduleStateSave();return{success:true,result:{state:connectPlaybackState()}};}
+  if(command.action==='set_repeat'){repeatMode=['off','all','one'].includes(payload.mode)?payload.mode:'off';const repeat=document.querySelector('#repeat');repeat.classList.toggle('active',repeatMode!=='off');repeat.textContent=repeatMode==='one'?'↻1':'↻';scheduleStateSave();return{success:true,result:{state:connectPlaybackState()}};}
+  if(command.action==='set_volume'){const volume=Math.min(1,Math.max(0,Number(payload.volume)||0));localStorage.setItem('music-volume',String(volume));document.querySelector('#volume').value=String(volume);applyWebGain();scheduleStateSave();return{success:true,result:{state:connectPlaybackState()}};}
   return{success:false,result:{error:'Команда не поддерживается WEB-клиентом'}};
 }
 
 async function setupConnect(){
-  connectClient?.stop();clearInterval(connectUiTimer);connectUiTimer=null;connectClient=new ConnectClient({api,onCommand:handleConnectCommand,onState:applyConnectState});
-  try{if(!await connectClient.start())return;connectUiTimer=setInterval(renderConnectRemoteState,250);const button=document.querySelector('#connect-toggle');button.hidden=false;button.onclick=async()=>{enableWebAudio();await connectClient.setReady();showConnectDevices();};updateConnectIndicator();}catch{connectClient.stop();}
+  connectClient?.stop();clearInterval(connectUiTimer);connectUiTimer=null;
+  const availability=enabled=>{
+    const button=document.querySelector('#connect-toggle');if(button)button.hidden=!enabled;
+    if(enabled){if(!connectUiTimer)connectUiTimer=setInterval(()=>{renderConnectRemoteState();updateConnectIndicator();},250);updateConnectIndicator();}
+    else{if(connectPreparing)cancelMediaPreparation();clearInterval(connectUiTimer);connectUiTimer=null;connectState=null;connectRemoteTrack=null;connectRemoteTrackId='';connectPreparing=false;connectPreparationGeneration++;renderLocalPlaybackState();}
+  };
+  connectClient=new ConnectClient({api,onCommand:handleConnectCommand,onState:applyConnectState,onAvailability:availability,onStatus:()=>updateConnectIndicator()});
+  const button=document.querySelector('#connect-toggle');if(button)button.onclick=async()=>{enableWebAudio();await connectClient.setReady();showConnectDevices();};
+  try{await connectClient.start();}catch{connectClient.stop();}
 }
 
 async function showConnectDevices(){
   const dialog=document.createElement('dialog');dialog.className='connect-dialog';dialog.innerHTML=`<section class="stats-shell"><div class="stats-head"><div><div class="dialog-title">Слушать на…</div><small>Устройства аккаунта в сети</small></div><button class="stats-close" aria-label="Закрыть">×</button></div><div class="connect-devices">Загрузка…</div></section>`;document.body.append(dialog);dialog.showModal();dialog.querySelector('.stats-close').onclick=()=>dialog.close();dialog.addEventListener('close',()=>dialog.remove());
-  try{const data=await connectClient.devices(),root=dialog.querySelector('.connect-devices'),devices=availableConnectDevices(data.items);connectState=data.state;root.innerHTML=devices.length?devices.map(device=>{const current=device.id===connectState?.active_device_id,here=device.id===connectClient.deviceId;return`<button class="connect-device ${current?'active':''}" data-id="${escapeHtml(device.id)}"><span><strong>${escapeHtml(device.name)}${here?' · это устройство':''}</strong><small>${device.client_type==='android'?'Android':'WEB'} · в сети</small></span><em>${current?'Играет':'›'}</em></button>`;}).join(''):'<div class="stats-empty">Доступных устройств пока нет.</div>';root.querySelectorAll('.connect-device').forEach(button=>button.onclick=async()=>{if(button.dataset.id===connectState?.active_device_id){dialog.close();return;}button.disabled=true;try{const snapshot=button.dataset.id===connectClient.deviceId&&connectRemoteActive()?{...connectState}:connectPlaybackState();await connectClient.transfer(button.dataset.id,snapshot);dialog.close();}catch(error){button.disabled=false;alert(error.message);}});}catch(error){dialog.querySelector('.connect-devices').innerHTML=`<div class="error">${escapeHtml(error.message)}</div>`;}
+  try{const data=await connectClient.devices(),root=dialog.querySelector('.connect-devices'),devices=availableConnectDevices(data.items);connectState=data.state;root.innerHTML=devices.length?devices.map(device=>{const current=device.id===connectState?.active_device_id,here=device.id===connectClient.deviceId;return`<button class="connect-device ${current?'active':''}" data-id="${escapeHtml(device.id)}"><span><strong>${escapeHtml(device.name)}${here?' · это устройство':''}</strong><small>${device.client_type==='android'?'Android':'WEB'} · в сети</small></span><em>${current?'Играет':'›'}</em></button>`;}).join(''):'<div class="stats-empty">Доступных устройств пока нет.</div>';root.querySelectorAll('.connect-device').forEach(button=>button.onclick=async()=>{if(button.dataset.id===connectState?.active_device_id){dialog.close();return;}button.disabled=true;try{const snapshot=connectRemoteActive()?{...connectState}:connectPlaybackState();await connectClient.transfer(button.dataset.id,snapshot);dialog.close();}catch(error){button.disabled=false;alert(error.message);}});}catch(error){dialog.querySelector('.connect-devices').innerHTML=`<div class="error">${escapeHtml(error.message)}</div>`;}
 }
 
 function setupPlayer() {
   const player=document.querySelector('#player'), toggle=document.querySelector('#toggle'), seek=document.querySelector('#seek'), volume=document.querySelector('#volume');
+  mediaPlaybackClient=new MediaPlaybackClient({api,codecs:browserPlaybackCodecs(player)});
   const savedVolume=Number(localStorage.getItem('music-volume') ?? 0.8);player.volume=savedVolume;volume.value=savedVolume;
   const normalization=document.querySelector('#normalization');normalization.classList.toggle('active',localStorage.getItem('music-normalization')==='1');
   normalization.onclick=()=>{const enabled=localStorage.getItem('music-normalization')!=='1';localStorage.setItem('music-normalization',enabled?'1':'0');normalization.classList.toggle('active',enabled);enableWebAudio();};
-  toggle.onclick=()=>{ enableWebAudio();if(connectRemoteActive())return connectClient.command(connectState?.playing?'pause':'play').catch(error=>alert(error.message));if(currentIndex<0&&queue.length) return playTrack(0); player.paused ? safePlay(player) : player.pause(); };
+  toggle.onclick=()=>{ enableWebAudio();if(connectRemoteActive())return connectClient.command(connectState?.playing?'pause':'play').catch(error=>alert(error.message));if(currentIndex<0&&queue.length) return playTrack(0);toggleLocalPlayback(); };
   document.querySelector('#previous').onclick=()=>connectRemoteActive()?connectClient.command('previous').catch(error=>alert(error.message)):advanceTrack(-1);
   document.querySelector('#next').onclick=()=>connectRemoteActive()?connectClient.command('next').catch(error=>alert(error.message)):advanceTrack(1);
-  document.querySelector('#shuffle').onclick=()=>{const next=!shuffleEnabled;if(connectRemoteActive())return connectClient.command('set_shuffle',{enabled:next}).catch(error=>alert(error.message));shuffleEnabled=next;if(shuffleEnabled)shuffleNavigator.reset(queue.length,currentIndex);else shuffleNavigator.clear();document.querySelector('#shuffle').classList.toggle('active',shuffleEnabled);scheduleAudioPrefetch();scheduleStateSave();};
-  document.querySelector('#repeat').onclick=()=>{const next=repeatMode==='off'?'all':repeatMode==='all'?'one':'off';if(connectRemoteActive())return connectClient.command('set_repeat',{mode:next}).catch(error=>alert(error.message));repeatMode=next;const button=document.querySelector('#repeat');button.classList.toggle('active',repeatMode!=='off');button.textContent=repeatMode==='one'?'↻1':'↻';button.title={off:'Повтор выключен',all:'Повтор очереди',one:'Повтор трека'}[repeatMode];scheduleStateSave();};
+  document.querySelector('#shuffle').onclick=()=>{const next=!(connectRemoteActive()?connectState?.shuffle:shuffleEnabled);if(connectRemoteActive())return connectClient.command('set_shuffle',{enabled:next}).catch(error=>alert(error.message));shuffleEnabled=next;if(shuffleEnabled)shuffleNavigator.reset(queue.length,currentIndex);else shuffleNavigator.clear();document.querySelector('#shuffle').classList.toggle('active',shuffleEnabled);scheduleAudioPrefetch();scheduleStateSave();};
+  document.querySelector('#repeat').onclick=()=>{const current=connectRemoteActive()?connectState?.repeat_mode:repeatMode;const next=current==='off'?'all':current==='all'?'one':'off';if(connectRemoteActive())return connectClient.command('set_repeat',{mode:next}).catch(error=>alert(error.message));repeatMode=next;const button=document.querySelector('#repeat');button.classList.toggle('active',repeatMode!=='off');button.textContent=repeatMode==='one'?'↻1':'↻';button.title={off:'Повтор выключен',all:'Повтор очереди',one:'Повтор трека'}[repeatMode];scheduleStateSave();};
   player.onplay=()=>{ toggle.textContent='❚❚'; toggle.title='Пауза'; if('mediaSession' in navigator)navigator.mediaSession.playbackState='playing'; updatePlayingState();scheduleAudioPrefetch();scheduleStateSave(); };
-  player.onpause=()=>{ toggle.textContent='▶'; toggle.title='Воспроизвести'; if('mediaSession' in navigator)navigator.mediaSession.playbackState='paused'; updatePlayingState();cancelAudioPrefetch();scheduleStateSave(); };
-  player.onended=()=>{playbackFailures.delete(queue[currentIndex]?.id);if(repeatMode==='one')playTrack(currentIndex);else advanceTrack(1,true);};
-  player.onerror=()=>{const failed=queue[currentIndex];if(!failed)return;const cached=audioCache.get(failed.id),decision=audioRecoveryDecision({usingCache:Boolean(activeBlobUrl),cachedCopy:Boolean(cached),attempted:blobFallbackTrackId===failed.id});if(decision!=='skip'){blobFallbackTrackId=failed.id;if(decision==='cache'){activeBlobUrl=cached;player.src=cached;}else{activeBlobUrl='';player.src=streamUrl(failed);audioCache.delete(failed.id);}safePlay(player);return;}playbackFailures.add(failed.id);clearTimeout(playbackErrorTimer);playbackErrorTimer=setTimeout(()=>{if(queue[currentIndex]?.id===failed.id)advanceTrack(1,true);},250);};
+  player.onpause=()=>{ if(!webMediaPreparing){toggle.textContent='▶';toggle.title='Воспроизвести';}if('mediaSession' in navigator)navigator.mediaSession.playbackState='paused'; updatePlayingState();cancelAudioPrefetch();scheduleStateSave(); };
+  for(const event of ['playing','waiting','stalled','seeking','seeked'])player.addEventListener(event,scheduleStateSave);
+  player.onended=()=>{if(webMediaPreparing)return;playbackFailures.delete(queue[currentIndex]?.id);if(repeatMode==='one')playTrack(currentIndex);else advanceTrack(1,true);};
+  player.onerror=()=>{const failed=queue[currentIndex];if(!failed||webMediaPreparing)return;if(tryCompatibleSource(failed,player))return;const key=audioCacheKey(failed),cached=audioCache.get(key),decision=audioRecoveryDecision({usingCache:Boolean(activeBlobUrl),cachedCopy:Boolean(cached),attempted:blobFallbackTrackId===failed.id});if(decision!=='skip'){blobFallbackTrackId=failed.id;if(decision==='cache'){activeBlobUrl=cached;player.src=cached;}else{activeBlobUrl='';player.src=streamUrl(failed);audioCache.delete(key);}safePlay(player);return;}playbackFailures.add(failed.id);clearTimeout(playbackErrorTimer);playbackErrorTimer=setTimeout(()=>{if(queue[currentIndex]?.id===failed.id)advanceTrack(1,true);},250);};
   player.ontimeupdate=()=>{ if(connectRemoteActive()||!player.duration)return; seek.value=String(Math.round(player.currentTime/player.duration*1000)); document.querySelector('#elapsed').textContent=duration(player.currentTime);if(Date.now()-lastPositionSave>3000){lastPositionSave=Date.now();if(!queue[currentIndex]?.external_preview)localStorage.setItem('music-position',String(player.currentTime));updateMediaPosition();scheduleStateSave();} };
   player.onloadedmetadata=()=>{ if(!connectRemoteActive())document.querySelector('#total').textContent=duration(player.duration); };
   seek.oninput=()=>{const position=Number(seek.value)/1000*(connectRemoteActive()?Number(connectState?.duration_seconds||0):player.duration);if(connectRemoteActive())connectClient.command('seek',{position_seconds:position}).catch(()=>{});else if(player.duration)player.currentTime=position;};
@@ -607,7 +670,23 @@ function advanceTrack(direction,automatic=false){
   if(index>=0)return playTrack(index);
 }
 
-const streamUrl=track=>track.external_preview?track.stream_url:track.remote?track.stream_url:`/api/v1/tracks/${track.id}/stream`;
+const streamUrl=track=>selectedMedia(track)?.stream_url||(track.external_preview||track.remote?track.stream_url:`/api/v1/tracks/${track.id}/stream`);
+function tryCompatibleSource(track,player){
+  const selection=selectedMedia(track);
+  if(track.remote||track.external_preview||![3,4].includes(player.error?.code)||!selection?.codec||selection.codec==='aac')return false;
+  if(!mediaPlaybackClient.rejectCodec(track.id,selection.codec))return false;
+  const position=Math.max(0,Number(player.currentTime)||0);
+  audioCache.delete(selection.cache_key);mediaSelections.delete(track.id);
+  playTrack(currentIndex,true,true,{position});
+  return true;
+}
+function toggleLocalPlayback(){
+  const player=document.querySelector('#player');
+  if(connectPreparing)return;
+  if(webMediaPreparing){if(!webMediaPlayIntent){webMediaPlayIntent=true;document.querySelector('#toggle').textContent='❚❚';document.querySelector('#toggle').title='Отменить запуск';return;}cancelMediaPreparation();player.pause();document.querySelector('#toggle').textContent='▶';return;}
+  if(!player.getAttribute('src')&&currentIndex>=0)return playTrack(currentIndex,true,true,{retry:true});
+  return player.paused?safePlay(player):player.pause();
+}
 function safePlay(player){const attempt=player.play();if(attempt?.catch)attempt.catch(error=>{if(error?.name!=='AbortError')console.warn('Не удалось запустить воспроизведение',error);});return attempt;}
 function cancelAudioPrefetch(){clearTimeout(preloadTimer);preloadTimer=null;preloadAbort?.abort();preloadAbort=null;}
 function upcomingTracks(){
@@ -629,24 +708,36 @@ function scheduleAudioPrefetch(){
     const tracks=[next[0],queue[currentIndex],next[1]];
     for(const track of tracks){
       if(controller.signal.aborted||player.paused)break;
-      if(!track||track.stream_available===false||audioCache.get(track.id))continue;
-      try{await audioCache.load(track.id,streamUrl(track),controller.signal);}catch(error){if(error?.name!=='AbortError')console.debug('Предзагрузка аудио пропущена',error);}
+      if(!track||track.stream_available===false||audioCache.get(audioCacheKey(track)))continue;
+      try{
+        // The current file stays pinned even if a derivative finishes meanwhile.
+        const selection=selectedMedia(track)||await mediaPlaybackClient.resolve(track,{signal:controller.signal,waitForReady:false});
+        if(!selection||controller.signal.aborted)continue;
+        rememberMediaSelection(track,selection);
+        await audioCache.load(selection.cache_key,selection.stream_url,controller.signal);
+      }catch(error){if(error?.name!=='AbortError')console.debug('Предзагрузка аудио пропущена',error);}
     }
     if(preloadAbort===controller)preloadAbort=null;
   },1200);
 }
 
-function selectAudioSource(track){if(track.external_preview){activeBlobUrl='';return streamUrl(track);}activeBlobUrl=audioCache.get(track.id)||'';audioCache.pin(track.id);return activeBlobUrl||streamUrl(track);}
+function rememberMediaSelection(track,selection){mediaSelections.set(track.id,selection);if(mediaSelections.size>512){for(const id of mediaSelections.keys()){if(id!==queue[currentIndex]?.id){mediaSelections.delete(id);break;}}}}
+function selectAudioSource(track){if(track.external_preview){activeBlobUrl='';return streamUrl(track);}const key=audioCacheKey(track);activeBlobUrl=audioCache.get(key)||'';audioCache.pin(key);return activeBlobUrl||streamUrl(track);}
 
-function scheduleStateSave(){clearTimeout(stateSaveTimer);if(queue[currentIndex]?.external_preview)return;stateSaveTimer=setTimeout(()=>{const state=connectPlaybackState();api('/api/v1/playback-state',{method:'PUT',body:JSON.stringify(state)}).catch(()=>{});if(connectClient?.enabled&&!connectRemoteActive())connectClient.updateState(state).catch(()=>{});},500);}
+function scheduleStateSave(){clearTimeout(stateSaveTimer);if(connectPreparing||webMediaPreparing||queue[currentIndex]?.external_preview)return;stateSaveTimer=setTimeout(()=>{if(connectPreparing||webMediaPreparing)return;const state=connectPlaybackState();api('/api/v1/playback-state',{method:'PUT',body:JSON.stringify(state)}).catch(()=>{});if(connectClient?.enabled&&!connectRemoteActive())connectClient.updateState(state).catch(()=>{});},500);}
 
-function playTrack(index,shuffleNavigation=false) {
-  if(!queue.length || index<0) return;
-  if(connectRemoteActive()&&!handlingConnectCommand){connectClient.transfer(connectClient.deviceId,{...connectPlaybackState(index),playing:true}).catch(error=>alert(error.message));return;}
+async function playTrack(index,shuffleNavigation=false,playNow=true,options={}) {
+  if(!queue.length || index<0||index>=queue.length||connectPreparing&&!options.connect) return false;
+  if(connectRemoteActive()&&!handlingConnectCommand){if(!options.restore)connectClient.transfer(connectClient.deviceId,{...connectPlaybackState(index),playing:true}).catch(error=>alert(error.message));return false;}
   currentIndex=index;
   const track=queue[index], player=document.querySelector('#player');
   if(shuffleEnabled&&!shuffleNavigation)shuffleNavigator.reset(queue.length,index);
   if(track.remote&&track.stream_available===false){playbackFailures.add(track.id);return advanceTrack(1,true);}
+  const request=mediaRequestGate.begin();webMediaPreparing=true;webMediaPlayIntent=Boolean(playNow);cancelAudioPrefetch();clearTimeout(playbackErrorTimer);
+  player.pause();player.removeAttribute('src');player.load();
+  setMediaStatus('Подбираем аудиоформат…');
+  document.querySelector('#elapsed').textContent='0:00';document.querySelector('#total').textContent=duration(track.duration_seconds);
+  document.querySelector('#seek').value='0';document.querySelector('#toggle').textContent=playNow?'❚❚':'▶';document.querySelector('#toggle').title=playNow?'Отменить запуск':'Воспроизвести после подготовки';
   document.querySelector('#now-title').textContent=track.title;
   document.querySelector('#now-artist').textContent=track.artist || 'Неизвестный исполнитель';
   const cover=document.querySelector('#now-cover');
@@ -654,29 +745,41 @@ function playTrack(index,shuffleNavigation=false) {
   cover.textContent=track.cover_url ? '' : '♫';
   updatePlayerLike(track);
   document.querySelector('#player-bar').classList.add('active');
+  try{
+    const cached=selectedMedia(track);
+    const selection=cached&&audioCache.get(cached.cache_key)?cached:await mediaPlaybackClient.resolve(track,{signal:request.signal,retry:Boolean(options.retry),onStatus:state=>{if(request.current()&&state==='preparing')setMediaStatus('Готовим совместимый файл…');}});
+    if(!request.current()||queue[currentIndex]?.id!==track.id)return false;
+    rememberMediaSelection(track,selection);webMediaPreparing=false;setMediaStatus(mediaPlaybackLabel(selection));
+    document.querySelector('#toggle').title=webMediaPlayIntent?'Пауза':'Воспроизвести';
+  }catch(error){
+    if(!request.current()||error.name==='AbortError')return false;
+    webMediaPreparing=false;setMediaStatus(error.message);document.querySelector('#toggle').textContent='▶';return false;
+  }
+  if(Number(options.position)>0)player.addEventListener('loadedmetadata',()=>{if(request.current()&&options.position<player.duration)player.currentTime=options.position;},{once:true});
   blobFallbackTrackId='';player.src=selectAudioSource(track);audioCache.evict();
   applyWebGain();
-  if(!track.external_preview){localStorage.setItem('music-track-id',track.id);localStorage.setItem('music-position','0');}
-  if(!track.remote&&!track.external_preview)api('/api/v1/history',{method:'POST',body:JSON.stringify({track_id:track.id})}).catch(()=>{});
+  if(!track.external_preview){localStorage.setItem('music-track-id',track.id);localStorage.setItem('music-position',String(Number(options.position)||0));}
+  if(!options.restore&&!track.remote&&!track.external_preview)api('/api/v1/history',{method:'POST',body:JSON.stringify({track_id:track.id})}).catch(()=>{});
   scheduleStateSave();
-  safePlay(player);
+  if(webMediaPlayIntent)safePlay(player);else{player.pause();player.load();}
   scheduleAudioPrefetch();
   updateMediaSession(track);
   renderQueue();
   updatePlayingState();
+  return true;
 }
 
 async function restorePlayer(){
+  const restoreGeneration=mediaRequestGate.generation;
   playerRestored=true;let state;try{state=await api('/api/v1/playback-state');}catch{}
+  if(restoreGeneration!==mediaRequestGate.generation||connectRemoteActive())return;
   const id=state?.track_id||localStorage.getItem('music-track-id');if(!id)return;
-  if(state?.queue?.length){let candidates=queue;try{candidates=(await api('/api/v1/tracks/resolve',{method:'POST',body:JSON.stringify({ids:state.queue})})).items;}catch{}const byId=new Map(candidates.map(track=>[track.id,track]));const restored=state.queue.map(id=>byId.get(id)).filter(Boolean);if(restored.length)queue=restored;}
+  if(state?.queue?.length){let candidates=queue;try{candidates=(await api('/api/v1/tracks/resolve',{method:'POST',body:JSON.stringify({ids:state.queue})})).items;}catch{}if(restoreGeneration!==mediaRequestGate.generation||connectRemoteActive())return;const byId=new Map(candidates.map(track=>[track.id,track]));const restored=state.queue.map(id=>byId.get(id)).filter(Boolean);if(restored.length)queue=restored;}
   shuffleEnabled=Boolean(state?.shuffle);repeatMode=state?.repeat_mode||'off';document.querySelector('#shuffle').classList.toggle('active',shuffleEnabled);const repeat=document.querySelector('#repeat');repeat.classList.toggle('active',repeatMode!=='off');repeat.textContent=repeatMode==='one'?'↻1':'↻';
   const index=queue.findIndex(track=>track.id===id);if(index<0)return;
-  currentIndex=index;if(shuffleEnabled)shuffleNavigator.reset(queue.length,index);const track=queue[index],player=document.querySelector('#player'),position=Number(state?.position_seconds??localStorage.getItem('music-position')??0);
-  document.querySelector('#now-title').textContent=track.title;document.querySelector('#now-artist').textContent=track.artist||'Неизвестный исполнитель';
-  const cover=document.querySelector('#now-cover');cover.style.backgroundImage=track.cover_url?`url("${track.cover_url}")`:'';cover.textContent=track.cover_url?'':'♫';
-  updatePlayerLike(track);
-  document.querySelector('#player-bar').classList.add('active');player.addEventListener('loadedmetadata',()=>{if(position>0&&position<player.duration)player.currentTime=position;updateMediaPosition();},{once:true});player.src=streamUrl(track);scheduleAudioPrefetch();updateMediaSession(track);renderQueue();updatePlayingState();
+  if(shuffleEnabled)shuffleNavigator.reset(queue.length,index);
+  const position=Number(state?.position_seconds??localStorage.getItem('music-position')??0);
+  await playTrack(index,true,false,{position,restore:true});
 }
 
 function updatePlayerLike(track){
@@ -702,7 +805,7 @@ function setupMediaSession(){
   if(!('mediaSession' in navigator))return;
   const player=document.querySelector('#player');
   const handlers={
-    play:()=>safePlay(player), pause:()=>player.pause(), previoustrack:()=>advanceTrack(-1), nexttrack:()=>advanceTrack(1),
+    play:()=>{if(connectRemoteActive())return connectClient.command('play').catch(()=>{});if(connectPreparing)return;if(webMediaPreparing){webMediaPlayIntent=true;return;}return player.getAttribute('src')?safePlay(player):playTrack(currentIndex,true);}, pause:()=>{if(connectRemoteActive())return connectClient.command('pause').catch(()=>{});cancelMediaPreparation();player.pause();}, previoustrack:()=>advanceTrack(-1), nexttrack:()=>advanceTrack(1),
     seekbackward:event=>{player.currentTime=Math.max(0,player.currentTime-(event.seekOffset||10));},
     seekforward:event=>{player.currentTime=Math.min(player.duration||Infinity,player.currentTime+(event.seekOffset||10));},
     seekto:event=>{if(Number.isFinite(event.seekTime))player.currentTime=event.seekTime;}
@@ -759,7 +862,7 @@ function moveQueueItem(from,to){
 function removeQueueItem(index){
   const player=document.querySelector('#player'),wasCurrent=index===currentIndex;
   queue.splice(index,1);
-  if(!queue.length){player.pause();player.removeAttribute('src');currentIndex=-1;document.querySelector('#player-bar').classList.remove('active');}
+  if(!queue.length){cancelMediaPreparation();player.pause();player.removeAttribute('src');currentIndex=-1;document.querySelector('#player-bar').classList.remove('active');}
   else if(wasCurrent){currentIndex=Math.min(index,queue.length-1);playTrack(currentIndex);}
   else if(index<currentIndex)currentIndex--;
   if(shuffleEnabled&&currentIndex>=0)shuffleNavigator.reset(queue.length,currentIndex);renderQueue();updatePlayingState();scheduleAudioPrefetch();scheduleStateSave();
@@ -865,7 +968,7 @@ function renderTracks(items,emptyMessage,header=''){
   container.innerHTML = items.map(track => `<article class="track ${track.stream_available===false?'unavailable':''}" data-id="${track.id}"><button class="play artwork ${track.cover_url?'has-cover':'no-cover'}" data-id="${track.id}" ${track.cover_url ? `style="background-image:url('${track.cover_url}')"` : ''} aria-label="Воспроизвести ${escapeHtml(track.title)}" ${track.stream_available===false?'disabled':''}><span>${track.stream_available===false?'!':'▶'}</span></button><div><div class="title">${escapeHtml(track.title)}</div><div class="meta">${escapeHtml(track.artist)}${track.album ? ` · ${escapeHtml(track.album)}` : ''}${track.year ? ` · ${track.year}` : ''}${track.play_count?` · ${track.play_count} просл.`:''}${track.remote?` · ${escapeHtml(track.source_label||'другая нода')}`:''}${track.availability==='offline'?' · временно недоступна':track.availability==='revoked'?' · доступ отозван':''}</div></div><button class="like ${track.liked?'liked':''}" title="Мне нравится">${track.liked?'♥':'♡'}</button><div class="muted">${duration(track.duration_seconds)}</div><button class="edit-track" title="${track.remote?'Открыть карточку':'Редактировать'}">•••</button></article>`).join('');
   container.querySelectorAll('.play').forEach((button,index) => button.onclick = async () => {
     const player=document.querySelector('#player');
-    const selected=displayedTracks[index];if(queue[currentIndex]?.id===selected.id)return player.paused?safePlay(player):player.pause();playbackFailures.clear();
+    const selected=displayedTracks[index];if(queue[currentIndex]?.id===selected.id)return toggleLocalPlayback();playbackFailures.clear();
     if(currentQueueRequest){try{const data=await api(currentQueueRequest),all=data.items||[],position=all.findIndex(item=>item.id===selected.id);if(position>=0){queue=all;return playTrack(position);}}catch{}}
     queue=[...displayedTracks];playTrack(index);
   });

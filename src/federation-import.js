@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { openFederationStream } from './federation-endpoints.js';
 import { signFederationRequest } from './federation-signatures.js';
+import { prepareAudio as prepareDefault } from './audio-preparation.js';
+import { audioCodec, requiresCompatibilityVariant } from './audio-compatibility.js';
 
 export function federationImportRetryDelay(attempts) {
   return Math.min(3600, 10 * 2 ** Math.min(8, Math.max(0, Number(attempts) - 1)));
@@ -15,7 +17,7 @@ export function federationReplicaPaths(storageDir, nodeId, objectId) {
 
 export const federationSourceId = (nodeId, objectId) => `${nodeId}\n${objectId}`;
 
-export function createFederationImportService({ db, storageDir, uploadDir, originalDir, loadIdentity, extractCover, sha256File, openStream = openFederationStream, logger = console, startOperation = null }) {
+export function createFederationImportService({ db, storageDir, uploadDir, originalDir, loadIdentity, extractCover, sha256File, prepareAudio = prepareDefault, openStream = openFederationStream, logger = console, startOperation = null }) {
   let busy = false;
 
   async function downloadCover(nodeId, objectId, trackId) {
@@ -82,24 +84,38 @@ export function createFederationImportService({ db, storageDir, uploadDir, origi
     const destinationDir = path.join(originalDir, shard);
     const destination = path.join(destinationDir, trackId);
     fs.mkdirSync(destinationDir, { recursive:true, mode:0o750 });
-    let coverKey = await extractCover(paths.temporaryPath, trackId);
-    if (!coverKey) try { coverKey = await downloadCover(job.origin_node_id, job.object_id, trackId); }
-    catch (error) { logger.error(`Не удалось импортировать обложку ${job.object_id}:`, error.message || error); }
-    fs.renameSync(paths.temporaryPath, destination);
+    const preparation=await prepareAudio(paths.temporaryPath);
+    let coverKey,repairedKey=null,moved=false;
     try {
+      coverKey = await extractCover(paths.temporaryPath, trackId);
+      if (!coverKey) try { coverKey = await downloadCover(job.origin_node_id, job.object_id, trackId); }
+      catch (error) { logger.error(`Не удалось импортировать обложку ${job.object_id}:`, error.message || error); }
+      if(preparation.normalized){
+        repairedKey=path.posix.join('derived','normalized_flac',shard,`${trackId}.flac`);
+        fs.mkdirSync(path.dirname(path.join(storageDir,repairedKey)),{recursive:true,mode:0o750});
+        fs.renameSync(preparation.output,path.join(storageDir,repairedKey));
+      }
+      fs.renameSync(paths.temporaryPath, destination);moved=true;
+      const codec=audioCodec(preparation.sourceMetadata)||audioCodec(preparation.metadata);
       await db.transaction(async tx => {
-        await tx.prepare(`INSERT INTO tracks(id,owner_id,title,artist,album,filename,mime_type,size_bytes,duration_seconds,storage_key,sha256,cover_key,cover_checked,genre,year,track_number,disc_number)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?)`).run(trackId, likers[0].user_id, remote.title || 'Без названия', remote.artist || 'Неизвестный исполнитель', remote.album || '', `${remote.artist || 'Исполнитель'} - ${remote.title || trackId}`, mimeType, total, remote.duration_seconds, path.posix.join('originals', shard, trackId), sha256, coverKey, remote.genre || '', remote.year, remote.track_number, remote.disc_number);
+        await tx.prepare(`INSERT INTO tracks(id,owner_id,title,artist,album,filename,mime_type,size_bytes,duration_seconds,storage_key,sha256,cover_key,cover_checked,genre,year,track_number,disc_number,source_codec)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?)`).run(trackId, likers[0].user_id, remote.title || 'Без названия', remote.artist || 'Неизвестный исполнитель', remote.album || '', `${remote.artist || 'Исполнитель'} - ${remote.title || trackId}`, mimeType, total, preparation.metadata.duration, path.posix.join('originals', shard, trackId), sha256, coverKey, remote.genre || '', remote.year, remote.track_number, remote.disc_number,codec);
+        if(repairedKey)await tx.prepare(`INSERT INTO track_files(track_id,variant,mime_type,codec,size_bytes,storage_key,status)
+          VALUES(?,'normalized_flac','audio/flac','flac',?,?,'ready')`).run(trackId,fs.statSync(path.join(storageDir,repairedKey)).size,repairedKey);
+        if(requiresCompatibilityVariant(codec))await tx.prepare(`INSERT INTO track_files(track_id,variant,mime_type,codec,bitrate,status,priority)
+          VALUES(?,'aac_192','audio/mp4','aac',192000,'queued',50)`).run(trackId);
+        await tx.prepare("INSERT INTO loudness_jobs(track_id,status) VALUES(?,'queued') ON CONFLICT(track_id) DO NOTHING").run(trackId);
         for (const liker of likers) await tx.prepare('INSERT INTO track_likes(user_id,track_id) VALUES(?,?) ON CONFLICT DO NOTHING').run(liker.user_id, trackId);
         await tx.prepare("INSERT INTO track_sources(source,source_id,track_id) VALUES('federation',?,?)").run(sourceId, trackId);
         await tx.prepare('DELETE FROM federation_remote_likes WHERE origin_node_id=? AND object_id=?').run(job.origin_node_id, job.object_id);
         await tx.prepare("UPDATE federation_remote_replicas SET status='imported',local_track_id=?,storage_key=NULL,mime_type=?,size_bytes=?,received_bytes=?,sha256=?,error=NULL,updated_at=CURRENT_TIMESTAMP WHERE origin_node_id=? AND object_id=?").run(trackId, mimeType, total, total, sha256, job.origin_node_id, job.object_id);
       });
     } catch (error) {
-      fs.renameSync(destination, paths.temporaryPath);
+      if(moved)fs.renameSync(destination, paths.temporaryPath);
+      if(repairedKey)fs.rmSync(path.join(storageDir,repairedKey),{force:true});
       if (coverKey) fs.rmSync(path.join(storageDir, coverKey), { force:true });
       throw error;
-    }
+    } finally { preparation.cleanup(); }
   }
 
   async function claim() {
@@ -170,14 +186,18 @@ export function createFederationImportService({ db, storageDir, uploadDir, origi
       if (expectedSha256 && actualSha256 !== expectedSha256) throw new Error('SHA-256 реплики не совпадает с оригиналом');
       const current = await db.prepare('SELECT status FROM federation_remote_replicas WHERE origin_node_id=? AND object_id=?').get(job.origin_node_id, job.object_id);
       if (!current || current.status !== 'downloading') { fs.rmSync(paths.temporaryPath, { force:true }); return false; }
-      await complete(job, paths, String(upstream.response.headers['content-type'] || 'application/octet-stream'), total, actualSha256);
+      const mimeType=String(upstream.response.headers['content-type'] || 'application/octet-stream');
+      await db.prepare(`UPDATE federation_remote_replicas SET sha256=?,mime_type=?,received_bytes=?,updated_at=CURRENT_TIMESTAMP
+        WHERE origin_node_id=? AND object_id=? AND status='downloading'`).run(actualSha256,mimeType,total,job.origin_node_id,job.object_id);
+      await complete(job, paths, mimeType, total, actualSha256);
       succeeded = true;
       return true;
     } catch (error) {
       if (job) {
         const paths = federationReplicaPaths(storageDir, job.origin_node_id, job.object_id);
         const received = fs.existsSync(paths.temporaryPath) ? fs.statSync(paths.temporaryPath).size : 0;
-        await db.prepare("UPDATE federation_remote_replicas SET status='retry',received_bytes=?,available_at=CURRENT_TIMESTAMP+(? * INTERVAL '1 second'),error=?,updated_at=CURRENT_TIMESTAMP WHERE origin_node_id=? AND object_id=?").run(received, federationImportRetryDelay(job.attempts), String(error.message || error).slice(0, 1000), job.origin_node_id, job.object_id);
+        const invalidAudio=['audio_unrecognized','audio_invalid','audio_invalid_variant'].includes(error.code);
+        await db.prepare("UPDATE federation_remote_replicas SET status=?,received_bytes=?,available_at=CURRENT_TIMESTAMP+(? * INTERVAL '1 second'),error=?,updated_at=CURRENT_TIMESTAMP WHERE origin_node_id=? AND object_id=?").run(invalidAudio?'failed':'retry',received, federationImportRetryDelay(job.attempts), String(error.message || error).slice(0, 1000), job.origin_node_id, job.object_id);
         logger.error(`Ошибка репликации ${job.object_id}:`, error.message || error);
       }
       return false;

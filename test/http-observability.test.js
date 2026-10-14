@@ -10,6 +10,16 @@ test('request id accepts a safe proxy id and rejects unsafe input', () => {
   assert.equal(requestKind('/federation/v1/node'), 'federation');
 });
 
+test('a long-lived SSE stream is logged but does not inflate API latency or slow requests',()=>{
+  const metrics={requests:0,errors5xx:0,duration_ms_total:0,duration_ms_max:0,slow_requests:0};const lines=[];
+  const res=new EventEmitter();res.statusCode=200;res.setHeader=()=>{};res.getHeader=()=> 'text/event-stream; charset=utf-8';
+  createHttpObserver({metrics,slowMs:0,write:line=>lines.push(JSON.parse(line))})({method:'GET',headers:{}},res,new URL('https://music.test/api/v1/connect/events?device_id=private-device'));
+  res.emit('close');
+  assert.equal(lines[0].kind,'connect_events');assert.equal(metrics.requests,1);assert.equal(metrics.event_streams,1);
+  assert.equal(httpMetricSnapshot(metrics).slow_requests,0);assert.equal(httpMetricSnapshot(metrics).duration_ms_average,0);assert.equal(httpMetricSnapshot(metrics).duration_ms_max,0);
+  assert.equal(JSON.stringify(lines).includes('private-device'),false);
+});
+
 test('observer emits one safe record and aggregates request duration', () => {
   const metrics = { requests:0, errors5xx:0, duration_ms_total:0, duration_ms_max:0, slow_requests:0 };
   const lines = [];

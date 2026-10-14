@@ -66,7 +66,13 @@ test('admin metrics combine worker, queues, HTTP and federation snapshots', asyn
     async get(){
       if(sql.includes("service='worker'"))return {last_seen_at:'now',age_seconds:'12'};
       if(sql.includes("diagnostic_reports"))return {tracks:'10',active_sessions:'2',new_reports:'1',upload_errors_24h:'0'};
-      if(sql.includes('peers_active'))return {peers_active:'1',peers_revoked:'0',peers_offline:'0',remote_tracks:'5',remote_likes:'2',remote_playlist_tracks:'1',oldest_sync_seconds:'3',sync_errors:'0',notify_errors:'0'};
+      if(sql.includes('peers_active')){
+        assert.match(sql,/JOIN federation_peers p ON p.node_id=t.origin_node_id WHERE p.revoked_at IS NULL AND p.status<>'revoked'/);
+        assert.match(sql,/WHERE revoked_at IS NULL AND status<>'revoked' AND sync_error IS NOT NULL/);
+        assert.match(sql,/WHERE revoked_at IS NULL AND status<>'revoked' AND notify_error IS NOT NULL/);
+        assert.match(sql,/FILTER\(WHERE revoked_at IS NULL AND status<>'revoked' AND \(sync_error/);
+        return {peers_active:'1',peers_revoked:'0',peers_offline:'0',remote_tracks:'5',cached_remote_tracks:'107',remote_likes:'2',remote_playlist_tracks:'1',oldest_sync_seconds:'3',sync_errors:'0',notify_errors:'0'};
+      }
       throw new Error(`Unexpected get: ${sql}`);
     },
     async all(){
@@ -86,5 +92,6 @@ test('admin metrics combine worker, queues, HTTP and federation snapshots', asyn
   assert.equal(result.api.uptime_seconds,20);
   assert.equal(result.api.errors_5xx,1);
   assert.equal(result.federation.remote_tracks,5);
+  assert.equal(result.federation.cached_remote_tracks,107);
   assert.equal(result.federation.incoming_streams,2);
 });

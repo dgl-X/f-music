@@ -117,6 +117,12 @@ jobs:
         run: npm ci
       - name: Проверить загрузку, worker и HTTP Range
         run: npm run test:media:integration
+      - name: Проверить неизменяемый оригинал, импорт, AAC и WEB
+        env:
+          MEDIA_IMPORT_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/family_music_import_test
+        run: |
+          node --input-type=module -e 'import pg from "pg";const client=new pg.Client({connectionString:process.env.MEDIA_TEST_DATABASE_URL});await client.connect();await client.query("CREATE DATABASE family_music_import_test");await client.end();'
+          npm run test:media:import
 
   connect-integration:
     runs-on: ubuntu-latest

@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { audioCodec } from './audio-compatibility.js';
 
 export function createWorkerMaintenance({db,storageDir,uploadDir,abandonedUploadHours,diagnosticReports,inspectAudio,sha256File,extractCover,normalizedTags,pid=process.pid,nodeVersion=process.version,log=console.log,logError=console.error}){
   const root=path.resolve(storageDir),uploads=path.resolve(uploadDir);
@@ -39,19 +40,20 @@ export function createWorkerMaintenance({db,storageDir,uploadDir,abandonedUpload
   }
 
   async function enrichTracks(){
-    const tracks=await db.prepare('SELECT * FROM tracks WHERE sha256 IS NULL OR cover_checked=0').all();
+    const tracks=await db.prepare("SELECT * FROM tracks WHERE sha256 IS NULL OR cover_checked=0 OR source_codec IS NULL OR source_codec=''").all();
     for(const track of tracks){
       const file=path.resolve(root,track.storage_key||'');
       if(!file.startsWith(`${root}${path.sep}`)||!fs.existsSync(file)||!fs.statSync(file).isFile())continue;
       try{
-        const [metadata,sha256]=await Promise.all([inspectAudio(file),sha256File(file)]);
+        const [metadata,sha256]=await Promise.all([inspectAudio(file),track.sha256?Promise.resolve(track.sha256):sha256File(file)]);
         if(!metadata)continue;
         const tags=normalizedTags(metadata);let coverKey=track.cover_key;
-        if(!coverKey)coverKey=await extractCover(file,track.id);
-        const duplicate=await db.prepare('SELECT id FROM tracks WHERE sha256=? AND id<>?').get(sha256,track.id);
+        if(!coverKey&&!track.cover_checked)coverKey=await extractCover(file,track.id);
+        const duplicate=track.sha256?null:await db.prepare('SELECT id FROM tracks WHERE sha256=? AND id<>?').get(sha256,track.id);
         await db.prepare(`UPDATE tracks SET sha256=?, cover_key=?, cover_checked=1, genre=CASE WHEN genre='' THEN ? ELSE genre END,
-          year=COALESCE(year,?), track_number=COALESCE(track_number,?), disc_number=COALESCE(disc_number,?) WHERE id=?`).run(
-          duplicate?null:sha256,coverKey,tags.genre,tags.year,tags.trackNumber,tags.discNumber,track.id);
+          year=COALESCE(year,?), track_number=COALESCE(track_number,?), disc_number=COALESCE(disc_number,?),
+          source_codec=CASE WHEN source_codec IS NULL OR source_codec='' THEN ? ELSE source_codec END WHERE id=?`).run(
+          duplicate?null:sha256,coverKey,tags.genre,tags.year,tags.trackNumber,tags.discNumber,audioCodec(metadata),track.id);
       }catch(error){logError(`Не удалось дополнить трек ${track.id}:`,error.message);}
     }
     if(tracks.length)log(`Проверены метаданные существующих треков: ${tracks.length}`);

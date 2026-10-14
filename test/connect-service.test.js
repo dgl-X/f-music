@@ -1,6 +1,45 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createConnectService, validateConnectDevice } from '../src/connect-service.js';
+import { createConnectService, validateConnectDevice, normalizeConnectNavigation } from '../src/connect-service.js';
+
+test('Connect navigation keeps the exact permutation and history within the shared queue',()=>{
+  assert.deepEqual(normalizeConnectNavigation({shuffle_order:['c','bad','a','c'],playback_history:['a','bad','c','a']},['a','b','c']),{shuffle_order:['c','a','b'],playback_history:['a','c','a']});
+});
+
+test('prepared transfer commits actual paused position and only requests source deactivation', async () => {
+  const calls=[];
+  const command={id:41,status:'pending',action:'transfer',expires_at:new Date(Date.now()+30000),payload_json:{transfer_prepare:true,track_id:'track',queue:['track'],position_seconds:10,playing:true,playback_epoch:2,previous_device_id:'source'}};
+  const tx={prepare(sql){return{
+    async get(){if(sql.startsWith('SELECT * FROM connect_commands'))return command;if(sql.startsWith('SELECT id FROM connect_devices'))return{id:'source'};if(sql.startsWith('SELECT * FROM connect_state'))return{active_device_id:'target',playback_epoch:2,queue_json:['track']};},
+    async run(...params){calls.push({sql,params});return{changes:1};},
+  };}};
+  const service=createConnectService({db:{transaction:fn=>fn(tx)},enabled:true});
+  await service.acknowledge(1,'target',41,{success:true,result:{state:{track_id:'track',queue:['track'],position_seconds:14,playing:false}}});
+  const state=calls.find(c=>c.sql.startsWith('INSERT INTO connect_state'));
+  assert.equal(state.params[4],14);
+  assert.equal(state.params[7],0);
+  assert.equal(calls.filter(c=>c.sql.includes("'activate'")).length,0);
+  const deactivate=calls.find(c=>c.sql.includes("'deactivate'"));
+  assert.equal(JSON.parse(deactivate.params[3]).activate_device_id,'target');
+});
+
+test('prepared transfer rejects an early ACK while target is still playing', async () => {
+  let writes=0;
+  const tx={prepare(sql){return{async get(){if(sql.startsWith('SELECT * FROM connect_commands'))return{status:'pending',action:'transfer',payload_json:{transfer_prepare:true,track_id:'track'},expires_at:new Date(Date.now()+30000)};},async run(){writes++;}};}};
+  const result=await createConnectService({db:{transaction:fn=>fn(tx)}}).acknowledge(1,'target',41,{success:true,result:{state:{track_id:'track',playing:true}}});
+  assert.equal(result.status,'invalid');assert.equal(writes,0);
+});
+
+test('source pause ACK schedules activation at the actual stopped position', async () => {
+  const calls=[];
+  const tx={prepare(sql){return{
+    async get(){if(sql.startsWith('SELECT * FROM connect_commands'))return{status:'pending',action:'deactivate',payload_json:{activate_device_id:'target',playback_epoch:2,track_id:'track',playing:true},expires_at:new Date(Date.now()+30000)};if(sql.startsWith('SELECT * FROM connect_state'))return{active_device_id:'target',playback_epoch:2,position_seconds:10};},
+    async run(...params){calls.push({sql,params});},
+  };}};
+  await createConnectService({db:{transaction:fn=>fn(tx)}}).acknowledge(1,'source',42,{success:true,result:{state:{track_id:'track',position_seconds:18,playing:false}}});
+  const activate=calls.find(c=>c.sql.includes("'activate'"));
+  assert.equal(JSON.parse(activate.params[3]).position_seconds,18);
+});
 
 test('Connect device validation accepts only stable opaque ids and known clients', () => {
   assert.deepEqual(validateConnectDevice({
@@ -39,6 +78,16 @@ test('unknown Connect commands are rejected before touching the database', async
   const db={async transaction(){throw new Error('must not run');}};
   const result=await createConnectService({db,enabled:true}).sendCommand(1,'web_0123456789abcdef','format_disk',{});
   assert.equal(result.status,'invalid');
+});
+
+test('remote controls cannot start the target before transfer completes', async () => {
+  const tx={prepare(sql){return{async get(){
+    if(sql.startsWith('SELECT id FROM connect_devices'))return{id:'source'};
+    if(sql.startsWith('SELECT id FROM connect_commands'))return{id:41};
+    throw new Error('Playback command must not be enqueued during transfer');
+  }};}};
+  const result=await createConnectService({db:{transaction:fn=>fn(tx)}}).sendCommand(1,'source','play',{});
+  assert.equal(result.status,'transfer_pending');
 });
 
 test('Connect registration cannot take over a device id during a concurrent conflict', async () => {

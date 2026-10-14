@@ -22,5 +22,6 @@ export function loadConfig(env = process.env) {
     metricsToken: String(env.MUSIC_METRICS_TOKEN ?? ''),
     registrationEnabled: env.MUSIC_REGISTRATION_ENABLED === 'true',
     connectEnabled: env.MUSIC_CONNECT_ENABLED === 'true',
+    connectEventsEnabled: env.MUSIC_CONNECT_EVENTS_ENABLED === 'true',
   };
 }

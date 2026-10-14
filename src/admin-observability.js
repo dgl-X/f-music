@@ -71,7 +71,16 @@ export function createAdminObservabilityService({ db, storageDir, processStarted
       db.prepare(`SELECT status,count(*) AS count,COALESCE(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP-min(updated_at))),0) AS oldest_seconds FROM loudness_jobs WHERE status IN ('queued','retry','processing','failed') GROUP BY status`).all(),
       db.prepare(`SELECT status,count(*) AS count,COALESCE(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP-min(updated_at))),0) AS oldest_seconds FROM federation_remote_replicas WHERE status IN ('queued','retry','downloading','failed') GROUP BY status`).all(),
       db.prepare(`SELECT (SELECT count(*) FROM tracks) AS tracks,(SELECT count(*) FROM sessions WHERE expires_at>CURRENT_TIMESTAMP) AS active_sessions,(SELECT count(*) FROM diagnostic_reports WHERE status='new') AS new_reports,(SELECT count(*) FROM uploads WHERE status='failed' AND updated_at>CURRENT_TIMESTAMP-INTERVAL '24 hours') AS upload_errors_24h`).get(),
-      db.prepare(`SELECT count(*) FILTER(WHERE revoked_at IS NULL AND status<>'revoked') peers_active,count(*) FILTER(WHERE revoked_at IS NOT NULL OR status='revoked') peers_revoked,count(*) FILTER(WHERE revoked_at IS NULL AND (sync_error IS NOT NULL OR last_synced_at IS NULL OR last_synced_at<CURRENT_TIMESTAMP-INTERVAL '10 minutes')) peers_offline,(SELECT count(*) FROM federation_remote_tracks) remote_tracks,(SELECT count(*) FROM federation_remote_likes) remote_likes,(SELECT count(*) FROM federation_playlist_tracks) remote_playlist_tracks,COALESCE(max(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP-last_synced_at))) FILTER(WHERE revoked_at IS NULL),0) oldest_sync_seconds,count(*) FILTER(WHERE sync_error IS NOT NULL) sync_errors,count(*) FILTER(WHERE notify_error IS NOT NULL) notify_errors FROM federation_peers`).get(),
+      db.prepare(`SELECT count(*) FILTER(WHERE revoked_at IS NULL AND status<>'revoked') peers_active,
+        count(*) FILTER(WHERE revoked_at IS NOT NULL OR status='revoked') peers_revoked,
+        count(*) FILTER(WHERE revoked_at IS NULL AND status<>'revoked' AND (sync_error IS NOT NULL OR last_synced_at IS NULL OR last_synced_at<CURRENT_TIMESTAMP-INTERVAL '10 minutes')) peers_offline,
+        (SELECT count(*) FROM federation_remote_tracks t JOIN federation_peers p ON p.node_id=t.origin_node_id WHERE p.revoked_at IS NULL AND p.status<>'revoked') remote_tracks,
+        (SELECT count(*) FROM federation_remote_tracks) cached_remote_tracks,
+        (SELECT count(*) FROM federation_remote_likes) remote_likes,
+        (SELECT count(*) FROM federation_playlist_tracks) remote_playlist_tracks,
+        COALESCE(max(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP-last_synced_at))) FILTER(WHERE revoked_at IS NULL AND status<>'revoked'),0) oldest_sync_seconds,
+        count(*) FILTER(WHERE revoked_at IS NULL AND status<>'revoked' AND sync_error IS NOT NULL) sync_errors,
+        count(*) FILTER(WHERE revoked_at IS NULL AND status<>'revoked' AND notify_error IS NOT NULL) notify_errors FROM federation_peers`).get(),
       db.prepare(`SELECT name,count,error_count,duration_ms_total,duration_ms_max,last_duration_ms,last_succeeded,last_finished_at FROM operation_metrics ORDER BY name`).all(),
     ]);
     const workerAge=heartbeat?Math.round(Number(heartbeat.age_seconds)):null;
