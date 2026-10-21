@@ -48,6 +48,7 @@ test('setup status keeps worker readiness and public version fields', async () =
   assert.equal(responses[0].value.library_name, 'Дом');
   assert.equal(responses[0].value.checks.worker, 'ok');
   assert.equal(responses[0].value.registration_enabled, true);
+  assert.equal(responses[0].value.features.android_settings_portal,1);
 });
 
 test('administrative metrics remain admin-only', async () => {

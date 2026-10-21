@@ -38,6 +38,14 @@ test('processor rejects an unrecognized file and removes its temporary data', as
   assert.match(setup.calls.at(-1).sql, /uploads SET status='failed'/);
 });
 
+test('decoder resource failure preserves upload bytes for retry instead of rejecting audio', async t => {
+  const setup=fixture(t,{async validateAudioDecode(){throw Object.assign(new Error('resource limit'),{code:'media_timeout'});}});
+  const source=path.join(setup.uploadDir,'upload-1.part');fs.writeFileSync(source,'original bytes');
+  await assert.rejects(setup.processor.process({id:'upload-1',user_id:2,filename:'song.mp3',mime_type:'audio/mpeg'}),error=>error.code==='media_timeout');
+  assert.equal(fs.readFileSync(source,'utf8'),'original bytes');
+  assert.equal(setup.calls.some(call=>call.sql.includes("status='failed'")),false);
+});
+
 test('processor links a byte-identical upload to the existing track', async t => {
   const setup = fixture(t);
   const source = path.join(setup.uploadDir, 'upload-1.part'); fs.writeFileSync(source, 'audio');

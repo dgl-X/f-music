@@ -26,6 +26,9 @@ mkdir -p "$STAGE/DEBIAN" "$STAGE/opt/family-music" "$STAGE/lib/systemd/system" "
 
 cp -R "$ROOT/src" "$ROOT/public" "$ROOT/federation" "$ROOT/node_modules" "$STAGE/opt/family-music/"
 cp "$ROOT/package.json" "$ROOT/package-lock.json" "$ROOT/LICENSE" "$STAGE/opt/family-music/"
+# Unit-test tools must not be shipped as runtime dependencies. Prune the copy,
+# never the developer's node_modules; all production dependencies are already here.
+npm prune --prefix "$STAGE/opt/family-music" --omit=dev --ignore-scripts --offline --no-audit --no-fund
 cp "$ROOT/.env.example" "$STAGE/usr/share/doc/family-music-server/examples/family-music.env"
 cp "$ROOT/deploy/family-music.nginx" "$STAGE/usr/share/doc/family-music-server/examples/family-music.nginx"
 cp "$ROOT/deploy/family-music.service" "$ROOT/deploy/family-music-worker.service" "$STAGE/lib/systemd/system/"

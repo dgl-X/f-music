@@ -71,6 +71,39 @@ CREATE TABLE IF NOT EXISTS track_likes (user_id INTEGER NOT NULL REFERENCES user
 CREATE TABLE IF NOT EXISTS playlists (id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS playlist_tracks (playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE, track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, position INTEGER NOT NULL, added_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (playlist_id, track_id));
 CREATE TABLE IF NOT EXISTS play_history (user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, play_count INTEGER NOT NULL DEFAULT 0, last_played_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (user_id, track_id));
+CREATE TABLE IF NOT EXISTS listening_preferences (
+  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  enabled BOOLEAN NOT NULL DEFAULT FALSE, generation INTEGER NOT NULL DEFAULT 0,
+  started_at TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS listening_sessions (
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  playback_id UUID NOT NULL, auth_session_id BIGINT NOT NULL, generation INTEGER NOT NULL,
+  track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+  client_type TEXT NOT NULL CHECK(client_type IN ('web','android')),
+  elapsed_ms BIGINT NOT NULL DEFAULT 0 CHECK(elapsed_ms>=0),
+  threshold_ms INTEGER NOT NULL, qualified BOOLEAN NOT NULL DEFAULT FALSE,
+  started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY(user_id,playback_id)
+);
+CREATE INDEX IF NOT EXISTS listening_sessions_retention ON listening_sessions(updated_at);
+CREATE INDEX IF NOT EXISTS listening_sessions_user_started ON listening_sessions(user_id,started_at);
+ALTER TABLE listening_sessions ADD COLUMN IF NOT EXISTS received_at TIMESTAMPTZ;
+UPDATE listening_sessions SET received_at=started_at WHERE received_at IS NULL;
+ALTER TABLE listening_sessions ALTER COLUMN received_at SET DEFAULT CURRENT_TIMESTAMP;
+ALTER TABLE listening_sessions ALTER COLUMN received_at SET NOT NULL;
+CREATE INDEX IF NOT EXISTS listening_sessions_user_received ON listening_sessions(user_id,received_at);
+CREATE TABLE IF NOT EXISTS listening_daily (
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+  day DATE NOT NULL, client_type TEXT NOT NULL CHECK(client_type IN ('web','android')),
+  elapsed_ms BIGINT NOT NULL DEFAULT 0 CHECK(elapsed_ms>=0),
+  plays INTEGER NOT NULL DEFAULT 0 CHECK(plays>=0),
+  PRIMARY KEY(user_id,track_id,day,client_type)
+);
+CREATE INDEX IF NOT EXISTS listening_daily_period ON listening_daily(day,user_id);
+CREATE INDEX IF NOT EXISTS listening_daily_user_period ON listening_daily(user_id,day);
 CREATE TABLE IF NOT EXISTS playback_state (user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, track_id TEXT REFERENCES tracks(id) ON DELETE SET NULL, position_seconds DOUBLE PRECISION NOT NULL DEFAULT 0, queue_json TEXT NOT NULL DEFAULT '[]', shuffle INTEGER NOT NULL DEFAULT 0, repeat_mode TEXT NOT NULL DEFAULT 'off', updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP);
 ALTER TABLE playback_state ADD COLUMN IF NOT EXISTS queue_source TEXT NOT NULL DEFAULT 'Очередь';
 ALTER TABLE playback_state ADD COLUMN IF NOT EXISTS remote_track_ref TEXT;
@@ -253,6 +286,9 @@ function adapter(client) {
 
 export async function openDatabase(databaseUrl) {
   const pool = new Pool({ connectionString: databaseUrl, max: 10 });
+  // Long-held locks must not consume ordinary query/transaction connections.
+  const lockPool = new Pool({ connectionString: databaseUrl, max: 10 });
+  lockPool.on('error', () => {});
   // API и worker могут стартовать одновременно на новой ноде. PostgreSQL не
   // гарантирует отсутствие гонки между двумя параллельными CREATE TABLE IF
   // NOT EXISTS, поэтому сериализуем применение схемы на уровне БД.
@@ -266,12 +302,39 @@ export async function openDatabase(databaseUrl) {
   }
   return {
     ...adapter(pool),
+    async withQueueLock(queue, exclusive, callback) {
+      const queues = { uploads:1, transcode:2, loudness:3, recognition:4, replicas:5 };
+      if (!Object.hasOwn(queues,queue)) throw new Error('Unknown worker queue');
+      const client = await lockPool.connect();
+      const suffix = exclusive ? '' : '_shared';
+      const keys = [1179471694, queues[queue]];
+      let held = false;
+      // Fail closed: no side effects after losing the coordination session.
+      const lost = () => { console.error('Worker coordination connection lost; stopping process'); process.exit(1); };
+      client.on('error',lost);
+      try {
+        if (exclusive) {
+          await client.query("SET lock_timeout='30s'");
+          try { await client.query('SELECT pg_advisory_lock($1,$2)',keys); held=true; }
+          catch (error) { if(error.code==='55P03')return false; throw error; }
+        } else held = (await client.query('SELECT pg_try_advisory_lock_shared($1,$2) AS locked', keys)).rows[0].locked;
+        if (!held) return false;
+        return await callback();
+      } finally {
+        let discard=false;
+        try {
+          if(held)await client.query(`SELECT pg_advisory_unlock${suffix}($1,$2)`,keys);
+          if(exclusive)await client.query('SET lock_timeout=0');
+        } catch { discard=true; if(held)lost(); }
+        finally { client.removeListener('error',lost); client.release(discard); }
+      }
+    },
     async transaction(callback) {
       const client = await pool.connect();
       try { await client.query('BEGIN'); const result = await callback(adapter(client)); await client.query('COMMIT'); return result; }
       catch (error) { await client.query('ROLLBACK'); throw error; }
       finally { client.release(); }
     },
-    async close() { await pool.end(); },
+    async close() { await Promise.all([pool.end(),lockPool.end()]); },
   };
 }

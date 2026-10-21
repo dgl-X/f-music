@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { guardQueue } from './queue-guard.js';
 import path from 'node:path';
 import { openFederationStream } from './federation-endpoints.js';
 import { signFederationRequest } from './federation-signatures.js';
@@ -128,7 +129,8 @@ export function createFederationImportService({ db, storageDir, uploadDir, origi
     });
   }
 
-  async function processNext() {
+  const processNext=()=>guardQueue(db,'replicas',false,processNextUnlocked);
+  async function processNextUnlocked() {
     if (busy) return false;
     busy = true;
     let job;
@@ -204,9 +206,10 @@ export function createFederationImportService({ db, storageDir, uploadDir, origi
     } finally { await finish?.(succeeded); busy = false; }
   }
 
-  async function recover() {
+  const recover=({legacy=true}={})=>guardQueue(db,'replicas',true,()=>recoverUnlocked(legacy));
+  async function recoverUnlocked(legacy) {
     await db.prepare("UPDATE federation_remote_replicas SET status='retry',available_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE status='downloading'").run();
-    const ready = await db.prepare("SELECT * FROM federation_remote_replicas WHERE status='ready' AND storage_key IS NOT NULL").all();
+    const ready = legacy ? await db.prepare("SELECT * FROM federation_remote_replicas WHERE status='ready' AND storage_key IS NOT NULL").all() : [];
     for (const replica of ready) {
       const paths = federationReplicaPaths(storageDir, replica.origin_node_id, replica.object_id);
       const source = path.resolve(storageDir, replica.storage_key);

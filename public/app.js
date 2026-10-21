@@ -3,11 +3,17 @@ import { AudioMemoryCache, audioRecoveryDecision } from './audio-cache.js';
 import { parseWebRoute, webRouteForState } from './web-router.js';
 import { ConnectClient, availableConnectDevices, remotePlaybackActive } from './connect-client.js';
 import { connectStatusLabel } from './connect-status.js';
+import { personalStatisticsHtml, administrativeUsageHtml, measuredStatisticsHtml } from './listening-statistics.js';
+import { ListeningTracker } from './listening-tracker.js';
+import { ListeningJournal } from './listening-journal.js';
+import { settingsPortalMode, settingsPortalView } from './settings-portal.js';
 import { waitForPlayback, webConnectPlaybackStatus, connectPositionAdvances } from './connect-playback.js';
 import { artistAlbumMeta, groupArtistAlbums, groupArtistTracks } from './artist-tracks.js';
 import { browserPlaybackCodecs, MediaPlaybackClient, mediaCacheKey, mediaPlaybackLabel, PlaybackRequestGate } from './media-playback-client.js';
 
 const app = document.querySelector('#app');
+const androidSettingsPortal=settingsPortalMode(location.search);
+if(androidSettingsPortal)document.body.classList.add('android-settings-portal');
 const api = async (url, options = {}) => {
   const response = await fetch(url, { ...options, headers: { ...(options.body && typeof options.body === 'string' ? { 'Content-Type': 'application/json' } : {}), ...options.headers } });
   if (!response.ok) { const body = await response.json().catch(() => ({})),error=new Error(body.error || `HTTP ${response.status}`);error.status=response.status;error.code=body.error_code||'';throw error; }
@@ -58,6 +64,8 @@ function cancelMediaPreparation(){const waiting=webMediaPreparing;mediaRequestGa
 let repeatMode = 'off';
 let stateSaveTimer;
 let sessionUser=null;
+let listeningTracker=null;
+let listeningPageLifecycle=null;
 let uploadTasks=[];
 let uploadWorkers=0;
 let uploadTaskSequence=0;
@@ -158,6 +166,7 @@ function renderSetup(status) {
 }
 
 function renderAuth(isSetup) {
+  listeningTracker?.stop({revoke:true});listeningTracker=null;listeningPageLifecycle?.abort();
   connectClient?.stop();connectClient=null;connectState=null;clearInterval(connectUiTimer);connectUiTimer=null;
   cancelAudioPrefetch();
   const oldPlayer=document.querySelector('#player');if(oldPlayer){oldPlayer.pause();oldPlayer.removeAttribute('src');oldPlayer.load();}
@@ -215,6 +224,7 @@ async function renderLibrary(user) {
   document.querySelector('#now-details').onclick=()=>{const track=queue[currentIndex];if(track?.external_preview)return alert('Сначала добавьте трек в свою библиотеку.');if(track?.remote)return showRemoteTrack(track.remote_ref);if(track)editTrack(track);};
   setupPlayer();
   await setupConnect();
+  setupListeningTracker();
   updateViewControls();
   if(!initialRoute.canonical)syncBrowserRoute('replace');
   await loadCurrentView();
@@ -229,16 +239,23 @@ function loadSettingsView(){
   const scopeNames={all:'Общая библиотека',local:'Только этот сервер',remote:'Только федерация'};
   const admin=sessionUser?.is_admin?`<div class="settings-group"><h3>Администрирование</h3><button data-section="statistics"><span>Статистика</span><small>Состояние сервера, очереди и громкость</small></button><button data-section="users"><span>Аккаунты</span><small>Пользователи и сброс паролей</small></button><button data-section="registration"><span>Регистрация</span><small>Разрешить пользователям создавать аккаунты самостоятельно</small></button><button data-section="federation"><span>Федерация</span><small>Identity, адреса и доступность ноды</small></button><button data-section="recognition"><span>Автораспознавание</span><small>AcoustID, включение и Client API key</small></button><button data-section="openvk"><span>OpenVK</span><small>Внешний поиск и импорт музыки в WEB</small></button><button data-section="reports"><span>Отчёты об ошибках</span><small>Диагностика из Android-приложения</small></button><button data-action="recognition-queue"><span>Требуют внимания</span><small>Распознавание и исправление метаданных</small></button></div>`:'';
   root.innerHTML=`<section class="stats-shell settings-dialog routed-settings"><div class="stats-head"><div><div class="dialog-title">Настройки</div><small>${escapeHtml(sessionUser?.display_name||'')}</small></div><button class="stats-close" aria-label="Закрыть">×</button></div><div class="settings-group"><h3>Аккаунт</h3><button data-section="connect"><span>Family Music Connect</span><small>Управление музыкой между вашими устройствами</small></button><button data-section="password"><span>Изменить пароль</span><small>Обновить пароль текущего пользователя</small></button></div><div class="settings-group"><h3>Библиотека</h3><button data-section="library"><span>«Все треки» по умолчанию</span><small>${escapeHtml(scopeNames[searchScope]||scopeNames.all)}</small></button><button data-section="duplicates"><span>Возможные дубликаты</span><small>Совпадения по названию и исполнителю</small></button></div>${admin}</section>`;
-  root.querySelector('.stats-close').onclick=()=>switchView('liked');
+  root.querySelector('.settings-group').insertAdjacentHTML('beforeend','<button data-section="listening"><span>Моя статистика</span><small>Воспроизведения, любимые исполнители и альбомы</small></button>');
+  if(sessionUser?.is_admin)root.querySelector('[data-section="statistics"]').insertAdjacentHTML('afterend','<button data-section="usage"><span>Использование сервера</span><small>Слушатели, активность и рост библиотеки</small></button>');
+  if(androidSettingsPortal){
+    root.querySelector('.settings-group').style.display='none';
+    root.querySelectorAll('[data-section="duplicates"],[data-section="federation"],[data-action="recognition-queue"]').forEach(button=>button.remove());
+  }
+  root.querySelector('.stats-close').onclick=()=>{if(androidSettingsPortal)location.href='familymusic-settings:close';else switchView('liked');};
   root.querySelectorAll('[data-section]').forEach(button=>button.onclick=()=>openSettingsSection(button.dataset.section));
   root.querySelector('[data-action="recognition-queue"]')?.addEventListener('click',()=>switchView('recognition'));
   if(settingsSection&&openingSettingsSection!==settingsSection)openSettingsSection(settingsSection,false);
 }
 
 function openSettingsSection(section,push=true){
-  const adminOnly=new Set(['statistics','users','registration','federation','recognition','openvk','reports']);
+  if(androidSettingsPortal&&['duplicates','federation','recognition-queue'].includes(section)){settingsSection='';openingSettingsSection='';syncBrowserRoute('replace');return;}
+  const adminOnly=new Set(['statistics','usage','users','registration','federation','recognition','openvk','reports']);
   if(adminOnly.has(section)&&!sessionUser?.is_admin){settingsSection='';syncBrowserRoute('replace');return;}
-  const actions={connect:showConnectSettings,library:showLibraryDisplaySettings,statistics:showAdminStats,users:manageUsers,registration:showRegistrationSettings,federation:showFederationSettings,recognition:showRecognitionSettings,openvk:showOpenVkSettings,reports:showDiagnosticReports,duplicates:showDuplicates,password:changeOwnPassword};
+  const actions={listening:()=>showListeningStatistics(false),usage:()=>showListeningStatistics(true),connect:showConnectSettings,library:showLibraryDisplaySettings,statistics:showAdminStats,users:manageUsers,registration:showRegistrationSettings,federation:showFederationSettings,recognition:showRecognitionSettings,openvk:showOpenVkSettings,reports:showDiagnosticReports,duplicates:showDuplicates,password:changeOwnPassword};
   const action=actions[section];if(!action)return;
   settingsSection=section;openingSettingsSection=section;if(push)syncBrowserRoute();
   Promise.resolve(action()).catch(error=>alert(error.message));
@@ -373,6 +390,45 @@ async function manageUsers(){
   try{await load();}catch(error){dialog.querySelector('.users-list').innerHTML=`<div class="error">${escapeHtml(error.message)}</div>`;}
 }
 
+async function showListeningStatistics(admin){
+  const tracker=listeningTracker;
+  const dialog=document.createElement('dialog');dialog.className='stats-dialog';
+  dialog.innerHTML=`<div class="stats-shell"><div class="stats-head"><div><div class="dialog-title">${admin?'Использование сервера':'Моя статистика'}</div><small>История и измеренное время</small></div><button class="stats-close" aria-label="Закрыть">×</button></div><label>Период измеренного времени <select class="listening-period"><option value="7">7 дней</option><option value="30">30 дней</option><option value="all">Всё время</option></select></label>${admin?'':'<label class="settings-check"><input class="listening-enabled" type="checkbox" disabled><span><strong>Учитывать моё время прослушивания</strong><small>По умолчанию выключено. Поддерживаются WEB и Android.</small></span></label><button class="secondary clear-listening" disabled>Очистить измеренную статистику</button>'}<div class="error listening-error"></div><button class="secondary refresh-statistics">Обновить</button><div class="stats-content">Загрузка…</div></div>`;
+  const abort=new AbortController();document.body.append(dialog);dialog.showModal();
+  dialog.querySelector('.stats-close').onclick=()=>dialog.close();dialog.addEventListener('close',()=>{abort.abort();dialog.remove();});
+  const refresh=dialog.querySelector('.refresh-statistics');
+  const period=dialog.querySelector('.listening-period'),enabled=dialog.querySelector('.listening-enabled'),clear=dialog.querySelector('.clear-listening');
+  let generation=0;
+  const load=async()=>{
+    const token=++generation;refresh.disabled=true;period.disabled=true;if(enabled)enabled.disabled=true;if(clear)clear.disabled=true;
+    try{
+      const [data,measured]=await Promise.all([api(admin?'/api/v1/admin/usage':'/api/v1/statistics/me',{signal:abort.signal}),api((admin?'/api/v1/admin/listening':'/api/v1/statistics/listening')+'?period='+period.value,{signal:abort.signal})]);
+      if(!dialog.isConnected||token!==generation||tracker!==listeningTracker)return;
+      if(enabled){enabled.checked=measured.settings.enabled;enabled.disabled=false;clear.disabled=false;tracker?.configure(measured.settings);}
+      dialog.querySelector('.stats-content').innerHTML=measuredStatisticsHtml(measured,admin)+(admin?administrativeUsageHtml(data):personalStatisticsHtml(data));
+      dialog.querySelector('.stats-head small').textContent=`Обновлено ${new Date(data.generated_at).toLocaleString('ru-RU')}`;
+    }catch(error){if(token===generation&&error.name!=='AbortError'&&dialog.isConnected)dialog.querySelector('.stats-content').innerHTML=`<div class="error">${escapeHtml(error.message)}</div>`;}
+    finally{if(token===generation){refresh.disabled=false;period.disabled=false;}}
+  };
+  if(enabled)enabled.onchange=async()=>{
+    if(tracker!==listeningTracker){dialog.close();return;}
+    enabled.disabled=true;const error=dialog.querySelector('.listening-error');error.textContent='';
+    if(!enabled.checked)tracker?.stop();
+    try{const settings=await api('/api/v1/statistics/settings',{method:'PUT',body:JSON.stringify({enabled:enabled.checked}),signal:abort.signal});if(tracker!==listeningTracker)return;tracker?.start();tracker?.configure(settings);await load();}
+    catch(problem){if(problem.name!=='AbortError'){error.textContent=problem.message;await load();}}
+  };
+  if(clear)clear.onclick=async()=>{
+    if(tracker!==listeningTracker){dialog.close();return;}
+    if(!confirm('Удалить измеренное время и новые счётчики прослушиваний? Старая история, лайки и плейлисты останутся.'))return;
+    clear.disabled=true;const error=dialog.querySelector('.listening-error');error.textContent='';
+    tracker?.stop();
+    try{const settings=await api('/api/v1/statistics/listening',{method:'DELETE',signal:abort.signal});if(tracker!==listeningTracker)return;tracker?.start();tracker?.configure(settings);await load();}
+    catch(problem){if(problem.name!=='AbortError'){error.textContent=problem.message;await load();}}
+  };
+  period.onchange=load;
+  refresh.onclick=load;await load();
+}
+
 async function showAdminStats(){
   const dialog=document.createElement('dialog');dialog.className='stats-dialog';
   dialog.innerHTML='<div class="stats-shell"><div class="stats-head"><div><div class="dialog-title">Состояние сервера</div><small>Загрузка данных…</small></div><button class="stats-close" aria-label="Закрыть">×</button></div><div class="stats-content"></div></div>';
@@ -431,6 +487,7 @@ function setTrackFilter(artist='',album='',artistId=0,albumId=0) {
 }
 
 async function loadCurrentView() {
+  if(androidSettingsPortal&&!settingsPortalView(activeView)){activeView='settings';settingsSection='';syncBrowserRoute('replace');}
   renderActiveFilter();
   if(activeView==='settings')return loadSettingsView();
   if(activeView==='not-found'){const root=document.querySelector('#catalog-content');root.innerHTML=`<section class="route-not-found"><strong>404</strong><h2>Такой страницы нет</h2><p>${escapeHtml(unknownRoutePath||location.pathname)}</p><button class="primary">Перейти в библиотеку</button></section>`;root.querySelector('button').onclick=()=>switchView('liked');return;}
@@ -623,6 +680,7 @@ async function handleConnectCommand(command){
 }
 
 async function setupConnect(){
+  if(androidSettingsPortal)return;
   connectClient?.stop();clearInterval(connectUiTimer);connectUiTimer=null;
   const availability=enabled=>{
     const button=document.querySelector('#connect-toggle');if(button)button.hidden=!enabled;
@@ -637,6 +695,24 @@ async function setupConnect(){
 async function showConnectDevices(){
   const dialog=document.createElement('dialog');dialog.className='connect-dialog';dialog.innerHTML=`<section class="stats-shell"><div class="stats-head"><div><div class="dialog-title">Слушать на…</div><small>Устройства аккаунта в сети</small></div><button class="stats-close" aria-label="Закрыть">×</button></div><div class="connect-devices">Загрузка…</div></section>`;document.body.append(dialog);dialog.showModal();dialog.querySelector('.stats-close').onclick=()=>dialog.close();dialog.addEventListener('close',()=>dialog.remove());
   try{const data=await connectClient.devices(),root=dialog.querySelector('.connect-devices'),devices=availableConnectDevices(data.items);connectState=data.state;root.innerHTML=devices.length?devices.map(device=>{const current=device.id===connectState?.active_device_id,here=device.id===connectClient.deviceId;return`<button class="connect-device ${current?'active':''}" data-id="${escapeHtml(device.id)}"><span><strong>${escapeHtml(device.name)}${here?' · это устройство':''}</strong><small>${device.client_type==='android'?'Android':'WEB'} · в сети</small></span><em>${current?'Играет':'›'}</em></button>`;}).join(''):'<div class="stats-empty">Доступных устройств пока нет.</div>';root.querySelectorAll('.connect-device').forEach(button=>button.onclick=async()=>{if(button.dataset.id===connectState?.active_device_id){dialog.close();return;}button.disabled=true;try{const snapshot=connectRemoteActive()?{...connectState}:connectPlaybackState();await connectClient.transfer(button.dataset.id,snapshot);dialog.close();}catch(error){button.disabled=false;alert(error.message);}});}catch(error){dialog.querySelector('.connect-devices').innerHTML=`<div class="error">${escapeHtml(error.message)}</div>`;}
+}
+
+function setupListeningTracker(){
+  if(androidSettingsPortal)return;
+  listeningTracker?.stop();
+  listeningPageLifecycle?.abort();listeningPageLifecycle=new AbortController();
+  const player=document.querySelector('#player');
+  listeningTracker=new ListeningTracker({api,journal:new ListeningJournal(),sample:()=>({trackId:queue[currentIndex]?.id,
+    deviceId:connectClient?.deviceId,positionSeconds:player.currentTime,rate:player.playbackRate,
+    executing:!connectRemoteActive()&&!connectPreparing&&!webMediaPreparing&&!queue[currentIndex]?.external_preview,
+    playing:!player.paused&&!player.ended&&!player.seeking&&player.readyState>=3})});
+  const tracker=listeningTracker;
+  for(const event of ['seeking','seeked','waiting','stalled','pause','playing','ratechange','emptied'])player.addEventListener(event,()=>tracker.interrupt());
+  player.addEventListener('ended',()=>tracker.finish());
+  document.querySelector('#logout').addEventListener('click',()=>tracker.stop({revoke:true}),{capture:true});
+  window.addEventListener('pagehide',()=>tracker.suspend(),{signal:listeningPageLifecycle.signal});
+  window.addEventListener('pageshow',event=>{if(event.persisted&&listeningTracker===tracker)tracker.resume();},{signal:listeningPageLifecycle.signal});
+  tracker.start();
 }
 
 function setupPlayer() {
@@ -724,9 +800,10 @@ function scheduleAudioPrefetch(){
 function rememberMediaSelection(track,selection){mediaSelections.set(track.id,selection);if(mediaSelections.size>512){for(const id of mediaSelections.keys()){if(id!==queue[currentIndex]?.id){mediaSelections.delete(id);break;}}}}
 function selectAudioSource(track){if(track.external_preview){activeBlobUrl='';return streamUrl(track);}const key=audioCacheKey(track);activeBlobUrl=audioCache.get(key)||'';audioCache.pin(key);return activeBlobUrl||streamUrl(track);}
 
-function scheduleStateSave(){clearTimeout(stateSaveTimer);if(connectPreparing||webMediaPreparing||queue[currentIndex]?.external_preview)return;stateSaveTimer=setTimeout(()=>{if(connectPreparing||webMediaPreparing)return;const state=connectPlaybackState();api('/api/v1/playback-state',{method:'PUT',body:JSON.stringify(state)}).catch(()=>{});if(connectClient?.enabled&&!connectRemoteActive())connectClient.updateState(state).catch(()=>{});},500);}
+function scheduleStateSave(){if(androidSettingsPortal)return;clearTimeout(stateSaveTimer);if(connectPreparing||webMediaPreparing||queue[currentIndex]?.external_preview)return;stateSaveTimer=setTimeout(()=>{if(connectPreparing||webMediaPreparing)return;const state=connectPlaybackState();api('/api/v1/playback-state',{method:'PUT',body:JSON.stringify(state)}).catch(()=>{});if(connectClient?.enabled&&!connectRemoteActive())connectClient.updateState(state).catch(()=>{});},500);}
 
 async function playTrack(index,shuffleNavigation=false,playNow=true,options={}) {
+  if(androidSettingsPortal&&playNow)location.href='familymusic-settings:preview';
   if(!queue.length || index<0||index>=queue.length||connectPreparing&&!options.connect) return false;
   if(connectRemoteActive()&&!handlingConnectCommand){if(!options.restore)connectClient.transfer(connectClient.deviceId,{...connectPlaybackState(index),playing:true}).catch(error=>alert(error.message));return false;}
   currentIndex=index;
@@ -759,7 +836,7 @@ async function playTrack(index,shuffleNavigation=false,playNow=true,options={}) 
   blobFallbackTrackId='';player.src=selectAudioSource(track);audioCache.evict();
   applyWebGain();
   if(!track.external_preview){localStorage.setItem('music-track-id',track.id);localStorage.setItem('music-position',String(Number(options.position)||0));}
-  if(!options.restore&&!track.remote&&!track.external_preview)api('/api/v1/history',{method:'POST',body:JSON.stringify({track_id:track.id})}).catch(()=>{});
+  if(!androidSettingsPortal&&!options.restore&&!track.remote&&!track.external_preview)api('/api/v1/history',{method:'POST',body:JSON.stringify({track_id:track.id})}).catch(()=>{});
   scheduleStateSave();
   if(webMediaPlayIntent)safePlay(player);else{player.pause();player.load();}
   scheduleAudioPrefetch();
@@ -770,6 +847,7 @@ async function playTrack(index,shuffleNavigation=false,playNow=true,options={}) 
 }
 
 async function restorePlayer(){
+  if(androidSettingsPortal)return;
   const restoreGeneration=mediaRequestGate.generation;
   playerRestored=true;let state;try{state=await api('/api/v1/playback-state');}catch{}
   if(restoreGeneration!==mediaRequestGate.generation||connectRemoteActive())return;

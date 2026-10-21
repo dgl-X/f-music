@@ -1,3 +1,5 @@
+import { guardQueue } from './queue-guard.js';
+
 export const UPLOAD_JOB_MAX_ATTEMPTS = 5;
 
 export function uploadRetryDelaySeconds(attempts) {
@@ -47,11 +49,11 @@ export function createUploadJobService({ db, maxAttempts = UPLOAD_JOB_MAX_ATTEMP
   }
 
   async function recover() {
-    await db.transaction(async tx => {
+    return guardQueue(db,'uploads',true,() => db.transaction(async tx => {
       await tx.prepare("UPDATE processing_jobs SET status='retry',available_at=CURRENT_TIMESTAMP,started_at=NULL,finished_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE status='processing'").run();
       await tx.prepare(`INSERT INTO processing_jobs(upload_id,status)
         SELECT id,'queued' FROM uploads WHERE status='processing' ON CONFLICT(upload_id) DO NOTHING`).run();
-    });
+    }));
   }
 
   return { enqueue, claim, complete, failOrRetry, recover };

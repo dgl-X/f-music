@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { audioCodec } from './audio-compatibility.js';
 
-export function createWorkerMaintenance({db,storageDir,uploadDir,abandonedUploadHours,diagnosticReports,inspectAudio,sha256File,extractCover,normalizedTags,pid=process.pid,nodeVersion=process.version,log=console.log,logError=console.error}){
+export function createWorkerMaintenance({db,storageDir,uploadDir,abandonedUploadHours,diagnosticReports,listeningEvents,inspectAudio,sha256File,extractCover,normalizedTags,pid=process.pid,nodeVersion=process.version,log=console.log,logError=console.error}){
   const root=path.resolve(storageDir),uploads=path.resolve(uploadDir);
 
   async function heartbeat(){
@@ -60,5 +60,6 @@ export function createWorkerMaintenance({db,storageDir,uploadDir,abandonedUpload
     return tracks.length;
   }
 
-  return{heartbeat,cleanupUploads,cleanupReports,cleanupFederation,enrichTracks};
+  const cleanupListening=()=>listeningEvents?.cleanup();
+  return{heartbeat,cleanupUploads,cleanupReports,cleanupFederation,cleanupListening,enrichTracks};
 }

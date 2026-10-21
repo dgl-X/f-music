@@ -1,4 +1,4 @@
-import { hashPassword, parseCookies, randomToken, tokenHash, verifyPassword } from './security.js';
+import { DUMMY_PASSWORD_HASH, hashPassword, parseCookies, pruneLimiterEntries, randomToken, tokenHash, verifyPasswordAsync } from './security.js';
 
 export function validateInitialSetup(input = {}) {
   const username=String(input.username??'').trim(),displayName=String(input.display_name??'').trim();
@@ -41,26 +41,37 @@ export function clearSessionCookie() {
 }
 
 export class LoginAttemptLimiter {
-  constructor({ limit = 8, windowMs = 15 * 60 * 1000 } = {}) {
+  constructor({ limit = 8, windowMs = 15 * 60 * 1000, maxEntries = 10000 } = {}) {
     this.limit = limit;
     this.windowMs = windowMs;
     this.entries = new Map();
+    this.maxEntries = maxEntries;
+    this.nextSweep = 0;
   }
   blocked(key, now = Date.now()) {
+    pruneLimiterEntries(this, now);
     const entry = this.entries.get(key);
-    if (!entry || now - entry.startedAt > this.windowMs) { this.entries.delete(key); return false; }
+    if (!entry || now - entry.startedAt >= this.windowMs) { this.entries.delete(key); return !entry && this.entries.size >= this.maxEntries; }
     return entry.failures >= this.limit;
   }
   failure(key, now = Date.now()) {
+    pruneLimiterEntries(this, now);
     const entry = this.entries.get(key);
+    if (!entry && this.entries.size >= this.maxEntries) return;
     if (!entry || now - entry.startedAt > this.windowMs) this.entries.set(key, { failures: 1, startedAt: now });
     else entry.failures++;
+  }
+  take(key, now = Date.now()) {
+    if (this.blocked(key, now)) return false;
+    this.failure(key, now);
+    return true;
   }
   success(key) { this.entries.delete(key); }
 }
 
-export function createAuthenticationService({ db, sessionDays, secureCookies }) {
+export function createAuthenticationService({ db, sessionDays, secureCookies, passwordVerifier = verifyPasswordAsync, maxConcurrentLogins = 4 }) {
   const attempts = new LoginAttemptLimiter();
+  let activeLogins = 0;
   return {
     async setup(input) {
       const values=validateInitialSetup(input);if(values.error)return {status:'invalid',error:values.error};
@@ -77,20 +88,24 @@ export function createAuthenticationService({ db, sessionDays, secureCookies }) 
       return created?{status:'ok',libraryName:values.libraryName}:{status:'configured'};
     },
     async login({ username, password, deviceName, clientName, userAgent, ip }) {
-      if (attempts.blocked(ip)) return { status: 'blocked' };
-      const user = await db.prepare('SELECT * FROM users WHERE lower(username) = lower(?)').get(String(username ?? ''));
-      if (!user || !verifyPassword(String(password ?? ''), user.password_hash)) {
-        attempts.failure(ip);
-        return { status: 'invalid' };
-      }
-      attempts.success(ip);
-      const token = randomToken();
-      const expires = new Date(Date.now() + sessionDays * 86400000);
-      const normalizedDevice = String(deviceName ?? '').trim().slice(0, 120) || 'Web-браузер';
-      const normalizedClient = String(clientName ?? '').trim().slice(0, 120) || String(userAgent ?? 'Браузер').slice(0, 120);
-      await db.prepare(`INSERT INTO sessions (user_id, token_hash, expires_at, device_name, client_name, ip_address)
-        VALUES (?, ?, ?, ?, ?, ?)`).run(user.id, tokenHash(token), expires.toISOString(), normalizedDevice, normalizedClient, ip);
-      return { status: 'ok', user: { id: user.id, username: user.username, display_name: user.display_name }, cookie: sessionCookie(token, sessionDays, secureCookies) };
+      // Reserve before the first await: concurrent requests cannot bypass the limit.
+      if (activeLogins >= maxConcurrentLogins || !attempts.take(ip)) return { status: 'blocked' };
+      activeLogins++;
+      try {
+        // Older admin-created accounts could have passwords longer than 256 characters.
+        if (typeof username !== 'string' || username.length > 32 || typeof password !== 'string' || password.length > 64 * 1024) return { status:'invalid' };
+        const user = await db.prepare('SELECT * FROM users WHERE lower(username) = lower(?)').get(username);
+        const valid = await passwordVerifier(password, user?.password_hash || DUMMY_PASSWORD_HASH);
+        if (!user || !valid) return { status: 'invalid' };
+        const token = randomToken();
+        const expires = new Date(Date.now() + sessionDays * 86400000);
+        const normalizedDevice = String(deviceName ?? '').trim().slice(0, 120) || 'Web-браузер';
+        const normalizedClient = String(clientName ?? '').trim().slice(0, 120) || String(userAgent ?? 'Браузер').slice(0, 120);
+        await db.prepare(`INSERT INTO sessions (user_id, token_hash, expires_at, device_name, client_name, ip_address)
+          VALUES (?, ?, ?, ?, ?, ?)`).run(user.id, tokenHash(token), expires.toISOString(), normalizedDevice, normalizedClient, ip);
+        attempts.success(ip);
+        return { status: 'ok', user: { id: user.id, username: user.username, display_name: user.display_name }, cookie: sessionCookie(token, sessionDays, secureCookies) };
+      } finally { activeLogins--; }
     },
     async logout(cookieHeader) {
       const token = parseCookies(cookieHeader).music_session;
@@ -131,7 +146,7 @@ export function createAuthenticationService({ db, sessionDays, secureCookies }) 
     async changeOwnPassword({ userId, cookieHeader, currentPassword, newPassword }) {
       const values=validateNewPassword(newPassword);if(values.error)return {status:'invalid',error:values.error};
       const account=await db.prepare('SELECT password_hash FROM users WHERE id=?').get(userId);
-      if(!account||!verifyPassword(String(currentPassword??''),account.password_hash))return {status:'wrong_current'};
+      if(!account||!await verifyPasswordAsync(String(currentPassword??''),account.password_hash))return {status:'wrong_current'};
       const token=parseCookies(cookieHeader).music_session;
       await db.transaction(async tx=>{
         await tx.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hashPassword(values.password),userId);

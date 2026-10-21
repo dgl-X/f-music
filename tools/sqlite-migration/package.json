@@ -1,0 +1,15 @@
+{
+  "name": "family-music-legacy-sqlite-migration",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Необязательная зависимость старого переноса SQLite в PostgreSQL",
+  "scripts": {
+    "test:integration": "node smoke.mjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "11.10.0"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

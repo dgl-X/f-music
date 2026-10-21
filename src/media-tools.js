@@ -1,22 +1,18 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { runMediaProcess } from './media-process.js';
 
-export function inspectAudio(file) {
-  return new Promise(resolve => {
-    const process = spawn('ffprobe', ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', file]);
-    let output = '';
-    process.stdout.on('data', chunk => { output += chunk; });
-    process.on('close', code => {
-      if (code !== 0) return resolve(null);
-      try {
-        const parsed = JSON.parse(output);
-        resolve(parsed.format ? { ...parsed.format, streams: parsed.streams ?? [] } : null);
-      } catch { resolve(null); }
-    });
-    process.on('error', () => resolve(null));
-  });
+export async function inspectAudio(file, options = {}) {
+  const result = await runMediaProcess('ffprobe', ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', file], { timeoutMs:30000, ...options });
+  // Resource/tool failure is not proof of invalid audio: allow job retry rather
+  // than letting upload validation delete a potentially valid original.
+  if (result.error) throw Object.assign(new Error(`Не удалось проверить аудио: ${result.error}`), { code:`media_${result.error}` });
+  if (result.code !== 0) return null;
+  try {
+    const parsed = JSON.parse(result.stdout);
+    return parsed.format ? { ...parsed.format, streams:parsed.streams ?? [] } : null;
+  } catch { return null; }
 }
 
 export function sha256File(file) {
@@ -29,12 +25,8 @@ export function sha256File(file) {
   });
 }
 
-export function runProcess(command, args) {
-  return new Promise(resolve => {
-    const process = spawn(command, args, { stdio: 'ignore' });
-    process.on('close', code => resolve(code === 0));
-    process.on('error', () => resolve(false));
-  });
+export async function runProcess(command, args, options) {
+  return (await runMediaProcess(command, args, options)).code === 0;
 }
 
 export function createCoverExtractor({ coverDir, storageDir, execute = runProcess }) {

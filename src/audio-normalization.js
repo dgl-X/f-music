@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
-import { spawn } from 'node:child_process';
+import { captureMediaOutput } from './media-process.js';
 
 export function hybridFlacMediaOffset(filename) {
   const descriptor = fs.openSync(filename, 'r');
@@ -26,13 +26,7 @@ export function hybridFlacMediaOffset(filename) {
   }
 }
 
-function run(command, args) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: 'ignore' });
-    child.once('error', reject);
-    child.once('close', code => code === 0 ? resolve() : reject(new Error(`${command} завершился с кодом ${code}`)));
-  });
-}
+const run = captureMediaOutput;
 
 export async function normalizeHybridFlac(filename) {
   const offset = hybridFlacMediaOffset(filename);

@@ -1,6 +1,9 @@
+import { guardQueue } from './queue-guard.js';
+
 export function createUploadWorker({ db, uploadJobs, uploadProcessor, startOperation, logError = console.error }) {
   let busy = false;
-  async function processNext() {
+  const processNext = () => guardQueue(db,'uploads',false,processNextUnlocked);
+  async function processNextUnlocked() {
     if (busy) return false;
     busy = true;
     let finish; let succeeded = false;

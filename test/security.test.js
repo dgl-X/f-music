@@ -1,6 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { acquireCounter, hashPassword, parseContentRange, releaseCounter, verifyPassword } from '../src/security.js';
+import { acquireCounter, DUMMY_PASSWORD_HASH, hashPassword, parseContentRange, releaseCounter, verifyPassword, verifyPasswordAsync } from '../src/security.js';
+
+test('asynchronous password verification keeps existing hashes compatible', async () => {
+  const hash = hashPassword('very-long-password');
+  assert.equal(await verifyPasswordAsync('very-long-password', hash), true);
+  assert.equal(await verifyPasswordAsync('wrong-password', hash), false);
+  assert.equal(await verifyPasswordAsync('wrong-password', DUMMY_PASSWORD_HASH), false);
+  assert.equal(await verifyPasswordAsync('anything', 'scrypt$bad$bad'), false);
+  assert.equal(await verifyPasswordAsync('anything', null), false);
+});
 
 test('password hashes verify safely', () => {
   const hash = hashPassword('very-long-password');

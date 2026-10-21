@@ -50,3 +50,28 @@ test('admin cannot reset own password through another user route', async () => {
   await controller.handle({ method:'PUT' }, {}, new URL('https://music.test/api/users/7/password'), { id:7, is_admin:1 });
   assert.deepEqual(responses[0], { status:400, value:{ error:'Свой пароль меняется через профиль' }, extra:{} });
 });
+
+test('account listing and creation reject ordinary users before touching the database',async()=>{
+  const {controller,responses}=harness();
+  for(const method of ['GET','POST'])await controller.handle({method},{},new URL('https://music.test/api/users'),{id:2,is_admin:0});
+  assert.deepEqual(responses.map(response=>response.status),[403,403]);
+});
+
+test('admin reset delegates only the target and new password and returns no credential',async()=>{
+  let received;
+  const {controller,responses}=harness({body:{new_password:'synthetic-password'},authentication:{async resetUserPassword(value){received=value;return{status:'ok'};}}});
+  await controller.handle({method:'PUT'},{},new URL('https://music.test/api/users/2/password'),{id:1,is_admin:1});
+  assert.deepEqual(received,{targetId:2,newPassword:'synthetic-password'});
+  assert.deepEqual(responses[0],{status:200,value:{ok:true},extra:{}});
+});
+
+test('password reset maps missing users and invalid passwords and denies non-admin writes',async()=>{
+  for(const [status,expected] of [['not_found',404],['invalid',400]]){
+    const {controller,responses}=harness({authentication:{async resetUserPassword(){return{status,error:'Invalid password'};}}});
+    await controller.handle({method:'PUT'},{},new URL('https://music.test/api/users/2/password'),{id:1,is_admin:1});
+    assert.equal(responses[0].status,expected);
+  }
+  const {controller,responses}=harness();
+  await controller.handle({method:'PUT'},{},new URL('https://music.test/api/users/2/password'),{id:3,is_admin:0});
+  assert.equal(responses[0].status,403);
+});

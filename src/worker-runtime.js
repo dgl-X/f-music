@@ -5,6 +5,7 @@ export function createWorkerRuntime({
   setIntervalFn = setInterval, clearIntervalFn = clearInterval, logError = console.error,
 }) {
   const timers = [];
+  let recovering = false;
   const guarded = (label, task) => () => Promise.resolve().then(task).catch(error => logError(label, error));
   const schedule = (label, task, interval, immediate = true) => {
     const run = guarded(label, task);
@@ -41,11 +42,21 @@ export function createWorkerRuntime({
     schedule('Ошибка worker реплик:', federationImport.processNext, 2000, false);
     schedule('Ошибка очистки загрузок:', maintenance.cleanupUploads, Math.max(1, config.uploadCleanupMinutes) * 60000);
     schedule('Ошибка ротации отчётов:', maintenance.cleanupReports, 6 * 60 * 60 * 1000);
+    if(maintenance.cleanupListening)schedule('Ошибка очистки сеансов прослушивания:',maintenance.cleanupListening,6*60*60*1000);
     schedule('Ошибка очистки федерации:', maintenance.cleanupFederation, 6 * 60 * 60 * 1000);
     schedule('Ошибка federation sync:', syncFederationCatalogs, 5000);
     schedule('Ошибка federation notify:', notifyFederationPeers, 5000);
     schedule('Ошибка federation health:', checkFederationPeers, 15000);
     guarded('Ошибка фоновой индексации:', maintenance.enrichTracks)();
+    schedule('Ошибка периодического восстановления:', async()=>{
+      if(recovering)return;
+      recovering=true;
+      try {
+        const results=await Promise.allSettled([uploadJobs.recover(),transcoding.recover(),recognition.recover(),loudness.recover(),federationImport.recover({legacy:false})]);
+        for(const result of results)if(result.status==='rejected')logError('Ошибка восстановления очереди:',result.reason);
+      }
+      finally { recovering=false; }
+    },60000,false);
   }
 
   function stop() {

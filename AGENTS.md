@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-The Node.js 24 server lives in `src/`; `src/server.js` wires together focused services such as authentication, catalog, uploads, federation, and observability. Browser assets are plain HTML, CSS, and JavaScript under `public/`. Tests are in `test/` and generally mirror service names. Operational tooling belongs in `scripts/`, Debian packaging in `packaging/`, and monitoring/deployment examples in `deploy/`. Federation schemas, compatibility fixtures, and signature vectors are under `federation/`. The Android client is maintained in `android/`, with Java sources in `android/app/src/main` and unit tests in `android/app/src/test`.
+The Node.js 24 server lives in `src/`; `src/server.js` wires together authentication, catalog, uploads, federation, and observability. Browser assets are under `public/`, tests under `test/`, operational tooling under `scripts/`, Debian packaging under `packaging/`, and deployment examples under `deploy/`. Federation schemas and fixtures are under `federation/`. Android is maintained separately in the `dgl-X/f-music-android` repository.
 
 Do not commit generated content from `builds/`, `dist/`, `android/build/`, `android/builds/`, media storage, or dependency caches.
 
@@ -15,9 +15,9 @@ Do not commit generated content from `builds/`, `dist/`, `android/build/`, `andr
 - `npm run test:media:integration` exercises upload, Range, and media processing.
 - `npm run test:federation:two-node` verifies the two-node federation flow.
 - `./packaging/build-deb.sh` builds the Debian package.
-- `cd android && ./gradlew --no-daemon testDebugUnitTest assembleDebug` tests and builds Android.
+- `npm run test:worker:integration` checks queue coordination using a dedicated PostgreSQL database.
 
-Server development requires PostgreSQL and FFmpeg/ffprobe. Android requires JDK 17 and Android SDK 36.
+Server development requires PostgreSQL and FFmpeg/ffprobe.
 
 ## Coding Style & Naming Conventions
 

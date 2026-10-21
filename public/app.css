@@ -320,3 +320,20 @@ dialog::backdrop { background:#0009; backdrop-filter:blur(4px); }
 .route-not-found strong{font-size:72px;line-height:1;color:#ff4d73}
 .route-not-found h2{margin:0;color:#fff;font-size:28px}
 .route-not-found p{margin:0 0 12px;max-width:80%;overflow-wrap:anywhere}
+
+/* In-app administration is a settings surface, never another Connect player. */
+.android-settings-portal .shell{padding:8px 0 20px;max-width:none}
+.android-settings-portal .shell>header,
+.android-settings-portal .catalog-tabs,
+.android-settings-portal .hero,
+.android-settings-portal .catalog-tools,
+.android-settings-portal .active-filter,
+.android-settings-portal .player-bar,
+.android-settings-portal .queue-panel{display:none!important}
+.android-settings-portal .library-layout{display:block}
+.android-settings-portal .player-bar.active{display:grid!important}
+.android-settings-portal [data-section="library"],
+.android-settings-portal [data-section="statistics"],
+.android-settings-portal [data-section="usage"],
+.android-settings-portal [data-section="registration"]{display:none}
+.android-settings-portal dialog{max-width:100%;width:100%;max-height:95dvh;box-sizing:border-box}

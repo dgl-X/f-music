@@ -40,7 +40,8 @@ export function federationAddressClass(address) {
     if (inV4(address, '10.0.0.0', 8) || inV4(address, '172.16.0.0', 12) || inV4(address, '192.168.0.0', 16)) return 'private';
     if (inV4(address, '0.0.0.0', 8) || inV4(address, '100.64.0.0', 10) || inV4(address, '192.0.0.0', 24) ||
       inV4(address, '192.0.2.0', 24) || inV4(address, '198.18.0.0', 15) || inV4(address, '198.51.100.0', 24) ||
-      inV4(address, '203.0.113.0', 24) || inV4(address, '224.0.0.0', 4)) return 'reserved';
+      inV4(address, '203.0.113.0', 24) || inV4(address, '192.88.99.0', 24) ||
+      inV4(address, '224.0.0.0', 4) || inV4(address, '240.0.0.0', 4)) return 'reserved';
     return 'public';
   }
   if (net.isIP(address) === 6) {
@@ -52,13 +53,18 @@ export function federationAddressClass(address) {
     }
     if ((groups[0] & 0xffc0) === 0xfe80) return 'link-local';
     if ((groups[0] & 0xfe00) === 0xfc00) return 'private';
-    if ((groups[0] & 0xff00) === 0xff00 || groups[0] === 0x2001 && groups[1] === 0x0db8) return 'reserved';
+    // Conservative native-unicast policy: no NAT64, compatible IPv4, 6to4,
+    // Teredo or special IETF allocations. This is not a general routing library.
+    if ((groups[0] & 0xe000) !== 0x2000 ||
+      groups[0] === 0x2001 && (groups[1] < 0x0200 || groups[1] === 0x0db8) ||
+      groups[0] === 0x2002 || groups[0] === 0x3fff && (groups[1] & 0xf000) === 0) return 'reserved';
     return 'public';
   }
   return 'invalid';
 }
 
 export async function resolveFederationEndpoint(value, scope, resolver = dns.lookup) {
+  if (!['public','private'].includes(scope)) throw Object.assign(new Error('Неизвестная область endpoint'), { code:'invalid_endpoint_scope' });
   let url;
   try { url = new URL(String(value || '').trim()); } catch { throw Object.assign(new Error('Некорректный адрес ноды'), { code: 'invalid_endpoint' }); }
   if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || !['', '/'].includes(url.pathname)) {

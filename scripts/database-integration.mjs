@@ -1,0 +1,41 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import pg from 'pg';
+import {openDatabase} from '../src/db.js';
+
+const url=process.env.DATABASE_TEST_URL;
+if(!url)throw new Error('DATABASE_TEST_URL must point to a separate empty test database');
+const admin=new pg.Client({connectionString:url});
+const opened=[];
+const baseline=process.env.DATABASE_TEST_BASELINE||'0.1.36';
+assert.ok(['empty','0.1.36'].includes(baseline),'Unknown schema baseline');
+try{
+  await admin.connect();
+  const name=(await admin.query('SELECT current_database() AS name')).rows[0].name;
+  assert.match(name,/^fm_schema_test_[a-z0-9_]+$/,'Refusing a database outside the dedicated test namespace');
+  assert.equal((await admin.query("SELECT to_regclass('public.users') AS value")).rows[0].value,null,'Refusing an existing application database');
+  if(baseline==='empty')await Promise.all([1,2].map(async()=>opened.push(await openDatabase(url))));
+  else await admin.query(fs.readFileSync(new URL('../test/fixtures/db-v0.1.36.sql',import.meta.url),'utf8'));
+  const track='11111111-1111-4111-8111-111111111111',playback='22222222-2222-4222-8222-222222222222';
+  await admin.query("INSERT INTO users(username,display_name,password_hash) VALUES('schema-test','Schema test','synthetic-not-a-login')");
+  await admin.query("INSERT INTO tracks(id,owner_id,title,filename,mime_type,size_bytes,storage_key,sha256) VALUES($1,1,'Fixture','fixture.mp3','audio/mpeg',1,'originals/fixture.mp3','fixture-checksum')",[track]);
+  await admin.query('INSERT INTO play_history(user_id,track_id,play_count) VALUES(1,$1,7)',[track]);
+  await admin.query("INSERT INTO listening_preferences(user_id,enabled,generation,started_at) VALUES(1,TRUE,3,CURRENT_TIMESTAMP-INTERVAL '2 days')");
+  await admin.query("INSERT INTO listening_sessions(user_id,playback_id,auth_session_id,generation,track_id,client_type,threshold_ms,elapsed_ms,started_at) VALUES(1,$1,1,3,$2,'android',30000,20000,CURRENT_TIMESTAMP-INTERVAL '2 days')",[playback,track]);
+  await Promise.all([1,2].map(async()=>opened.push(await openDatabase(url))));
+  opened.push(await openDatabase(url));
+  const db=opened[0];
+  const tables=(await db.prepare("SELECT tablename FROM pg_tables WHERE schemaname='public'").all()).map(row=>row.tablename);
+  for(const table of ['users','sessions','uploads','tracks','albums','processing_jobs','recognition_jobs','track_sources','track_likes','playlists','playlist_tracks','play_history','playback_state','connect_devices','connect_state','connect_commands','operation_metrics','federation_nonces','federation_invitations','federation_peers','federation_export_collections','federation_export_collection_tracks','federation_peer_export_rules','federation_catalog_events','federation_remote_tracks','federation_remote_likes','federation_remote_replicas','federation_playlist_tracks','listening_preferences','listening_sessions','listening_daily'])assert.ok(tables.includes(table),table);
+  const row=await db.prepare('SELECT started_at,received_at,elapsed_ms FROM listening_sessions').get();
+  if(baseline==='0.1.36')assert.equal(new Date(row.received_at).getTime(),new Date(row.started_at).getTime());
+  else assert.ok(new Date(row.received_at).getTime()>new Date(row.started_at).getTime());
+  assert.equal(Number(row.elapsed_ms),20000);
+  assert.equal(Number((await db.prepare('SELECT play_count FROM play_history').get()).play_count),7);
+  const indexes=(await db.prepare("SELECT indexname FROM pg_indexes WHERE schemaname='public'").all()).map(row=>row.indexname);
+  for(const index of ['tracks_sha256_unique','listening_sessions_user_received','processing_jobs_queue','recognition_jobs_queue'])assert.ok(indexes.includes(index),index);
+  await assert.rejects(()=>db.prepare("INSERT INTO tracks(id,owner_id,title,filename,mime_type,size_bytes,storage_key,sha256) VALUES('33333333-3333-4333-8333-333333333333',1,'Duplicate','duplicate.mp3','audio/mpeg',1,'originals/duplicate.mp3','fixture-checksum')").run(),error=>error.code==='23505');
+  await assert.rejects(()=>db.transaction(async tx=>{await tx.prepare("UPDATE users SET display_name='Must roll back' WHERE id=1").run();throw new Error('rollback-fixture');}),/rollback-fixture/);
+  assert.equal((await db.prepare('SELECT display_name FROM users WHERE id=1').get()).display_name,'Schema test');
+  console.log(`PostgreSQL baseline=${baseline}: concurrent/repeated startup, retained data, indexes, uniqueness and rollback OK`);
+}finally{await Promise.all(opened.map(db=>db.close()));await admin.end();}

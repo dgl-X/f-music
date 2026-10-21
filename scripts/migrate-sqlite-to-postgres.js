@@ -1,5 +1,5 @@
 import path from 'node:path';
-import Database from 'better-sqlite3';
+import {loadLegacySqlite} from './sqlite-migration-loader.mjs';
 import pg from 'pg';
 import { schemaSql } from '../src/db.js';
 
@@ -7,6 +7,7 @@ const sqlitePath = path.resolve(process.argv[2] ?? 'data/music.db');
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) throw new Error('DATABASE_URL is required');
 
+const Database = loadLegacySqlite();
 const sqlite = new Database(sqlitePath, { readonly: true });
 const pool = new pg.Pool({ connectionString: databaseUrl });
 const tables = ['users', 'tracks', 'track_sources', 'track_likes', 'playlists', 'playlist_tracks', 'play_history', 'playback_state', 'uploads', 'sessions'];

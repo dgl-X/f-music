@@ -1,16 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { captureMediaOutput } from './media-process.js';
+import { guardQueue } from './queue-guard.js';
 
-function captureProcessOutput(command, args) {
-  return new Promise((resolve, reject) => {
-    const process = spawn(command, args); let output = '';
-    process.stdout.on('data', chunk => { output += chunk; });
-    process.stderr.on('data', chunk => { output += chunk; });
-    process.on('close', code => code === 0 ? resolve(output) : reject(new Error(output.trim() || `${command}: код ${code}`)));
-    process.on('error', reject);
-  });
-}
+const captureProcessOutput = captureMediaOutput;
 
 export function parseLoudness(output) {
   const blocks = [...String(output).matchAll(/\{[\s\S]*?"input_i"[\s\S]*?\}/g)];
@@ -31,7 +24,8 @@ export function createLoudnessService({ db, storageDir, execute = captureProcess
     return file.startsWith(`${storageRoot}${path.sep}`) && fs.existsSync(file) && fs.statSync(file).isFile() ? file : null;
   };
 
-  async function processNext() {
+  const processNext=()=>guardQueue(db,'loudness',false,processNextUnlocked);
+  async function processNextUnlocked() {
     if (active >= concurrency) return false;
     active++; let job, finish; let succeeded = false;
     try {
@@ -62,7 +56,7 @@ export function createLoudnessService({ db, storageDir, execute = captureProcess
   }
 
   async function recover() {
-    await db.prepare("UPDATE loudness_jobs SET status='retry',available_at=CURRENT_TIMESTAMP WHERE status='processing'").run();
+    await guardQueue(db,'loudness',true,()=>db.prepare("UPDATE loudness_jobs SET status='retry',available_at=CURRENT_TIMESTAMP WHERE status='processing'").run());
     pump();
   }
 

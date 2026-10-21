@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      release_version:
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -30,21 +36,90 @@ jobs:
       - name: Установить зависимости
         run: npm ci
       - name: Проверить синтаксис
-        run: find src scripts test -type f -name '*.js' -print0 | xargs -0 -n1 node --check
+        run: npm run check:syntax
       - name: Проверить личные данные и секреты
         run: |
           node scripts/check-repository-secrets.mjs
           node scripts/check-git-history-secrets.mjs
       - name: Запустить тесты
         run: npm test
-      - name: Проверить совместимость с сервером v0.1.1
+      - name: Проверить совместимость протокола и схем с baseline v0.1.1
         run: npm run test:federation:baseline
       - name: Проверить зависимости
         run: npm audit --audit-level=high
-      - name: Собрать DEB-пакет
-        run: ./packaging/build-deb.sh "0.1.0-${GITHUB_RUN_NUMBER}" amd64
-      - name: Проверить DEB-пакет
-        run: dpkg-deb --info dist/family-music-server_*.deb
+
+  package-install:
+    needs: test
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Получить исходный код
+        uses: actions/checkout@v5
+      - name: Установить Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - name: Установить зависимости
+        run: npm ci
+      - name: Выбрать версию проверяемого пакета
+        env:
+          FM_RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          version="$FM_RELEASE_VERSION"
+          if [ -z "$version" ]; then
+            version="$(node -p 'require("./package.json").version')-ci.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "FM_CANDIDATE_VERSION=$version" >> "$GITHUB_ENV"
+      - name: Собрать кандидат один раз
+        run: |
+          ./packaging/build-deb.sh "$FM_CANDIDATE_VERSION" amd64
+          cd dist
+          sha256sum family-music-server_*.deb > SHA256SUMS
+      - name: Скачать закреплённый предыдущий DEB
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/package-baseline"
+          gh release download v0.1.35 --repo "$GITHUB_REPOSITORY" \
+            --pattern family-music-server_0.1.35_amd64.deb --pattern SHA256SUMS \
+            --dir "$RUNNER_TEMP/package-baseline"
+          cd "$RUNNER_TEMP/package-baseline"
+          sha256sum -c SHA256SUMS
+      - name: Проверить установку, обновление, данные и восстановление
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes postgresql
+          # Hosted runners can contain an existing PostgreSQL cluster with manual startup.
+          # Starting the umbrella service alone does not start such a cluster.
+          pg_lsclusters
+          while read -r version cluster port rest; do
+            if [ "$port" = 5432 ]; then
+              if ! sudo pg_ctlcluster "$version" "$cluster" status; then
+                sudo pg_ctlcluster "$version" "$cluster" start
+              fi
+            fi
+          done < <(pg_lsclusters --no-header)
+          sudo -u postgres pg_isready -q -h /var/run/postgresql -p 5432
+          sudo env FM_PACKAGE_SMOKE_ALLOW_SYSTEM_CHANGES=disposable bash scripts/ci-deb-smoke.sh \
+            "$RUNNER_TEMP/package-baseline/family-music-server_0.1.35_amd64.deb" \
+            "$PWD/dist/family-music-server_${FM_CANDIDATE_VERSION}_amd64.deb"
+      - name: Сохранить проверенный пакет в черновик Release
+        if: inputs.release_version != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FM_RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          tag="v$FM_RELEASE_VERSION"
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --draft --generate-notes --title "Family Music Server $tag"
+          fi
+          test "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" \
+            "dist/family-music-server_${FM_RELEASE_VERSION}_amd64.deb" dist/SHA256SUMS --clobber
 
   federation-two-node:
     runs-on: ubuntu-latest
@@ -153,5 +228,25 @@ jobs:
           cache: npm
       - name: Установить зависимости
         run: npm ci
+      - name: Проверить обновление схемы и сохранность данных
+        env:
+          DATABASE_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/fm_schema_test_ci
+        run: |
+          node --input-type=module -e 'import pg from "pg";const client=new pg.Client({connectionString:process.env.CONNECT_TEST_DATABASE_URL});await client.connect();await client.query("CREATE DATABASE fm_schema_test_ci");await client.end();'
+          npm run test:db:integration
+          node --input-type=module -e 'import pg from "pg";const client=new pg.Client({connectionString:process.env.CONNECT_TEST_DATABASE_URL});await client.connect();await client.query("CREATE DATABASE fm_schema_test_fresh_ci");await client.end();'
+          DATABASE_TEST_URL=postgresql://postgres:postgres@127.0.0.1:5432/fm_schema_test_fresh_ci DATABASE_TEST_BASELINE=empty npm run test:db:integration
       - name: Проверить гонки Family Music Connect
         run: npm run test:connect:integration
+      - name: Проверить параллельные worker и восстановление после SIGKILL
+        env:
+          WORKER_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/fm_worker_test_ci
+        run: |
+          node --input-type=module -e 'import pg from "pg";const client=new pg.Client({connectionString:process.env.CONNECT_TEST_DATABASE_URL});await client.connect();await client.query("CREATE DATABASE fm_worker_test_ci");await client.end();'
+          npm run test:worker:integration
+      - name: Проверить статистику и изоляцию аккаунтов
+        env:
+          STATISTICS_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/family_music_statistics_test
+        run: |
+          node --input-type=module -e 'import pg from "pg";const client=new pg.Client({connectionString:process.env.CONNECT_TEST_DATABASE_URL});await client.connect();await client.query("CREATE DATABASE family_music_statistics_test");await client.end();'
+          npm run test:statistics:integration

@@ -1,6 +1,6 @@
 {
   "name": "family-music",
-  "version": "0.1.35",
+  "version": "0.1.39",
   "private": true,
   "license": "AGPL-3.0-only",
   "type": "module",
@@ -8,22 +8,28 @@
     "start": "node src/server.js",
     "worker": "node src/server.js --worker",
     "test": "node --test --test-concurrency=1",
+    "check:syntax": "node scripts/check-syntax.mjs",
+    "test:db:integration": "node scripts/database-integration.mjs",
     "test:media:integration": "node scripts/media-integration-ci.mjs",
+    "test:worker:integration": "node scripts/worker-coordination-integration.mjs",
     "test:media:import": "node scripts/media-import-integration.mjs",
     "test:federation:two-node": "node scripts/federation-two-node-ci.mjs",
     "test:federation:baseline": "node scripts/check-federation-baseline.mjs",
     "test:federation:reconnect": "node scripts/federation-reconnect-smoke.mjs",
     "test:connect:smoke": "node scripts/connect-smoke.mjs",
     "test:connect:integration": "node --experimental-eventsource scripts/connect-integration-ci.mjs",
+    "test:statistics:integration": "node scripts/listening-statistics-integration.mjs",
     "import:openvk:dry": "node scripts/import-openvk.js --dry-run",
     "import:openvk": "node scripts/import-openvk.js --skip-export",
     "migrate:postgres": "node scripts/migrate-sqlite-to-postgres.js"
   },
   "dependencies": {
-    "better-sqlite3": "^11.10.0",
     "pg": "^8.16.3"
   },
   "engines": {
     "node": ">=24"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "6.2.5"
   }
 }

@@ -34,6 +34,10 @@ import { createOperationMetrics } from './operation-metrics.js';
 import { createOpenVkProvider } from './openvk-provider.js';
 import { createOpenVkHttpController } from './openvk-http.js';
 import { createAdminObservabilityService } from './admin-observability.js';
+import { createListeningStatistics } from './listening-statistics.js';
+import { createListeningEvents } from './listening-events.js';
+import { createMeasuredStatistics } from './measured-statistics.js';
+import { createListeningStatisticsHttp } from './listening-statistics-http.js';
 import { createDiagnosticReportsHttpController, createDiagnosticReportsService } from './diagnostic-reports.js';
 import { createLoudnessHttpController, createLoudnessService } from './loudness-service.js';
 import { createRecognitionService } from './recognition-service.js';
@@ -57,7 +61,7 @@ import { createArtistAlbumHttpController } from './artist-album-http.js';
 import { createPlaybackHttpController } from './playback-http.js';
 import { createTrackManagementHttpController } from './track-management-http.js';
 import { createStreamingHttpController } from './streaming-http.js';
-import { createStaticFileHandler, createUserAccess, readBytes, readJson, setBrowserSecurityHeaders } from './http-runtime.js';
+import { createStaticFileHandler, createUserAccess, parseRequestUrl, readBytes, readJson, setBrowserSecurityHeaders } from './http-runtime.js';
 import { createFederationCatalogEvents } from './federation-catalog-events.js';
 import { createUploadWorker } from './upload-worker.js';
 import { createWorkerRuntime } from './worker-runtime.js';
@@ -130,6 +134,9 @@ const userAccess = createUserAccess({
 const staticFile = createStaticFileHandler(publicDir);
 const federationCatalogEvents = createFederationCatalogEvents({ db, federationTrackVisible });
 const connectHttp = createConnectHttpController({ connect, readJson, sendJson, events:connectEvents });
+const listeningEvents=createListeningEvents({db,connectEnabled:config.connectEnabled});
+const listeningStatisticsHttp=createListeningStatisticsHttp({statistics:createListeningStatistics({db}),
+  events:listeningEvents,measured:createMeasuredStatistics({db,events:listeningEvents}),readJson,sendJson});
 const accountHttp = createAccountHttpController({ db, authentication, registrationEnabled, readJson, sendJson });
 const authenticationHttp = createAuthenticationHttpController({ db, authentication, registrationEnabled, readJson, sendJson });
 const uploadHttp = createUploadHttpController({ uploads, readJson, sendJson });
@@ -172,7 +179,7 @@ const recognitionHttp = createRecognitionHttpController({ db, recognition, readJ
 const transcoding = createTranscodeService({ db, storageDir:config.storageDir, execute:runProcess, startOperation:operationMetrics.start });
 const maintenance = createWorkerMaintenance({
   db,storageDir:config.storageDir,uploadDir,abandonedUploadHours:config.abandonedUploadHours,
-  diagnosticReports,inspectAudio,sha256File,extractCover,normalizedTags,
+  diagnosticReports,listeningEvents,inspectAudio,sha256File,extractCover,normalizedTags,
 });
 const federationImport = createFederationImportService({
   db,
@@ -339,6 +346,7 @@ async function api(req, res, url, apiPrefix = '/api') {
   if (await connectHttp.handle(req, res, url, user)) return;
   if (await accountHttp.handle(req, res, url, user)) return;
   if (await operationalHttp.handleAdmin(req, res, url, user)) return;
+  if (await listeningStatisticsHttp.handle(req,res,url,user)) return;
   if (await openVkHttp.handle(req,res,url,user)) return;
   if (await diagnosticReportsHttp.handle(req,res,url,user)) return;
   if (await loudnessHttp.handle(req,res,url,user)) return;
@@ -357,10 +365,11 @@ async function api(req, res, url, apiPrefix = '/api') {
 }
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  setBrowserSecurityHeaders(req, res);
-  observeHttp(req, res, url);
+  let url;
   try {
+    url = parseRequestUrl(req);
+    setBrowserSecurityHeaders(req, res);
+    observeHttp(req, res, url);
     if (await inboundFederationHttp.handle(req, res, url)) return;
     if (await federationMedia.serveCover(req, res, url)) return;
     if (await federationMedia.serveAudio(req, res, url)) return;
@@ -377,7 +386,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (!staticFile(res, url.pathname)) staticFile(res, '/');
   } catch (error) {
-    console.error(JSON.stringify({ time:new Date().toISOString(), level:'error', event:'request_error', request_id:req.requestId, method:req.method, path:url.pathname, error_code:error.code || 'internal_error', message:String(error.message || error).slice(0,1000) }));
+    console.error(JSON.stringify({ time:new Date().toISOString(), level:'error', event:'request_error', request_id:req.requestId, method:req.method, path:url?.pathname || '', error_code:error.code || 'internal_error', message:String(error.message || error).slice(0,1000) }));
     if (!res.headersSent) sendJson(res, error.status ?? 500, { error: error.status ? error.message : 'Внутренняя ошибка сервера' });
     else res.destroy();
   }

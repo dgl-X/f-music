@@ -57,6 +57,23 @@ function httpSetup(reports) {
   return {controller,responses};
 }
 
+test('report status changes and deletion deny ordinary users before service access',async()=>{
+  const {controller,responses}=httpSetup({});
+  for(const method of ['PATCH','DELETE'])await controller.handle({method,body:{status:'fixed'}},{},new URL('http://local/api/admin/reports/3'),{id:2,is_admin:0});
+  assert.deepEqual(responses.map(row=>row.status),[403,403]);
+});
+
+test('report status and deletion responses preserve IDs and missing-report errors',async()=>{
+  const calls=[];
+  const {controller,responses}=httpSetup({async setStatus(id,status){calls.push([id,status]);return id!==99;},async remove(id){calls.push([id,'delete']);return id!==99;}});
+  for(const id of [3,99]){
+    await controller.handle({method:'PATCH',body:{status:'viewed'}},{},new URL('http://local/api/admin/reports/'+id),{id:1,is_admin:1});
+    await controller.handle({method:'DELETE'},{},new URL('http://local/api/admin/reports/'+id),{id:1,is_admin:1});
+  }
+  assert.deepEqual(calls,[[3,'viewed'],[3,'delete'],[99,'viewed'],[99,'delete']]);
+  assert.deepEqual(responses.map(row=>row.status),[200,200,404,404]);assert.deepEqual(responses[0].value,{ok:true,status:'viewed'});
+});
+
 test('diagnostic report HTTP routes keep submission available and administration protected', async () => {
   const reports={
     async create({userId}){assert.equal(userId,8);return{id:3,created_at:'now'};},

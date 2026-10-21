@@ -1,6 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+export function parseRequestUrl(req) {
+  try { return new URL(req.url, `http://${req.headers.host || 'localhost'}`); }
+  catch { throw Object.assign(new Error('Некорректный адрес запроса'), { status:400 }); }
+}
+
 export async function readJson(req, limit = 64 * 1024) {
   const data = await readBytesInternal(req, limit, 'Слишком большой запрос', true);
   try { return JSON.parse(data.toString('utf8') || '{}'); }

@@ -7,10 +7,11 @@ import { AudioMemoryCache } from '../public/audio-cache.js';
 import { remotePlaybackActive } from '../public/connect-client.js';
 import { connectStatusLabel } from '../public/connect-status.js';
 import { PlaybackRequestGate, mediaPlaybackLabel } from '../public/media-playback-client.js';
+import { settingsPortalMode, settingsPortalView } from '../public/settings-portal.js';
 
 // Exercise the real app orchestration with a minimal audio element, without
 // bootstrapping authentication or claiming a full browser/device field test.
-function fixture(){
+function fixture({portal=false}={}){
   const nodes=new Map(),plays=[],assigned=[];
   const player={paused:true,duration:200,currentTime:0,readyState:0,listeners:[],
     pause(){this.paused=true;},load(){this.readyState=0;},
@@ -25,16 +26,20 @@ function fixture(){
     return nodes.get(id);
   };
   const code=fs.readFileSync(new URL('../public/app.js',import.meta.url),'utf8').replace(/^import .*;\n/gm,'');
-  const context=vm.createContext({document:{querySelector:node,querySelectorAll:()=>[]},window:{addEventListener(){}},navigator:{},localStorage:{getItem(){return null;},setItem(){}},URL,AbortController,setTimeout,clearTimeout,setInterval,clearInterval,console,
+  const context=vm.createContext({document:{body:{classList:{add(){}}},querySelector:node,querySelectorAll:()=>[]},location:{search:portal?'?android_settings=1':''},settingsPortalMode,settingsPortalView,window:{addEventListener(){}},navigator:{},localStorage:{getItem(){return null;},setItem(){}},URL,AbortController,setTimeout,clearTimeout,setInterval,clearInterval,console,
     ShuffleNavigator,AudioMemoryCache,PlaybackRequestGate,remotePlaybackActive,connectStatusLabel,mediaPlaybackLabel,
     fetch:async()=>({ok:true,status:200,json:async()=>({})}),
   });
   vm.runInContext(code.slice(0,code.lastIndexOf('\nstart().catch'))+`
+    const originalScheduleStateSave=scheduleStateSave;
     cancelAudioPrefetch=()=>{};scheduleAudioPrefetch=()=>{};scheduleStateSave=()=>{};
     applyWebGain=()=>{};renderQueue=()=>{};updatePlayingState=()=>{};updateMediaSession=()=>{};renderConnectRemoteState=()=>{};
     globalThis.harness={
       configure(tracks,resolve,rejectCodec=()=>false){queue=tracks;mediaPlaybackClient={resolve,rejectCodec};},
       play:playTrack,toggle:toggleLocalPlayback,
+      async settingsIsolation(){await setupConnect();setupListeningTracker();await restorePlayer();return{connectClient,listeningTracker,playerRestored};},
+      settingsSave(){originalScheduleStateSave();return stateSaveTimer;},
+      settingsSectionBlocked(section){syncBrowserRoute=()=>{};openSettingsSection(section);return settingsSection;},
       sourceError(){return tryCompatibleSource(queue[currentIndex],document.querySelector('#player'));},
       remote(){connectClient={enabled:true,deviceId:'web'};applyConnectState({active_device_id:'remote',playing:true,track_id:''});},
       state(){return{queue,currentIndex,preparing:webMediaPreparing};}
@@ -42,6 +47,12 @@ function fixture(){
   `,context);
   return{...context.harness,player,plays,assigned,nodes};
 }
+test('real WEB orchestration in Android settings never creates a Connect client or listening collector',async()=>{
+  const h=fixture({portal:true}),result=await h.settingsIsolation();
+  assert.equal(result.connectClient,null);assert.equal(result.listeningTracker,null);assert.equal(result.playerRestored,false);assert.equal(h.plays.length,0);
+  assert.equal(h.settingsSave(),undefined);
+  for(const section of ['duplicates','federation','recognition-queue'])assert.equal(h.settingsSectionBlocked(section),'');
+});
 const tracks=[{id:'first',title:'First'},{id:'second',title:'Second'}];
 const ready=track=>({variant:'original',cache_key:track.id+':original',stream_url:'/api/v1/tracks/'+track.id+'/stream?quality=original&variant=original'});
 

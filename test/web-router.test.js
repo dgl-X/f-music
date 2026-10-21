@@ -27,6 +27,9 @@ test('root remains compatible and unknown paths are distinguishable', () => {
 });
 
 test('settings sections and internal 404 survive a refresh', () => {
+  assert.equal(parseWebRoute('/settings/listening').settingsSection,'listening');
+  assert.equal(parseWebRoute('/settings/usage').settingsSection,'usage');
+  assert.equal(webRouteForState({view:'settings',settingsSection:'listening'}),'/settings/listening');
   assert.equal(parseWebRoute('/settings/federation').settingsSection, 'federation');
   assert.equal(parseWebRoute('/settings/registration').settingsSection, 'registration');
   assert.equal(parseWebRoute('/settings/library').settingsSection, 'library');

@@ -19,7 +19,7 @@ test('worker runtime schedules every background subsystem and can stop', async (
   });
   runtime.start();
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(scheduled.length, 12);
+  assert.equal(scheduled.length, 13);
   assert.ok(calls.includes('heartbeat'));
   assert.ok(calls.includes('upload-recover'));
   assert.ok(calls.includes('loudness-recover'));

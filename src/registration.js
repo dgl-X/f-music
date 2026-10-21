@@ -1,3 +1,5 @@
+import { pruneLimiterEntries } from './security.js';
+
 export function validateRegistration(input = {}) {
   const username = String(input.username ?? '').trim();
   const displayName = String(input.display_name ?? '').trim();
@@ -9,9 +11,11 @@ export function validateRegistration(input = {}) {
 }
 
 export class RegistrationLimiter {
-  constructor({ limit = 5, windowMs = 60 * 60 * 1000 } = {}) { this.limit=limit;this.windowMs=windowMs;this.entries=new Map(); }
+  constructor({ limit = 5, windowMs = 60 * 60 * 1000, maxEntries = 10000 } = {}) { this.limit=limit;this.windowMs=windowMs;this.entries=new Map();this.maxEntries=maxEntries;this.nextSweep=0; }
   take(key, now=Date.now()) {
+    pruneLimiterEntries(this,now);
     const current=this.entries.get(key);
+    if(!current&&this.entries.size>=this.maxEntries)return false;
     if(!current||now-current.startedAt>=this.windowMs){this.entries.set(key,{count:1,startedAt:now});return true;}
     if(current.count>=this.limit)return false;
     current.count++;return true;

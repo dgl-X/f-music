@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
 import test from 'node:test';
-import { createUserAccess, readBytes, readJson, setBrowserSecurityHeaders } from '../src/http-runtime.js';
+import { createUserAccess, parseRequestUrl, readBytes, readJson, setBrowserSecurityHeaders } from '../src/http-runtime.js';
+
+test('malformed request hosts produce a controlled bad-request error', () => {
+  assert.throws(()=>parseRequestUrl({url:'/api/v1/health',headers:{host:'[malformed'}}),error=>error.status===400);
+  assert.equal(parseRequestUrl({url:'/api/v1/health',headers:{host:'music.example'}}).pathname,'/api/v1/health');
+});
 
 const request = (chunks, headers = {}) => Object.assign(Readable.from(chunks), { headers });
 

@@ -7,7 +7,8 @@ android/.gradle/
 android/**/build/
 android/local.properties
 builds/*.apk
-dist/*.deb
+dist/
+android/builds/
 packaging/.stage/
 packaging/.cache/
 .private/

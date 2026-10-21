@@ -10,7 +10,7 @@ const topLevelRoutes = new Map([
   ['upload', 'upload'],
   ['settings', 'settings'],
 ]);
-const settingsSections = new Set(['library', 'statistics', 'users', 'registration', 'federation', 'recognition', 'openvk', 'reports', 'duplicates', 'password', 'connect']);
+const settingsSections = new Set(['library', 'statistics', 'listening', 'usage', 'users', 'registration', 'federation', 'recognition', 'openvk', 'reports', 'duplicates', 'password', 'connect']);
 
 const positiveInteger = value => {
   const number = Number(value);

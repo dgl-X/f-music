@@ -22,6 +22,30 @@ export function verifyPassword(password, stored) {
   }
 }
 
+// Same KDF cost for unknown accounts, without computing a hash on the event loop.
+export const DUMMY_PASSWORD_HASH = `scrypt$${Buffer.alloc(16).toString('base64url')}$${Buffer.alloc(KEY_LENGTH).toString('base64url')}`;
+
+export async function verifyPasswordAsync(password, stored) {
+  try {
+    const [scheme, saltText, hashText] = stored.split('$');
+    const expected = Buffer.from(hashText || '', 'base64url');
+    const salt = Buffer.from(saltText || '', 'base64url');
+    if (scheme !== 'scrypt' || expected.length !== KEY_LENGTH || salt.length !== 16) return false;
+    const actual = await new Promise((resolve, reject) => {
+      crypto.scrypt(password, salt, KEY_LENGTH, (error, result) => error ? reject(error) : resolve(result));
+    });
+    return crypto.timingSafeEqual(actual, expected);
+  } catch { return false; }
+}
+
+export function pruneLimiterEntries(limiter, now) {
+  if (now < limiter.nextSweep && limiter.entries.size < limiter.maxEntries) return;
+  for (const [key, entry] of limiter.entries) {
+    if (now - entry.startedAt >= limiter.windowMs) limiter.entries.delete(key);
+  }
+  limiter.nextSweep = now + Math.min(limiter.windowMs, 60000);
+}
+
 export function randomToken() {
   return crypto.randomBytes(32).toString('base64url');
 }

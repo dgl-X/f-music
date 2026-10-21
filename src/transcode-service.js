@@ -3,6 +3,7 @@ import path from 'node:path';
 import { inspectAudio as inspectDefault } from './media-tools.js';
 import { validateAudioDecode as validateDefault } from './audio-validation.js';
 import { audioCodec } from './audio-compatibility.js';
+import { guardQueue } from './queue-guard.js';
 
 const VARIANTS={aac_96:{bitrate:'96k',bits:96000},aac_192:{bitrate:'192k',bits:192000}};
 
@@ -11,7 +12,8 @@ export function createTranscodeService({db,storageDir,execute,inspectAudio=inspe
   fs.mkdirSync(derivedDir,{recursive:true,mode:0o750});
   let active=0;
 
-  async function processNext(){
+  const processNext=()=>guardQueue(db,'transcode',false,processNextUnlocked);
+  async function processNextUnlocked(){
     if(active>=concurrency)return false;
     active++;let job,finish,succeeded=false,temporary;
     try{
@@ -52,7 +54,7 @@ export function createTranscodeService({db,storageDir,execute,inspectAudio=inspe
   }
 
   async function recover(){
-    await db.prepare("UPDATE track_files SET status='retry',updated_at=CURRENT_TIMESTAMP WHERE status='processing'").run();
+    await guardQueue(db,'transcode',true,()=>db.prepare("UPDATE track_files SET status='retry',updated_at=CURRENT_TIMESTAMP WHERE status='processing'").run());
     return processNext();
   }
 

@@ -23,6 +23,22 @@ test('recognition HTTP settings are admin-only and never expose the API key',asy
   assert.equal(JSON.stringify(allowed.responses).includes('secret'),false);
 });
 
+test('recognition settings preserve, replace and explicitly remove keys without exposing them',async()=>{
+  const saved=[];
+  const recognition={async saveSettings(value){saved.push(value);return{enabled:value.enabled,clientKey:value.keyProvided?value.clientKey:'kept-example'};}};
+  const {controller,responses}=setup({db:{},recognition});
+  const url=new URL('http://local/api/admin/recognition-settings');
+  for(const body of [{enabled:false},{enabled:true,client_key:'example-key'},{enabled:false,client_key:''}])
+    await controller.handle({method:'PUT',body},{},url,{is_admin:1});
+  assert.deepEqual(saved,[{enabled:false,keyProvided:false,clientKey:null},{enabled:true,keyProvided:true,clientKey:'example-key'},{enabled:false,keyProvided:true,clientKey:''}]);
+  assert.deepEqual(responses.map(r=>r.value.key_configured),[true,true,false]);
+  assert.equal(JSON.stringify(responses).includes('example-key'),false);
+  await controller.handle({method:'PUT',body:{enabled:true,client_key:'invalid key'}},{},url,{is_admin:1});
+  assert.equal(responses.at(-1).status,400);assert.equal(saved.length,3);
+  await controller.handle({method:'PUT',body:{enabled:true}},{},url,{is_admin:0});
+  assert.equal(responses.at(-1).status,403);assert.equal(saved.length,3);
+});
+
 test('recognition list tolerates damaged candidates and preserves public response shape',async()=>{
   const db={prepare(sql){return{async all(){
     if(sql.includes('GROUP BY status'))return[{status:'review',count:'1'}];

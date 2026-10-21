@@ -30,6 +30,7 @@ export function createOperationalHttpController({ db, storageDir, workerMode, so
         needs_setup:Number(users.count) === 0,
         setup_version:1,
         server_version:softwareVersion,
+        features:{android_settings_portal:1},
         library_name:settings?.value || 'Family Music',
         registration_enabled:registration,
         checks:{ database:'ok', storage:'ok', worker:workerAge !== null && workerAge <= 45 ? 'ok' : 'starting' },
